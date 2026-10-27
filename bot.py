@@ -718,6 +718,12 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "WHERE category = 'stars' AND name = ? LIMIT 1",
                 (f"استارز {amount} عدد",)
             ).fetchone()
+            # Older databases may only contain one generic Stars product.
+            if not product:
+                product = conn.execute(
+                    "SELECT id, price, active FROM products "
+                    "WHERE category = 'stars' AND active = 1 ORDER BY id LIMIT 1"
+                ).fetchone()
             user = conn.execute(
                 "SELECT balance FROM users WHERE user_id = ?",
                 (query.from_user.id,)
@@ -2632,9 +2638,11 @@ async def cancel_coupon_creation(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_channel_membership(update, context):
-        return
     user = update.effective_user
+    # Admin workflows (including coupon expiry numeric replies) must not be blocked by channel checks.
+    if not user or user.id != ADMIN_ID:
+        if not await require_channel_membership(update, context):
+            return
     message = update.effective_message
     if user:
         register_user(user)
@@ -2721,7 +2729,6 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("⏱️ انتخاب بر اساس ساعت", callback_data="admin_coupon_expiry_hours")],
                     [InlineKeyboardButton("📅 انتخاب بر اساس روز", callback_data="admin_coupon_expiry_days")],
-                    [InlineKeyboardButton("🛠️ مدت دلخواه (دقیقه/ساعت/روز)", callback_data="admin_coupon_expiry_custom")],
                     [InlineKeyboardButton("♾️ بدون انقضا", callback_data="admin_coupon_expiry_never")],
                 ])
             )
