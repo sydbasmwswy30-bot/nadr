@@ -1052,7 +1052,15 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if valid and row["recipient_type"] != "all":
                         try:
                             allowed = json.loads(row["recipient_ids"] or "[]")
-                            valid = str(user_id) in {str(x).lstrip("@") for x in allowed}
+                            allowed_ids = {str(x).strip() for x in allowed if str(x).strip().isdigit()}
+                            allowed_usernames = {str(x).strip().lstrip("@").casefold() for x in allowed if str(x).strip().startswith("@")}
+                            current_username = ""
+                            try:
+                                user_record = con.execute("SELECT username FROM users WHERE user_id=?", (user_id,)).fetchone()
+                                current_username = str(user_record["username"] or "").lstrip("@").casefold() if user_record else ""
+                            except Exception:
+                                current_username = ""
+                            valid = str(user_id) in allowed_ids or (current_username and current_username in allowed_usernames)
                         except (ValueError, TypeError):
                             valid = False
 
@@ -2063,7 +2071,8 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 """)
                 rows = con.execute("""
-                    SELECT code, discount_amount, category, product_name, active
+                    SELECT code, discount_amount, category, product_name, active,
+                           expires_at, max_uses, total_uses, recipient_type
                     FROM discount_codes ORDER BY code LIMIT 30
                 """).fetchall()
 
@@ -2074,10 +2083,14 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 code = r["code"]
                 scope = "همه محصولات" if r["category"] == "all" else r["category"]
                 state = "🟢 فعال" if r["active"] else "🔴 غیرفعال"
+                expiry_text = r["expires_at"] or "بدون انقضا"
+                usage_text = "نامحدود" if r["max_uses"] is None else f"{int(r['total_uses'] or 0)}/{int(r['max_uses'])}"
                 lines.append(
                     f"\n🏷️ {code}\n"
                     f"💰 تخفیف: {int(r['discount_amount']):,} تومان\n"
-                    f"🎯 محدوده: {scope} | {state}"
+                    f"🎯 محدوده: {scope} | {state}\n"
+                    f"⏳ انقضا: {expiry_text}\n"
+                    f"🔢 مصرف کل: {usage_text}"
                 )
                 buttons.append([
                     InlineKeyboardButton(
@@ -2152,8 +2165,32 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "admin_coupon_create":
             context.user_data["admin_coupon_state"] = {"step": "code"}
             await query.edit_message_text(
-                "➕ ساخت کد تخفیف\n\nکد دلخواه را بفرست؛ مثال: SEYED500\nبرای لغو /cancel بفرست."
+                "🎟️ ساخت کد تخفیف | SEYED PREMIUM\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "۱) یک کد دلخواه بفرست.\n"
+                "مثال: SEYED500\n\n"
+                "برای لغو هر زمان /cancel را بفرست."
             )
+            return
+
+        if data in ("admin_coupon_expiry_hours", "admin_coupon_expiry_days", "admin_coupon_expiry_custom", "admin_coupon_expiry_never"):
+            state = context.user_data.get("admin_coupon_state")
+            if not state or state.get("step") != "expiry_choice":
+                await query.answer("این مرحله منقضی شده؛ ساخت کد را دوباره شروع کن.", show_alert=True)
+                return
+            if data == "admin_coupon_expiry_never":
+                state["expires_at"] = None
+                state["step"] = "max_uses"
+                await query.edit_message_text("♾️ انقضا: بدون محدودیت زمانی ثبت شد.\n\n🔢 سقف مصرف کل را بفرست.\n0 = نامحدود")
+            elif data == "admin_coupon_expiry_hours":
+                state["step"] = "expiry_hours"
+                await query.edit_message_text("⏱ چند ساعت اعتبار داشته باشد؟\nمثال: 6\nاز 1 تا 876000 ساعت")
+            elif data == "admin_coupon_expiry_days":
+                state["step"] = "expiry_days"
+                await query.edit_message_text("📅 چند روز اعتبار داشته باشد؟\nمثال: 1 یعنی دقیقاً 24 ساعت\nاز 1 تا 36500 روز")
+            else:
+                state["step"] = "expiry_custom"
+                await query.edit_message_text("🛠️ مدت اعتبار دلخواه را به شکل زیر بفرست:\nساعت: 6h\nروز: 2d\nمثال: 90m برای 90 دقیقه")
             return
 
         if data == "admin_coupon_toggle":
@@ -2650,9 +2687,13 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 return
             admin_state.update(category="all" if answer == "1" else "stars", step="recipients")
             await message.reply_text(
-                "👥 کاربران مجاز:\nALL = همه کاربران\n"
-                "یا آیدی عددی و @username را با کاما جدا کن.\n"
-                "مثال: 12345678, @myuser"
+                "👥 تعیین کاربران مجاز\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "🌍 برای همه کاربران، فقط ALL بفرست.\n\n"
+                "🔐 برای محدودکردن کد، آیدی عددی یا @username را وارد کن.\n"
+                "اگر چند نفر هستند، با کاما جدا کن.\n\n"
+                "نمونه: 12345678, @myuser\n"
+                "نکته: کاربران باید قبلاً ربات را باز کرده باشند تا نام کاربری‌شان قابل بررسی باشد."
             )
             return
 
@@ -2672,25 +2713,70 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     recipient_type="selected",
                     recipient_ids=json.dumps(recipients, ensure_ascii=False)
                 )
-            admin_state["step"] = "expiry"
-            await message.reply_text("⏳ انقضا چند روز دیگر باشد؟ 0 = بدون انقضا")
+            admin_state["step"] = "expiry_choice"
+            await message.reply_text(
+                "⏳ مدت اعتبار کد تخفیف را انتخاب کن\n\n"
+                "بعد از پایان مدت، کد به‌صورت خودکار در زمان استفاده نامعتبر می‌شود.\n"
+                "♾️ بدون انقضا یعنی کد از نظر زمان محدودیت ندارد.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⏱️ انتخاب بر اساس ساعت", callback_data="admin_coupon_expiry_hours")],
+                    [InlineKeyboardButton("📅 انتخاب بر اساس روز", callback_data="admin_coupon_expiry_days")],
+                    [InlineKeyboardButton("🛠️ مدت دلخواه (دقیقه/ساعت/روز)", callback_data="admin_coupon_expiry_custom")],
+                    [InlineKeyboardButton("♾️ بدون انقضا", callback_data="admin_coupon_expiry_never")],
+                ])
+            )
             return
 
-        if step == "expiry":
-            try:
-                days = int(answer)
-                if not 0 <= days <= 36500:
-                    raise ValueError
-            except ValueError:
-                await message.reply_text("❌ عددی بین 0 تا 36500 وارد کن.")
-                return
+        if step in ("expiry_hours", "expiry_days", "expiry_custom"):
             from datetime import timedelta
-            admin_state["expires_at"] = (
-                (datetime.now() + timedelta(days=days)).isoformat(timespec="seconds")
-                if days else None
-            )
+            try:
+                if step == "expiry_hours":
+                    value = int(answer)
+                    if not 1 <= value <= 876000:
+                        raise ValueError
+                    delta = timedelta(hours=value)
+                    label = f"{value} ساعت"
+                elif step == "expiry_days":
+                    value = int(answer)
+                    if not 1 <= value <= 36500:
+                        raise ValueError
+                    delta = timedelta(days=value)
+                    label = f"{value} روز"
+                else:
+                    import re as _re
+                    match = _re.fullmatch(r"(\d+)\s*(m|min|minute|minutes|h|hr|hour|hours|d|day|days)", answer.lower())
+                    if not match:
+                        raise ValueError
+                    value = int(match.group(1))
+                    unit = match.group(2)
+                    if value < 1:
+                        raise ValueError
+                    if unit in ("m", "min", "minute", "minutes"):
+                        delta = timedelta(minutes=value)
+                        label = f"{value} دقیقه"
+                    elif unit in ("h", "hr", "hour", "hours"):
+                        delta = timedelta(hours=value)
+                        label = f"{value} ساعت"
+                    else:
+                        delta = timedelta(days=value)
+                        label = f"{value} روز"
+                    if delta.total_seconds() > 36500 * 86400:
+                        raise ValueError
+            except (ValueError, OverflowError):
+                await message.reply_text(
+                    "❌ مدت معتبر نیست.\n"
+                    "ساعت/روز باید عدد صحیح مثبت باشد.\n"
+                    "در حالت دلخواه نمونه‌ها: 90m ، 6h ، 2d"
+                )
+                return
+            admin_state["expires_at"] = (datetime.now() + delta).isoformat(timespec="seconds")
+            admin_state["expiry_label"] = label
             admin_state["step"] = "max_uses"
-            await message.reply_text("🔢 سقف مصرف کل؟ 0 = نامحدود")
+            await message.reply_text(
+                f"✅ مدت اعتبار ثبت شد: {label}\n"
+                f"📅 زمان انقضا: {admin_state['expires_at']}\n\n"
+                "🔢 سقف مصرف کل را بفرست.\n0 = نامحدود"
+            )
             return
 
         if step == "max_uses":
