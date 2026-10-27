@@ -453,6 +453,14 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _handler_started = time.perf_counter()
     try:
         await _callbacks_impl(update, context)
+    except Exception:
+        logger.exception("Unhandled callback failure; update_id=%s", getattr(update, "update_id", None))
+        query = update.callback_query
+        if query:
+            try:
+                await query.answer("خطایی رخ داد؛ خطا ثبت شد. دوباره تلاش کن.", show_alert=True)
+            except Exception:
+                logger.exception("Could not notify user about callback failure")
     finally:
         _query = update.callback_query
         _button = _query.data if _query else "unknown"
@@ -2179,7 +2187,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        if data in ("admin_coupon_expiry_hours", "admin_coupon_expiry_days", "admin_coupon_expiry_custom", "admin_coupon_expiry_never"):
+        if data in ("admin_coupon_expiry_hours", "admin_coupon_expiry_days", "admin_coupon_expiry_never"):
             state = context.user_data.get("admin_coupon_state")
             if not state or state.get("step") != "expiry_choice":
                 await query.answer("این مرحله منقضی شده؛ ساخت کد را دوباره شروع کن.", show_alert=True)
@@ -2194,9 +2202,6 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif data == "admin_coupon_expiry_days":
                 state["step"] = "expiry_days"
                 await query.edit_message_text("📅 چند روز اعتبار داشته باشد؟\nمثال: 1 یعنی دقیقاً 24 ساعت\nاز 1 تا 36500 روز")
-            else:
-                state["step"] = "expiry_custom"
-                await query.edit_message_text("🛠️ مدت اعتبار دلخواه را به شکل زیر بفرست:\nساعت: 6h\nروز: 2d\nمثال: 90m برای 90 دقیقه")
             return
 
         if data == "admin_coupon_toggle":
@@ -2218,7 +2223,10 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"💰 مجموع مبلغ سفارش‌های ثبت‌شده: {total:,} تومان\n\n"
                 "این مبلغ فروش قطعی نیست؛ پرداخت‌ها در این نسخه تأیید نمی‌شوند."
             )
-            await query.edit_message_text(text, reply_markup=back_menu())
+            await query.edit_message_text(
+                text,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ بازگشت به مدیریت", callback_data="admin")]])
+            )
             return
 
         if data == "admin_products" or data.startswith("admin_p_"):
@@ -2574,7 +2582,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not rows:
                 await query.edit_message_text(
                     "📦 هنوز سفارشی ثبت نشده است.",
-                    reply_markup=back_menu()
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ بازگشت به مدیریت", callback_data="admin")]])
                 )
                 return
 
@@ -2592,7 +2600,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ])
 
             keyboard.append([
-                InlineKeyboardButton("🏠 منوی اصلی", callback_data="home")
+                InlineKeyboardButton("↩️ بازگشت به مدیریت", callback_data="admin")
             ])
 
             await query.edit_message_text(
@@ -2614,6 +2622,14 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _handler_started = time.perf_counter()
     try:
         await _text_message_impl(update, context)
+    except Exception:
+        logger.exception("Unhandled text-message failure; update_id=%s", getattr(update, "update_id", None))
+        message = update.effective_message
+        if message and update.effective_user and update.effective_user.id == ADMIN_ID:
+            try:
+                await message.reply_text("❌ خطایی هنگام پردازش پیام رخ داد؛ جزئیات در لاگ ثبت شد. برای ادامه دوباره تلاش کن یا /cancel بزن.")
+            except Exception:
+                logger.exception("Could not notify admin about text-message failure")
     finally:
         logger.info("PERF text_message: %.3fs",
                     time.perf_counter() - _handler_started)
@@ -2669,10 +2685,25 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if step == "code":
             code = answer.upper()
             if not re.fullmatch(r"[A-Z0-9_-]{3,40}", code):
-                await message.reply_text("کد باید ۳ تا ۴۰ حرف انگلیسی، عدد، _ یا - باشد.")
+                await message.reply_text(
+                    "❌ کد معتبر نیست. فقط ۳ تا ۴۰ حرف انگلیسی، عدد، _ یا - مجاز است.\n"
+                    "مثال: SEYED500\nبرای لغو /cancel را بفرست."
+                )
+                return
+            try:
+                with db() as con:
+                    duplicate = con.execute(
+                        "SELECT 1 FROM discount_codes WHERE UPPER(code)=? LIMIT 1", (code,)
+                    ).fetchone()
+            except Exception:
+                logger.exception("Could not check duplicate coupon code")
+                await message.reply_text("❌ بررسی کد در دیتابیس انجام نشد؛ خطا ثبت شد. دوباره تلاش کن یا /cancel بزن.")
+                return
+            if duplicate:
+                await message.reply_text("❌ این کد قبلاً ثبت شده است. کد دیگری بفرست. برای لغو /cancel را بفرست.")
                 return
             admin_state.update(code=code, step="amount")
-            await message.reply_text("💰 مبلغ تخفیف به تومان را وارد کن.")
+            await message.reply_text("💰 مبلغ تخفیف به تومان را وارد کن.\nبرای لغو /cancel را بفرست.")
             return
 
         if step == "amount":
@@ -2734,55 +2765,39 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             return
 
-        if step in ("expiry_hours", "expiry_days", "expiry_custom"):
+        if step in ("expiry_hours", "expiry_days"):
             from datetime import timedelta
             try:
+                # Only positive integer input is accepted for hour/day modes.
+                if not re.fullmatch(r"[0-9]+", answer):
+                    raise ValueError("integer required")
+                value = int(answer)
                 if step == "expiry_hours":
-                    value = int(answer)
                     if not 1 <= value <= 876000:
-                        raise ValueError
+                        raise ValueError("hours out of range")
                     delta = timedelta(hours=value)
                     label = f"{value} ساعت"
-                elif step == "expiry_days":
-                    value = int(answer)
+                else:
                     if not 1 <= value <= 36500:
-                        raise ValueError
+                        raise ValueError("days out of range")
                     delta = timedelta(days=value)
                     label = f"{value} روز"
-                else:
-                    import re as _re
-                    match = _re.fullmatch(r"(\d+)\s*(m|min|minute|minutes|h|hr|hour|hours|d|day|days)", answer.lower())
-                    if not match:
-                        raise ValueError
-                    value = int(match.group(1))
-                    unit = match.group(2)
-                    if value < 1:
-                        raise ValueError
-                    if unit in ("m", "min", "minute", "minutes"):
-                        delta = timedelta(minutes=value)
-                        label = f"{value} دقیقه"
-                    elif unit in ("h", "hr", "hour", "hours"):
-                        delta = timedelta(hours=value)
-                        label = f"{value} ساعت"
-                    else:
-                        delta = timedelta(days=value)
-                        label = f"{value} روز"
-                    if delta.total_seconds() > 36500 * 86400:
-                        raise ValueError
+                # Calculate from current time when the admin submits the value.
+                expiry_dt = datetime.now() + delta
+                admin_state["expires_at"] = expiry_dt.isoformat(timespec="seconds")
+                admin_state["expiry_label"] = label
+                admin_state["step"] = "max_uses"
             except (ValueError, OverflowError):
-                await message.reply_text(
-                    "❌ مدت معتبر نیست.\n"
-                    "ساعت/روز باید عدد صحیح مثبت باشد.\n"
-                    "در حالت دلخواه نمونه‌ها: 90m ، 6h ، 2d"
-                )
+                if step == "expiry_hours":
+                    guidance = "⏱ فقط عدد صحیح از 1 تا 876000 وارد کن. مثال: 6"
+                else:
+                    guidance = "📅 فقط عدد صحیح از 1 تا 36500 وارد کن. مثال: 1 یعنی 24 ساعت"
+                await message.reply_text("❌ مقدار معتبر نیست.\n" + guidance + "\nبرای لغو /cancel را بفرست.")
                 return
-            admin_state["expires_at"] = (datetime.now() + delta).isoformat(timespec="seconds")
-            admin_state["expiry_label"] = label
-            admin_state["step"] = "max_uses"
             await message.reply_text(
                 f"✅ مدت اعتبار ثبت شد: {label}\n"
                 f"📅 زمان انقضا: {admin_state['expires_at']}\n\n"
-                "🔢 سقف مصرف کل را بفرست.\n0 = نامحدود"
+                "🔢 سقف مصرف کل را بفرست.\n0 = نامحدود\nبرای لغو /cancel را بفرست."
             )
             return
 
