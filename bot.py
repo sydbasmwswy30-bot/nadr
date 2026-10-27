@@ -2235,6 +2235,16 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.answer("دسترسی مجاز نیست.", show_alert=True)
                 return
 
+            # صفحه‌بندی پویا: محصولات فعلی و محصولات آینده از دیتابیس خوانده می‌شوند.
+            products_page = 1
+            if data.startswith("admin_products_page_"):
+                try:
+                    products_page = max(1, int(data.rsplit("_", 1)[1]))
+                except (ValueError, IndexError):
+                    products_page = 1
+                data = "admin_products"
+            products_per_page = 8
+
             categories = {
                 "stars": "⭐ استارز",
                 "premium": "💎 پرمیوم",
@@ -2375,12 +2385,18 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.answer(result_message, show_alert=True)
 
             with db() as con:
+                total_products = con.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+                total_pages = max(1, (int(total_products) + products_per_page - 1) // products_per_page)
+                products_page = min(products_page, total_pages)
                 rows = con.execute(
-                    "SELECT id, category, name, price, active FROM products ORDER BY id"
+                    "SELECT id, category, name, price, active FROM products ORDER BY id LIMIT ? OFFSET ?",
+                    (products_per_page, (products_page - 1) * products_per_page),
                 ).fetchall()
 
-            text = "🛍 مدیریت محصولات SEYED PREMIUM\n━━━━━━━━━━━━━━━━━━\n"
-            text += f"📦 تعداد محصولات: {len(rows)}\n\n"
+            text = "🛍 مدیریت محصولات و قیمت‌ها | SEYED PREMIUM\n━━━━━━━━━━━━━━━━━━\n"
+            text += f"📦 کل محصولات: {total_products}\n"
+            text += f"📄 صفحه {products_page} از {total_pages}\n"
+            text += "محصولات جدیدی که اضافه شوند، خودکار در همین فهرست نمایش داده می‌شوند.\n\n"
             keyboard = []
 
             for r in rows:
@@ -2397,8 +2413,16 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     InlineKeyboardButton("🗑 حذف", callback_data=f"admin_p_del_{r['id']}"),
                 ])
 
+            page_buttons = []
+            if products_page > 1:
+                page_buttons.append(InlineKeyboardButton("⬅️ صفحه قبل", callback_data=f"admin_products_page_{products_page - 1}"))
+            if products_page < total_pages:
+                page_buttons.append(InlineKeyboardButton("صفحه بعد ➡️", callback_data=f"admin_products_page_{products_page + 1}"))
+            if page_buttons:
+                keyboard.append(page_buttons)
+
             keyboard.append([InlineKeyboardButton("➕ افزودن محصول", callback_data="admin_p_add")])
-            keyboard.append([InlineKeyboardButton("🔄 تازه‌سازی", callback_data="admin_products")])
+            keyboard.append([InlineKeyboardButton("🔄 تازه‌سازی", callback_data=f"admin_products_page_{products_page}")])
             keyboard.append([InlineKeyboardButton("🏠 بازگشت به مدیریت", callback_data="admin")])
             await query.edit_message_text(text[:4000], reply_markup=InlineKeyboardMarkup(keyboard))
             return
