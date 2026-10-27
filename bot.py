@@ -195,6 +195,16 @@ def init_db():
                 defaults,
             )
 
+        # هر بستهٔ ثابت استارز یک محصول مستقل دارد؛ قیمت‌های موجود دست‌نخورده می‌مانند.
+        for amount in (50, 75, 100, 150, 250, 350, 500, 1000, 2500, 5000, 10000, 50000):
+            name = f"استارز {amount} عدد"
+            con.execute(
+                "INSERT INTO products(category, name, price, active) "
+                "SELECT 'stars', ?, 0, 1 WHERE NOT EXISTS "
+                "(SELECT 1 FROM products WHERE category='stars' AND name=?)",
+                (name, name),
+            )
+
 
 
     with db() as con:
@@ -421,6 +431,37 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def persian_digits(value):
     return str(value).translate(str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹"))
+
+
+def build_stars_menu():
+    """ساخت منوی استارز از همان کاتالوگ محصولات مدیریت؛ محصولات آینده هم خودکار دیده می‌شوند."""
+    with db() as con:
+        rows = con.execute(
+            "SELECT id, name FROM products WHERE category='stars' AND active=1 ORDER BY id"
+        ).fetchall()
+    buttons = []
+    for row in rows:
+        # دکمه‌های فعلی و بسته‌های جدیدی که مدیر با نام «استارز N عدد» اضافه کند.
+        import re
+        match = re.search(r"(\d[\d,٬]*)", row["name"].replace("،", ","))
+        if not match:
+            continue
+        try:
+            amount = int(match.group(1).replace(",", "").replace("٬", ""))
+        except ValueError:
+            continue
+        buttons.append([InlineKeyboardButton(
+            f"🎁 {persian_digits(amount)} استارز",
+            callback_data=f"stars_pack_{amount}",
+            style="primary" if len(buttons) % 2 == 0 else "success",
+        )])
+    buttons.append([InlineKeyboardButton(
+        "✏️ استارز به مقدار دلخواه", callback_data="stars_custom", style="success"
+    )])
+    buttons.append([InlineKeyboardButton(
+        "↩️ بازگشت", callback_data="back_to_services", style="danger"
+    )])
+    return InlineKeyboardMarkup(buttons)
 
 
 def jalali_date(value):
@@ -688,7 +729,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "service_stars":
         await query.edit_message_text(
             stars_text(),
-            reply_markup=stars_menu()
+            reply_markup=build_stars_menu()
         )
         return
 
@@ -700,26 +741,11 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("بسته انتخاب‌شده معتبر نیست.", show_alert=True)
             return
 
-        package_labels = {
-            50: ("۵۰", "بسته پایه"),
-            75: ("۷۵", "بسته استاندارد"),
-            100: ("۱۰۰", "بسته استاندارد"),
-            150: ("۱۵۰", "بسته استاندارد"),
-            250: ("۲۵۰", "بسته ویژه"),
-            350: ("۳۵۰", "بسته ویژه"),
-            500: ("۵۰۰", "بسته ویژه"),
-            1000: ("۱۰۰۰", "بسته حرفه‌ای"),
-            2500: ("۲۵۰۰", "بسته حرفه‌ای"),
-            5000: ("۵۰۰۰", "بسته حرفه‌ای"),
-            10000: ("۱۰ هزار", "بسته ویژه"),
-            50000: ("۵۰ هزار", "بسته ویژه"),
-        }
-
-        if amount not in package_labels:
-            await query.answer("این بسته در فهرست استارز وجود ندارد.", show_alert=True)
+        if amount <= 0:
+            await query.answer("مقدار بسته معتبر نیست.", show_alert=True)
             return
-
-        persian_amount, tier = package_labels[amount]
+        persian_amount = persian_digits(f"{amount:,}".replace(",", "٬"))
+        tier = "بسته استارز"
         conn = db()
         try:
             product = conn.execute(
@@ -727,12 +753,6 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "WHERE category = 'stars' AND name = ? LIMIT 1",
                 (f"استارز {amount} عدد",)
             ).fetchone()
-            # Older databases may only contain one generic Stars product.
-            if not product:
-                product = conn.execute(
-                    "SELECT id, price, active FROM products "
-                    "WHERE category = 'stars' AND active = 1 ORDER BY id LIMIT 1"
-                ).fetchone()
             user = conn.execute(
                 "SELECT balance FROM users WHERE user_id = ?",
                 (query.from_user.id,)
@@ -787,7 +807,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "stars_detail_back":
         await query.edit_message_text(
             stars_text(),
-            reply_markup=stars_menu()
+            reply_markup=build_stars_menu()
         )
         return
 
@@ -2251,6 +2271,12 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "boost": "🚀 بوست",
                 "gifts": "🎁 گیفت",
                 "numbers": "📱 شماره مجازی",
+                "members": "👥 ممبر تلگرام",
+                "reactions": "🔥 ری‌اکشن تلگرام",
+                "views": "👀 ویو تلگرام",
+                "instagram_followers": "📸 فالوور اینستاگرام",
+                "instagram_likes": "❤️ لایک اینستاگرام",
+                "instagram_views": "🎬 ویو اینستاگرام",
             }
 
             if data == "admin_p_add":
