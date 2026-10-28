@@ -152,11 +152,26 @@ logger = logging.getLogger(__name__)
 
 PRODUCTS = {
     "premium": ("💎 تلگرام پرمیوم", "اشتراک تلگرام پرمیوم"),
-    "stars": ("⭐ تلگرام استارز", "خرید استارز تلگرام"),
+    "stars": ("⭐ استارز تلگرام", "خرید استارز تلگرام"),
     "gifts": ("🎁 گیفت تلگرام", "خرید گیفت تلگرام"),
-    "boost": ("🚀 بوست کانال", "افزایش بوست کانال"),
-    "numbers": (bot_text("numbers_button"), "شماره مجازی"),
+    "boost": ("🚀 بوست کانال / گروه", "افزایش بوست کانال یا گروه"),
+    "numbers": ("📱 شماره مجازی", "شماره مجازی"),
+    "config": ("🌐 کانفیگ", "خرید کانفیگ"),
+    "configs": ("🌐 کانفیگ", "خرید کانفیگ"),
+    "members": ("👥 ممبر تلگرام", "ممبر تلگرام"),
+    "reactions": ("🔥 ری‌اکشن تلگرام", "ری‌اکشن تلگرام"),
+    "views": ("👀 ویو تلگرام", "ویو تلگرام"),
+    "instagram_followers": ("📸 فالوور اینستاگرام", "فالوور اینستاگرام"),
+    "instagram_likes": ("❤️ لایک اینستاگرام", "لایک اینستاگرام"),
+    "instagram_views": ("🎬 ویو اینستاگرام", "ویو اینستاگرام"),
 }
+
+
+def coupon_category_label(category):
+    """Human-readable coupon scope label, including categories added from admin panel."""
+    if not category or category == "all":
+        return "🌐 همه خدمات و محصولات"
+    return PRODUCTS.get(str(category), (f"🛍 {category}", str(category)))[0]
 
 
 # ==========================================
@@ -276,6 +291,10 @@ def init_db():
                 "INSERT INTO products(category, name, price) VALUES (?, ?, ?)",
                 defaults,
             )
+
+        # محصول آزمایشی ناخواستهٔ «1 views» از خرید و فهرست محصولات فعال خارج شود؛
+        # ردیف حذف نمی‌شود تا سابقه و ارجاع‌های احتمالی دیتابیس حفظ شوند.
+        con.execute("UPDATE products SET active=0 WHERE LOWER(TRIM(name)) IN ('1 views', '1 view')")
 
         # هر بستهٔ ثابت استارز یک محصول مستقل دارد؛ قیمت‌های موجود دست‌نخورده می‌مانند.
         for amount in (50, 75, 100, 150, 250, 350, 500, 1000, 2500, 5000, 10000, 50000):
@@ -2280,7 +2299,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             for r in rows:
                 code = r["code"]
-                scope = "همه محصولات" if r["category"] == "all" else r["category"]
+                scope = coupon_category_label(r["category"])
                 state = "🟢 فعال" if r["active"] else "🔴 غیرفعال"
                 expiry_text = format_expiry_iran(r["expires_at"])
                 usage_text = "نامحدود" if r["max_uses"] is None else f"{int(r['total_uses'] or 0)}/{int(r['max_uses'])}"
@@ -2343,7 +2362,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             buttons = []
             for r in rows:
                 code2 = r["code"]
-                scope = "همه محصولات" if r["category"] == "all" else r["category"]
+                scope = coupon_category_label(r["category"])
                 state_text = "🟢 فعال" if r["active"] else "🔴 غیرفعال"
                 expiry = format_expiry_iran(r["expires_at"])
                 uses = "نامحدود" if r["max_uses"] is None else f"{int(r['total_uses'] or 0)}/{int(r['max_uses'])}"
@@ -2384,7 +2403,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             buttons = []
             for r in rows:
                 code2 = r["code"]
-                scope = "همه محصولات" if r["category"] == "all" else r["category"]
+                scope = coupon_category_label(r["category"])
                 state = "🟢 فعال" if r["active"] else "🔴 غیرفعال"
                 lines.append(
                     f"\n🏷️ {code2}\n"
@@ -2456,7 +2475,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 products = con.execute("SELECT id, name FROM products WHERE category=? AND active=1 ORDER BY name", (category,)).fetchall()
             state.update(category=category, product_name=None, step="scope_product_choice")
             state["scope_products"] = [{"id": int(r["id"]), "name": str(r["name"])} for r in products]
-            label = PRODUCTS.get(category, (category, category))[0]
+            label = coupon_category_label(category)
             buttons = [[InlineKeyboardButton("📂 تمام محصولات این دسته", callback_data="admin_coupon_scope_category_all")]]
             for idx, product in enumerate(state["scope_products"]):
                 # Use index-based callback data to respect Telegram's callback length limit.
@@ -2477,7 +2496,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             state["step"] = "scope_choice"
             buttons = [[InlineKeyboardButton("🌐 همه خدمات", callback_data="admin_coupon_scope_all")]]
             for idx, (category, count) in enumerate(categories):
-                label = PRODUCTS.get(category, (category, category))[0]
+                label = coupon_category_label(category)
                 buttons.append([InlineKeyboardButton(f"{label} ({count} محصول)", callback_data=f"admin_coupon_scope_cat_{idx}")])
             buttons.append([InlineKeyboardButton("❌ لغو ساخت", callback_data="admin_coupon_creation_cancel")])
             await query.edit_message_text("🎯 دسته‌بندی را انتخاب کن:", reply_markup=InlineKeyboardMarkup(buttons))
@@ -2498,7 +2517,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await query.answer("محصول انتخاب‌شده معتبر نیست.", show_alert=True)
                     return
             state["step"] = "recipients"
-            scope_label = "همه خدمات" if state["category"] == "all" else PRODUCTS.get(state["category"], (state["category"], state["category"]))[0]
+            scope_label = coupon_category_label(state["category"])
             product_label = state.get("product_name")
             await query.edit_message_text(
                 f"✅ محدوده: {scope_label}" + (f"\n📦 محصول دقیق: {product_label}" if product_label else "\n📦 تمام محصولات این دسته") +
@@ -3083,7 +3102,7 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             admin_state["scope_categories"] = [c for c, _ in categories]
             buttons = [[InlineKeyboardButton("🌐 همه خدمات", callback_data="admin_coupon_scope_all")]]
             for idx, (category, count) in enumerate(categories):
-                label = PRODUCTS.get(category, (category, category))[0]
+                label = coupon_category_label(category)
                 buttons.append([InlineKeyboardButton(f"{label} ({count} محصول)", callback_data=f"admin_coupon_scope_cat_{idx}")])
             buttons.append([InlineKeyboardButton("❌ لغو ساخت", callback_data="admin_coupon_creation_cancel")])
             await message.reply_text(
@@ -3254,7 +3273,7 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     "✅ کوپن ساخته شد.\n\n"
                     f"🏷️ کد: {state['code']}\n"
                     f"💰 تخفیف: {state['discount_amount']:,} تومان\n"
-                    f"🎯 محدوده: {'همه خدمات' if state['category'] == 'all' else PRODUCTS.get(state['category'], (state['category'], state['category']))[0]}\n"
+                    f"🎯 محدوده: {coupon_category_label(state['category'])}\n"
                     f"📦 محصول: {state.get('product_name') or 'تمام محصولات محدوده انتخاب‌شده'}\n"
                     f"👥 کاربران: {'همه' if state['recipient_type'] == 'all' else state['recipient_ids']}\n"
                     f"⏳ انقضا (ایران): {format_expiry_iran(expires_at_utc.isoformat() if expires_at_utc else None)}\n"
