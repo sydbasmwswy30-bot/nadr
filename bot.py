@@ -2426,6 +2426,86 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        if data == "admin_coupon_creation_cancel":
+            context.user_data.pop("admin_coupon_state", None)
+            await query.answer("ساخت کد لغو شد.")
+            await query.edit_message_text("❌ ساخت کد تخفیف لغو شد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏷️ مدیریت تخفیف‌ها", callback_data="admin_coupons")]]))
+            return
+
+        if data == "admin_coupon_scope_all":
+            state = context.user_data.get("admin_coupon_state")
+            if not state or state.get("step") != "scope_choice":
+                await query.answer("مرحله ساخت کوپن پیدا نشد؛ دوباره شروع کن.", show_alert=True)
+                return
+            state.update(category="all", product_name=None, step="recipients")
+            await query.edit_message_text("🎯 محدوده: همه خدمات و محصولات فعلی و آینده\n\n👥 برای همه کاربران، ALL بفرست؛ یا آیدی عددی/@username را وارد کن. چند نفر را با کاما جدا کن.\nبرای لغو /cancel")
+            return
+
+        if data.startswith("admin_coupon_scope_cat_"):
+            state = context.user_data.get("admin_coupon_state")
+            if not state or state.get("step") != "scope_choice":
+                await query.answer("مرحله ساخت کوپن پیدا نشد؛ دوباره شروع کن.", show_alert=True)
+                return
+            try:
+                idx = int(data.rsplit("_", 1)[1])
+                category = state.get("scope_categories", [])[idx]
+            except (ValueError, IndexError, TypeError):
+                await query.answer("دسته‌بندی انتخاب‌شده معتبر نیست.", show_alert=True)
+                return
+            with db() as con:
+                products = con.execute("SELECT id, name FROM products WHERE category=? AND active=1 ORDER BY name", (category,)).fetchall()
+            state.update(category=category, product_name=None, step="scope_product_choice")
+            state["scope_products"] = [{"id": int(r["id"]), "name": str(r["name"])} for r in products]
+            label = PRODUCTS.get(category, (category, category))[0]
+            buttons = [[InlineKeyboardButton("📂 تمام محصولات این دسته", callback_data="admin_coupon_scope_category_all")]]
+            for idx, product in enumerate(state["scope_products"]):
+                # Use index-based callback data to respect Telegram's callback length limit.
+                buttons.append([InlineKeyboardButton(product["name"][:60], callback_data=f"admin_coupon_scope_product_{idx}")])
+            buttons.append([InlineKeyboardButton("↩️ انتخاب دسته دیگر", callback_data="admin_coupon_scope_back")])
+            await query.edit_message_text(f"🎯 دسته انتخاب‌شده: {label}\nمی‌توانی کل دسته یا فقط یک محصول مشخص را انتخاب کنی:", reply_markup=InlineKeyboardMarkup(buttons))
+            return
+
+        if data == "admin_coupon_scope_back":
+            state = context.user_data.get("admin_coupon_state")
+            if not state:
+                await query.answer("فرایند ساخت کوپن فعال نیست.", show_alert=True)
+                return
+            with db() as con:
+                rows = con.execute("SELECT category, COUNT(*) AS n FROM products WHERE active=1 GROUP BY category ORDER BY category").fetchall()
+            categories = [(str(r["category"]), int(r["n"] or 0)) for r in rows if str(r["category"] or "").strip()]
+            state["scope_categories"] = [c for c, _ in categories]
+            state["step"] = "scope_choice"
+            buttons = [[InlineKeyboardButton("🌐 همه خدمات", callback_data="admin_coupon_scope_all")]]
+            for idx, (category, count) in enumerate(categories):
+                label = PRODUCTS.get(category, (category, category))[0]
+                buttons.append([InlineKeyboardButton(f"{label} ({count} محصول)", callback_data=f"admin_coupon_scope_cat_{idx}")])
+            buttons.append([InlineKeyboardButton("❌ لغو ساخت", callback_data="admin_coupon_creation_cancel")])
+            await query.edit_message_text("🎯 دسته‌بندی را انتخاب کن:", reply_markup=InlineKeyboardMarkup(buttons))
+            return
+
+        if data == "admin_coupon_scope_category_all" or data.startswith("admin_coupon_scope_product_"):
+            state = context.user_data.get("admin_coupon_state")
+            if not state or state.get("step") != "scope_product_choice":
+                await query.answer("مرحله انتخاب محصول معتبر نیست.", show_alert=True)
+                return
+            if data == "admin_coupon_scope_category_all":
+                state["product_name"] = None
+            else:
+                try:
+                    idx = int(data.rsplit("_", 1)[1])
+                    state["product_name"] = state["scope_products"][idx]["name"]
+                except (ValueError, IndexError, TypeError):
+                    await query.answer("محصول انتخاب‌شده معتبر نیست.", show_alert=True)
+                    return
+            state["step"] = "recipients"
+            scope_label = "همه خدمات" if state["category"] == "all" else PRODUCTS.get(state["category"], (state["category"], state["category"]))[0]
+            product_label = state.get("product_name")
+            await query.edit_message_text(
+                f"✅ محدوده: {scope_label}" + (f"\n📦 محصول دقیق: {product_label}" if product_label else "\n📦 تمام محصولات این دسته") +
+                "\n\n👥 برای همه کاربران، ALL بفرست؛ یا آیدی عددی/@username را وارد کن. چند نفر را با کاما جدا کن.\nبرای لغو /cancel"
+            )
+            return
+
         if data in ("admin_coupon_expiry_hours", "admin_coupon_expiry_days", "admin_coupon_expiry_never"):
             state = context.user_data.get("admin_coupon_state")
             if not state or state.get("step") != "expiry_choice":
@@ -2994,9 +3074,22 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             except ValueError:
                 await message.reply_text("❌ مبلغ باید عدد صحیح مثبت باشد.")
                 return
-            admin_state.update(discount_amount=amount, step="scope")
+            admin_state.update(discount_amount=amount, step="scope_choice")
+            with db() as con:
+                category_rows = con.execute(
+                    "SELECT category, COUNT(*) AS n FROM products WHERE active=1 GROUP BY category ORDER BY category"
+                ).fetchall()
+            categories = [(str(r["category"]), int(r["n"] or 0)) for r in category_rows if str(r["category"] or "").strip()]
+            admin_state["scope_categories"] = [c for c, _ in categories]
+            buttons = [[InlineKeyboardButton("🌐 همه خدمات", callback_data="admin_coupon_scope_all")]]
+            for idx, (category, count) in enumerate(categories):
+                label = PRODUCTS.get(category, (category, category))[0]
+                buttons.append([InlineKeyboardButton(f"{label} ({count} محصول)", callback_data=f"admin_coupon_scope_cat_{idx}")])
+            buttons.append([InlineKeyboardButton("❌ لغو ساخت", callback_data="admin_coupon_creation_cancel")])
             await message.reply_text(
-                "🎯 محدوده:\n1 = همه محصولات\n2 = فقط استارز\nعدد 1 یا 2 را بفرست."
+                "🎯 محدودهٔ کد تخفیف را انتخاب کن.\n"
+                "فهرست از دسته‌بندی‌های فعال دیتابیس ساخته شده؛ دسته‌های جدید نیز خودکار نمایش داده می‌شوند.",
+                reply_markup=InlineKeyboardMarkup(buttons)
             )
             return
 
@@ -3146,10 +3239,10 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                         (code, discount_amount, category, product_name, active,
                          expires_at, max_uses, per_user_limit, total_uses,
                          recipient_type, recipient_ids, created_by, created_at)
-                        VALUES (?, ?, ?, NULL, 1, ?, ?, ?, 0, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, 1, ?, ?, ?, 0, ?, ?, ?, ?)
                     """, (
                         admin_state["code"], admin_state["discount_amount"],
-                        admin_state["category"], expires_at_utc,
+                        admin_state["category"], admin_state.get("product_name"), expires_at_utc,
                         admin_state["max_uses"], admin_state["per_user_limit"],
                         admin_state["recipient_type"], admin_state["recipient_ids"],
                         user.id, created_at_utc.isoformat(timespec="seconds")
@@ -3161,7 +3254,8 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     "✅ کوپن ساخته شد.\n\n"
                     f"🏷️ کد: {state['code']}\n"
                     f"💰 تخفیف: {state['discount_amount']:,} تومان\n"
-                    f"🎯 محدوده: {state['category']}\n"
+                    f"🎯 محدوده: {'همه خدمات' if state['category'] == 'all' else PRODUCTS.get(state['category'], (state['category'], state['category']))[0]}\n"
+                    f"📦 محصول: {state.get('product_name') or 'تمام محصولات محدوده انتخاب‌شده'}\n"
                     f"👥 کاربران: {'همه' if state['recipient_type'] == 'all' else state['recipient_ids']}\n"
                     f"⏳ انقضا (ایران): {format_expiry_iran(expires_at_utc.isoformat() if expires_at_utc else None)}\n"
                     f"🔢 سقف کل: {state['max_uses'] or 'نامحدود'}\n"
@@ -3208,23 +3302,45 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     (code, discount_amount, category, product_name, active)
                     VALUES ('STAR20000', 20000, 'stars', NULL, 1)
                 """)
-                coupon_row = con.execute("""
-                    SELECT * FROM discount_codes
-                    WHERE code=? AND active=1 AND category IN ('stars', 'all')
-                    AND used_by IS NULL
-                    AND (product_name IS NULL OR product_name=?)
-                    LIMIT 1
-                """, (code, f"استارز {amount} عدد")).fetchone()
-                if coupon_row and not expiry_is_valid(coupon_row["expires_at"]):
-                    coupon_row = None
-                if coupon_row and "max_uses" in coupon_row.keys() and coupon_row["max_uses"] is not None:
-                    usage_count = con.execute("SELECT COUNT(*) FROM coupon_usage WHERE code=?", (code,)).fetchone()[0] if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='coupon_usage'").fetchone() else 0
-                    if usage_count >= int(coupon_row["max_uses"]):
-                        coupon_row = None
-            discount = int(coupon_row["discount_amount"]) if coupon_row else 0
-            if not coupon_row or discount <= 0 or original_price <= discount:
+                coupon_row = con.execute(
+                    "SELECT * FROM discount_codes WHERE UPPER(code)=? LIMIT 1", (code,)
+                ).fetchone()
+                invalid_reason = None
+                if not coupon_row:
+                    invalid_reason = "❌ این کد تخفیف در سیستم ثبت نشده است."
+                elif not int(coupon_row["active"] or 0):
+                    invalid_reason = "⛔ این کد تخفیف غیرفعال است."
+                elif coupon_row["used_by"] is not None:
+                    invalid_reason = "⛔ این کد قبلاً مصرف شده و دیگر قابل استفاده نیست."
+                elif coupon_row["category"] not in ("all", "stars"):
+                    expected = PRODUCTS.get(coupon_row["category"], (coupon_row["category"], coupon_row["category"]))[0]
+                    invalid_reason = f"⛔ این کد مخصوص دستهٔ «{expected}» است و برای استارز قابل استفاده نیست."
+                elif coupon_row["product_name"] and coupon_row["product_name"] != f"استارز {amount} عدد":
+                    invalid_reason = f"⛔ این کد مخصوص محصول «{coupon_row['product_name']}» است، نه بستهٔ انتخاب‌شده."
+                elif not expiry_is_valid(coupon_row["expires_at"]):
+                    invalid_reason = "⌛ اعتبار زمانی این کد تخفیف به پایان رسیده است."
+                else:
+                    usage_count = con.execute("SELECT COUNT(*) FROM coupon_usage WHERE code=?", (code,)).fetchone()[0]
+                    if coupon_row["max_uses"] is not None and usage_count >= int(coupon_row["max_uses"]):
+                        invalid_reason = "⛔ سقف مصرف کلی این کد تکمیل شده است."
+                    elif coupon_row["per_user_limit"] is not None:
+                        used_by_user = con.execute("SELECT COUNT(*) FROM coupon_usage WHERE code=? AND user_id=?", (code, user.id)).fetchone()[0]
+                        if used_by_user >= int(coupon_row["per_user_limit"]):
+                            invalid_reason = "⛔ سقف استفادهٔ شما از این کد تکمیل شده است."
+                    if not invalid_reason and coupon_row["recipient_type"] != "all":
+                        try:
+                            allowed = json.loads(coupon_row["recipient_ids"] or "[]")
+                            allowed_ids = {str(x).strip() for x in allowed if str(x).strip().isdigit()}
+                            allowed_names = {str(x).strip().lstrip("@").casefold() for x in allowed if str(x).strip().startswith("@")}
+                            if str(user.id) not in allowed_ids and (not user.username or user.username.casefold() not in allowed_names):
+                                invalid_reason = "⛔ این کد برای حساب کاربری شما مجاز نیست."
+                        except (ValueError, TypeError):
+                            invalid_reason = "⚠️ تنظیم کاربران مجاز این کد خراب است؛ با پشتیبانی تماس بگیرید."
+            discount = int(coupon_row["discount_amount"]) if coupon_row and not invalid_reason else 0
+            if invalid_reason or not coupon_row or discount <= 0 or original_price <= discount:
+                error_text = invalid_reason or "❌ مبلغ تخفیف این کد برای این بسته معتبر نیست."
                 await message.reply_text(
-                    "❌ کد تخفیف نامعتبر است. دوباره تلاش کنید یا روی «رد شدن» بزنید:",
+                    error_text + "\n\nدوباره تلاش کنید یا روی «رد شدن» بزنید:",
                     reply_markup=InlineKeyboardMarkup([[
                         InlineKeyboardButton("🔁 تلاش دوباره", callback_data=f"stars_discount_{amount}"),
                         InlineKeyboardButton("رد شدن", callback_data=f"stars_discount_skip_{amount}")
