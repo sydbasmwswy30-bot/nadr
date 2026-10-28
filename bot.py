@@ -204,6 +204,7 @@ def ensure_discount_schema(con):
     columns = {row[1] for row in con.execute("PRAGMA table_info(discount_codes)").fetchall()}
     migrations = {
         "expires_at": "TEXT",
+        "discount_type": "TEXT NOT NULL DEFAULT 'fixed'",
         "max_uses": "INTEGER",
         "per_user_limit": "INTEGER",
         "total_uses": "INTEGER NOT NULL DEFAULT 0",
@@ -1179,6 +1180,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     }
                     required = {
                         "expires_at": "TEXT",
+                        "discount_type": "TEXT NOT NULL DEFAULT 'fixed'",
                         "max_uses": "INTEGER",
                         "per_user_limit": "INTEGER",
                         "total_uses": "INTEGER NOT NULL DEFAULT 0",
@@ -1249,10 +1251,19 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         )
                         return
 
-                    discount = int(row["discount_amount"])
+                    raw_discount = int(row["discount_amount"])
+                    discount_type = row["discount_type"] if "discount_type" in row.keys() else "fixed"
+                    if discount_type == "percent":
+                        if not 1 <= raw_discount <= 100:
+                            con.rollback()
+                            await query.answer("درصد این کد تخفیف معتبر نیست.", show_alert=True)
+                            return
+                        discount = min(price - 1, (price * raw_discount) // 100)
+                    else:
+                        discount = raw_discount
                     if discount <= 0 or discount >= price:
                         con.rollback()
-                        await query.answer("مبلغ کد تخفیف معتبر نیست.", show_alert=True)
+                        await query.answer("مقدار تخفیف برای این سفارش معتبر نیست.", show_alert=True)
                         return
                     price -= discount
 
@@ -2289,7 +2300,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 """)
                 rows = con.execute("""
-                    SELECT code, discount_amount, category, product_name, active,
+                    SELECT code, discount_amount, discount_type, category, product_name, active,
                            expires_at, max_uses, total_uses, recipient_type
                     FROM discount_codes ORDER BY code LIMIT 30
                 """).fetchall()
@@ -2305,7 +2316,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 usage_text = "نامحدود" if r["max_uses"] is None else f"{int(r['total_uses'] or 0)}/{int(r['max_uses'])}"
                 lines.append(
                     f"\n🏷️ {code}\n"
-                    f"💰 تخفیف: {int(r['discount_amount']):,} تومان\n"
+                    f"💰 تخفیف: {(str(int(r['discount_amount'])) + '%') if r['discount_type'] == 'percent' else (format(int(r['discount_amount']), ',') + ' تومان')}\n"
                     f"🎯 محدوده: {scope} | {state}\n"
                     f"⏳ انقضا: {expiry_text}\n"
                     f"🔢 مصرف کل: {usage_text}"
@@ -2354,7 +2365,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # نمایش مجدد فهرست با وضعیت جدید
             with db() as con:
                 rows = con.execute("""
-                    SELECT code, discount_amount, category, product_name, active,
+                    SELECT code, discount_amount, discount_type, category, product_name, active,
                            expires_at, max_uses, total_uses, recipient_type
                     FROM discount_codes ORDER BY code LIMIT 30
                 """).fetchall()
@@ -2395,7 +2406,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("کد تخفیف حذف شد.")
             with db() as con:
                 rows = con.execute("""
-                    SELECT code, discount_amount, category, active
+                    SELECT code, discount_amount, discount_type, category, active
                     FROM discount_codes ORDER BY code LIMIT 30
                 """).fetchall()
 
@@ -2407,7 +2418,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 state = "🟢 فعال" if r["active"] else "🔴 غیرفعال"
                 lines.append(
                     f"\n🏷️ {code2}\n"
-                    f"💰 تخفیف: {int(r['discount_amount']):,} تومان\n"
+                    f"💰 تخفیف: {(str(int(r['discount_amount'])) + '%') if r['discount_type'] == 'percent' else (format(int(r['discount_amount']), ',') + ' تومان')}\n"
                     f"🎯 محدوده: {scope} | {state}"
                 )
                 buttons.append([
@@ -2449,6 +2460,20 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.pop("admin_coupon_state", None)
             await query.answer("ساخت کد لغو شد.")
             await query.edit_message_text("❌ ساخت کد تخفیف لغو شد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏷️ مدیریت تخفیف‌ها", callback_data="admin_coupons")]]))
+            return
+
+        if data in ("admin_coupon_type_percent", "admin_coupon_type_fixed"):
+            state = context.user_data.get("admin_coupon_state")
+            if not state or state.get("step") != "discount_type":
+                await query.answer("مرحلهٔ ساخت کوپن پیدا نشد؛ دوباره شروع کن.", show_alert=True)
+                return
+            state["discount_type"] = "percent" if data.endswith("percent") else "fixed"
+            state["step"] = "amount"
+            if state["discount_type"] == "percent":
+                prompt = "💯 درصد تخفیف را وارد کن (عدد 1 تا 100). مثال: 20"
+            else:
+                prompt = "💵 مبلغ ثابت تخفیف را به تومان وارد کن. مثال: 50000"
+            await query.edit_message_text(prompt + "\nبرای لغو /cancel را بفرست.")
             return
 
         if data == "admin_coupon_scope_all":
@@ -3081,8 +3106,15 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             if duplicate:
                 await message.reply_text("❌ این کد قبلاً ثبت شده است. کد دیگری بفرست. برای لغو /cancel را بفرست.")
                 return
-            admin_state.update(code=code, step="amount")
-            await message.reply_text("💰 مبلغ تخفیف به تومان را وارد کن.\nبرای لغو /cancel را بفرست.")
+            admin_state.update(code=code, step="discount_type")
+            await message.reply_text(
+                f"✅ کد: {code}\n\nنوع تخفیف را انتخاب کن:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("💯 درصدی (مثلاً 20٪)", callback_data="admin_coupon_type_percent")],
+                    [InlineKeyboardButton("💵 مبلغ ثابت (تومان)", callback_data="admin_coupon_type_fixed")],
+                    [InlineKeyboardButton("❌ لغو", callback_data="admin_coupon_creation_cancel")],
+                ])
+            )
             return
 
         if step == "amount":
@@ -3090,8 +3122,13 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 amount = int(answer.replace(",", "").replace("٬", ""))
                 if amount <= 0:
                     raise ValueError
+                if admin_state.get("discount_type") == "percent" and amount > 100:
+                    raise ValueError
             except ValueError:
-                await message.reply_text("❌ مبلغ باید عدد صحیح مثبت باشد.")
+                if admin_state.get("discount_type") == "percent":
+                    await message.reply_text("❌ درصد تخفیف باید عدد صحیح بین 1 تا 100 باشد.")
+                else:
+                    await message.reply_text("❌ مبلغ باید عدد صحیح مثبت باشد.")
                 return
             admin_state.update(discount_amount=amount, step="scope_choice")
             with db() as con:
@@ -3256,12 +3293,13 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     con.execute("""
                         INSERT INTO discount_codes
                         (code, discount_amount, category, product_name, active,
-                         expires_at, max_uses, per_user_limit, total_uses,
+                         discount_type, expires_at, max_uses, per_user_limit, total_uses,
                          recipient_type, recipient_ids, created_by, created_at)
-                        VALUES (?, ?, ?, ?, 1, ?, ?, ?, 0, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, 0, ?, ?, ?, ?)
                     """, (
                         admin_state["code"], admin_state["discount_amount"],
-                        admin_state["category"], admin_state.get("product_name"), expires_at_utc,
+                        admin_state["category"], admin_state.get("product_name"),
+                        admin_state.get("discount_type", "fixed"), expires_at_utc,
                         admin_state["max_uses"], admin_state["per_user_limit"],
                         admin_state["recipient_type"], admin_state["recipient_ids"],
                         user.id, created_at_utc.isoformat(timespec="seconds")
@@ -3272,7 +3310,7 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 await message.reply_text(
                     "✅ کوپن ساخته شد.\n\n"
                     f"🏷️ کد: {state['code']}\n"
-                    f"💰 تخفیف: {state['discount_amount']:,} تومان\n"
+                    f"💰 تخفیف: {(str(state['discount_amount']) + '%') if state.get('discount_type') == 'percent' else (format(state['discount_amount'], ',') + ' تومان')}\n"
                     f"🎯 محدوده: {coupon_category_label(state['category'])}\n"
                     f"📦 محصول: {state.get('product_name') or 'تمام محصولات محدوده انتخاب‌شده'}\n"
                     f"👥 کاربران: {'همه' if state['recipient_type'] == 'all' else state['recipient_ids']}\n"
