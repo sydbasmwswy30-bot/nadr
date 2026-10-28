@@ -9,6 +9,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from telegram import (
+    Bot,
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -189,10 +190,10 @@ EDITABLE_TEXTS = {
     "free_stars_button": ("دکمه استارز رایگان", "⭐ استارز رایگان"),
     "faq_button": ("دکمه سوالات متداول", "❓ سوالات متداول"),
     "members_button": ("دکمه ممبر تلگرام", "👥 ممبر تلگرام"),
-    "reactions_button": ("دکمه ری‌اکشن تلگرام", "🔥 ری‌اکشن تلگرام"),
+    "reactions_button": ("دکمه ری‌اکشن تلگرام", "💙 ری‌اکشن تلگرام"),
     "views_button": ("دکمه ویو تلگرام", "👀 ویو تلگرام"),
     "instagram_followers_button": ("دکمه فالوور اینستاگرام", "📸 فالوور اینستاگرام"),
-    "instagram_likes_button": ("دکمه لایک اینستاگرام", "❤️ لایک اینستاگرام"),
+    "instagram_likes_button": ("دکمه لایک اینستاگرام", "💙 لایک اینستاگرام"),
 
 
 }
@@ -244,10 +245,10 @@ PRODUCTS = {
     "config": ("🌐 کانفیگ", "خرید کانفیگ"),
     "configs": ("🌐 کانفیگ", "خرید کانفیگ"),
     "members": ("👥 ممبر تلگرام", "ممبر تلگرام"),
-    "reactions": ("🔥 ری‌اکشن تلگرام", "ری‌اکشن تلگرام"),
+    "reactions": ("💙 ری‌اکشن تلگرام", "ری‌اکشن تلگرام"),
     "views": ("👀 ویو تلگرام", "ویو تلگرام"),
     "instagram_followers": ("📸 فالوور اینستاگرام", "فالوور اینستاگرام"),
-    "instagram_likes": ("❤️ لایک اینستاگرام", "لایک اینستاگرام"),
+    "instagram_likes": ("💙 لایک اینستاگرام", "لایک اینستاگرام"),
     "instagram_views": ("🎬 ویو اینستاگرام", "ویو اینستاگرام"),
 }
 
@@ -264,7 +265,7 @@ DEFAULT_COUPON_CATEGORIES = {
     "reactions": "💟 ری‌اکشن تلگرام",
     "views": "👁️ ویو تلگرام",
     "instagram_followers": "📈 فالوور اینستاگرام",
-    "instagram_likes": "❤️ لایک اینستاگرام",
+    "instagram_likes": "💙 لایک اینستاگرام",
     "instagram_views": "🎬 ویو اینستاگرام",
 }
 
@@ -721,8 +722,25 @@ def init_db():
             )
         """)
         con.execute(
-            "INSERT OR IGNORE INTO app_settings(key, value) VALUES ('main_menu_type', 'inline')"
+            "INSERT OR IGNORE INTO app_settings(key, value) VALUES ('main_menu_type', 'keyboard')"
         )
+        # Preserve the administrator's selected menu mode across restarts.
+        # Persist visible button -> callback routing so keyboard menus continue to work after restart.
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS user_menu_routes (
+                user_id INTEGER NOT NULL,
+                label TEXT NOT NULL,
+                action_type TEXT NOT NULL,
+                action_value TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (user_id, label)
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS user_menu_state (
+                user_id INTEGER PRIMARY KEY,
+                menu_mode TEXT NOT NULL DEFAULT 'inline'
+            )
+        """)
 
         user_columns = {
             row["name"] for row in con.execute("PRAGMA table_info(users)").fetchall()
@@ -798,29 +816,28 @@ from stars_menu import stars_menu, stars_text, stars_detail_menu
 import re
 
 
-MENU_TYPE_DEFAULT = "inline"
+MENU_TYPE_DEFAULT = "keyboard"
 MENU_TYPE_KEYBOARD = "keyboard"
+# Kept only for compatibility with old saved settings and callback routes.
 MENU_TYPE_INLINE = "inline"
 
 
 def get_main_menu_type():
-    """Read the saved main-menu mode from the existing shop database."""
+    """Read the global menu mode from the existing settings table."""
     try:
         with db() as con:
-            row = con.execute(
-                "SELECT value FROM app_settings WHERE key='main_menu_type'"
-            ).fetchone()
-        value = str(row["value"] if row else MENU_TYPE_DEFAULT).strip().lower()
-        return value if value in (MENU_TYPE_KEYBOARD, MENU_TYPE_INLINE) else MENU_TYPE_DEFAULT
-    except sqlite3.Error:
-        logger.exception("Could not read main menu type; falling back to inline")
-        return MENU_TYPE_DEFAULT
+            row = con.execute("SELECT value FROM app_settings WHERE key='main_menu_type'").fetchone()
+        value = str(row[0] if row else MENU_TYPE_DEFAULT).strip().lower()
+        return value if value in (MENU_TYPE_KEYBOARD, MENU_TYPE_INLINE) else MENU_TYPE_KEYBOARD
+    except (sqlite3.Error, TypeError, ValueError):
+        return MENU_TYPE_KEYBOARD
 
 
-def set_main_menu_type(value):
-    value = str(value or "").strip().lower()
+def set_main_menu_type(value=MENU_TYPE_KEYBOARD):
+    """Persist either ordinary reply-keyboard mode or inline-button mode."""
+    value = str(value or MENU_TYPE_KEYBOARD).strip().lower()
     if value not in (MENU_TYPE_KEYBOARD, MENU_TYPE_INLINE):
-        raise ValueError("نوع منو نامعتبر است")
+        value = MENU_TYPE_KEYBOARD
     with db() as con:
         con.execute(
             "INSERT INTO app_settings(key, value) VALUES ('main_menu_type', ?) "
@@ -839,79 +856,376 @@ def _main_menu_items():
 
 
 def main_menu():
+    """Build the main menu in the globally selected Telegram menu style."""
     items = _main_menu_items()
-    if get_main_menu_type() == MENU_TYPE_KEYBOARD:
+    if get_main_menu_type() == MENU_TYPE_INLINE:
         rows = []
-        pair = []
         for item in items:
             label = str(item.get("text", "")).strip()
-            if "سؤالات متداول" in label or "سوالات متداول" in label or "خرید کانفیگ" in label:
-                if pair:
-                    rows.append(pair)
-                    pair = []
-                rows.append([KeyboardButton(label)])
-            else:
-                pair.append(KeyboardButton(label))
-                if len(pair) == 2:
-                    rows.append(pair)
-                    pair = []
-        if pair:
-            rows.append(pair)
-        rows.append([KeyboardButton("🏠 منوی اصلی")])
-        return ReplyKeyboardMarkup(
-            rows,
-            resize_keyboard=True,
-            is_persistent=True,
-            input_field_placeholder="از منوی SEYED PREMIUM انتخاب کن…",
-        )
-
+            callback = str(item.get("callback", "")).strip()
+            if label and callback:
+                rows.append([InlineKeyboardButton(label, callback_data=callback)])
+        return InlineKeyboardMarkup(rows)
     rows = []
     pair = []
     for item in items:
-        label = str(item.get("text", ""))
-        callback = str(item.get("callback", ""))
-        button = InlineKeyboardButton(
-            label,
-            callback_data=callback,
-            style="danger" if "سؤالات متداول" in label or "سوالات متداول" in label else "primary",
-        )
+        label = str(item.get("text", "")).strip()
+        if not label:
+            continue
         if "سؤالات متداول" in label or "سوالات متداول" in label or "خرید کانفیگ" in label:
             if pair:
                 rows.append(pair)
                 pair = []
-            rows.append([button])
+            rows.append([KeyboardButton(label)])
         else:
-            pair.append(button)
+            pair.append(KeyboardButton(label))
             if len(pair) == 2:
                 rows.append(pair)
                 pair = []
     if pair:
         rows.append(pair)
-    return InlineKeyboardMarkup(rows)
+    if not any(str(getattr(button, "text", "")).strip() == "🏠 منوی اصلی"
+               for row in rows for button in row):
+        rows.append([KeyboardButton("🏠 منوی اصلی")])
+    return ReplyKeyboardMarkup(
+        rows,
+        resize_keyboard=True,
+        input_field_placeholder="پیامت رو بنویس یا از منو انتخاب کن…",
+    )
 
 
 def menu_settings_keyboard():
+    mode = get_main_menu_type()
+    keyboard_label = "⌨️ کیبورد معمولی: فعال ✅" if mode == MENU_TYPE_KEYBOARD else "⌨️ فعال‌کردن کیبورد معمولی"
+    inline_label = "💎 شیشه‌ای: فعال ✅" if mode == MENU_TYPE_INLINE else "💎 فعال‌کردن منوی شیشه‌ای"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⌨️ نوع منو: کیبورد", callback_data="admin_menu_set_keyboard")],
-        [InlineKeyboardButton("💎 نوع منو: شیشه‌ای", callback_data="admin_menu_set_inline")],
+        [InlineKeyboardButton(keyboard_label, callback_data="admin_menu_set_keyboard")],
+        [InlineKeyboardButton(inline_label, callback_data="admin_menu_set_inline")],
         [InlineKeyboardButton("⬅️ بازگشت به مدیریت", callback_data="admin")],
     ])
 
 
 def menu_settings_text(prefix=None):
     mode = get_main_menu_type()
-    current = "⌨️ کیبورد معمولی" if mode == MENU_TYPE_KEYBOARD else "💎 منوی شیشه‌ای (Inline)"
-    return ((str(prefix).strip() + "\n\n") if prefix else "") + f"⚙️ تنظیم نوع منوی اصلی\n\nحالت فعلی: {current}\n\nنوع دلخواه را انتخاب کن:"
+    active = "⌨️ کیبورد معمولی" if mode == MENU_TYPE_KEYBOARD else "💎 دکمه‌های شیشه‌ای"
+    details = ("منوها با کیبورد پایین صفحه نمایش داده می‌شوند و کاربر می‌تواند آن را مخفی کند."
+               if mode == MENU_TYPE_KEYBOARD else "منوها با دکمه‌های شیشه‌ای زیر پیام‌ها نمایش داده می‌شوند.")
+    return ((str(prefix).strip() + "\n\n") if prefix else "") + (
+        "⚙️ تنظیمات منوی SEYED PREMIUM\n\n"
+        f"🔹 حالت فعال: {active}\n{details}\n\n"
+        "برای تغییر حالت، یکی از گزینه‌های زیر را انتخاب کن."
+    )
+
+
+# Every outgoing inline menu is registered per user. In keyboard mode the same
+# menu is rendered as ReplyKeyboardMarkup and each text button routes back into
+# the existing callback handler. Routes are saved additively in the shop DB.
+_USER_MENU_ROUTES = {}
+_USER_LAST_MENU_MESSAGE_IDS = {}
+_ORIGINAL_BOT_SEND_MESSAGE = Bot.send_message
+_ORIGINAL_BOT_EDIT_MESSAGE_TEXT = Bot.edit_message_text
+_ORIGINAL_BOT_EDIT_MESSAGE_REPLY_MARKUP = Bot.edit_message_reply_markup
+
+def _route_from_button(button):
+    label = str(getattr(button, "text", "") or "").strip()
+    if not label:
+        return None, None, None
+    callback = getattr(button, "callback_data", None)
+    url = getattr(button, "url", None)
+    if callback is not None:
+        return label, "callback", str(callback)
+    if url:
+        return label, "url", str(url)
+    # Preserve the label in the keyboard, but do not invent an action for
+    # Telegram button types that cannot be routed as a regular message.
+    return label, "noop", ""
+
+def _set_user_seen_mode(user_id, mode):
+    try:
+        user_id = int(user_id)
+        if mode not in (MENU_TYPE_KEYBOARD, MENU_TYPE_INLINE):
+            return
+        with db() as con:
+            con.execute(
+                "INSERT INTO user_menu_state(user_id,menu_mode) VALUES (?,?) "
+                "ON CONFLICT(user_id) DO UPDATE SET menu_mode=excluded.menu_mode",
+                (user_id, mode),
+            )
+            con.execute("UPDATE users SET menu_type_seen=? WHERE user_id=?", (mode, user_id))
+    except (sqlite3.Error, TypeError, ValueError):
+        logger.debug("Could not update user menu mode", exc_info=True)
+
+def _save_user_menu_routes(chat_id, routes, mode=None):
+    try:
+        user_id = int(chat_id)
+    except (TypeError, ValueError):
+        return
+    clean = {str(k): (str(v[0]), str(v[1])) for k, v in routes.items() if k and v}
+    _USER_MENU_ROUTES[user_id] = clean
+    try:
+        with db() as con:
+            con.execute("DELETE FROM user_menu_routes WHERE user_id=?", (user_id,))
+            con.executemany(
+                "INSERT OR REPLACE INTO user_menu_routes(user_id,label,action_type,action_value) VALUES (?,?,?,?)",
+                [(user_id, label, action[0], action[1]) for label, action in clean.items()],
+            )
+            if mode in (MENU_TYPE_KEYBOARD, MENU_TYPE_INLINE):
+                con.execute(
+                    "INSERT INTO user_menu_state(user_id,menu_mode) VALUES (?,?) "
+                    "ON CONFLICT(user_id) DO UPDATE SET menu_mode=excluded.menu_mode",
+                    (user_id, mode),
+                )
+                con.execute("UPDATE users SET menu_type_seen=? WHERE user_id=?", (mode, user_id))
+    except sqlite3.Error:
+        # Route conversion should not crash a menu send; in-memory routes remain available.
+        logger.exception("Could not persist menu routes for chat_id=%s", user_id)
+
+def _load_user_menu_routes(user_id):
+    routes = _USER_MENU_ROUTES.get(int(user_id))
+    if routes is not None:
+        return routes
+    try:
+        with db() as con:
+            rows = con.execute(
+                "SELECT label, action_type, action_value FROM user_menu_routes WHERE user_id=?",
+                (int(user_id),),
+            ).fetchall()
+        routes = {str(r["label"]): (str(r["action_type"]), str(r["action_value"] or "")) for r in rows}
+        _USER_MENU_ROUTES[int(user_id)] = routes
+        return routes
+    except (sqlite3.Error, ValueError, TypeError):
+        logger.exception("Could not load menu routes for user_id=%s", user_id)
+        return {}
+
+def _routes_from_inline_markup(markup, keyboard_labels=False):
+    routes = {}
+    rows = getattr(markup, "inline_keyboard", None) or []
+    for row in rows:
+        for button in row:
+            label, action_type, action_value = _route_from_button(button)
+            if label and keyboard_labels:
+                label = label[:64]
+            if label:
+                routes[label] = (action_type, action_value)
+    return routes
+
+def _routes_from_main_reply_keyboard(markup):
+    available = {str(item["text"]).strip(): str(item["callback"]) for item in _main_menu_items()}
+    available["🏠 منوی اصلی"] = "home"
+    labels = []
+    for row in getattr(markup, "keyboard", None) or []:
+        for button in row:
+            label = str(getattr(button, "text", "") or "").strip()
+            if label:
+                labels.append(label)
+    return {label: ("callback", available[label]) for label in labels if label in available}
+
+def _prepare_outgoing_markup(chat_id, markup):
+    """Apply the selected global style while preserving existing callback actions."""
+    if get_main_menu_type() == MENU_TYPE_INLINE:
+        return markup
+    if isinstance(markup, InlineKeyboardMarkup):
+        routes = _routes_from_inline_markup(markup, keyboard_labels=True)
+        rows = []
+        for source_row in getattr(markup, "inline_keyboard", None) or []:
+            pair = []
+            for button in source_row:
+                label = str(getattr(button, "text", "") or "").strip()[:64]
+                if not label:
+                    continue
+                pair.append(KeyboardButton(label))
+                if len(pair) == 2:
+                    rows.append(pair)
+                    pair = []
+            if pair:
+                rows.append(pair)
+
+        # A stable way back is available even when an old screen did not define one.
+        has_home_label = any(
+            str(getattr(button, "text", "")).strip() == "🏠 منوی اصلی"
+            for row in rows for button in row
+        )
+        if not has_home_label:
+            rows.append([KeyboardButton("🏠 منوی اصلی")])
+        routes["🏠 منوی اصلی"] = ("callback", "home")
+
+        try:
+            _save_user_menu_routes(chat_id, routes, MENU_TYPE_KEYBOARD)
+        except Exception:
+            logger.exception("Could not register converted keyboard routes")
+        return ReplyKeyboardMarkup(
+            rows,
+            resize_keyboard=True,
+            input_field_placeholder="پیامت رو بنویس یا از منو انتخاب کن…",
+        )
+
+    if isinstance(markup, ReplyKeyboardMarkup):
+        # Direct reply keyboards are currently used by the main menu. Keep them compact.
+        original_rows = getattr(markup, "keyboard", None) or []
+        rows = []
+        for source_row in original_rows:
+            pair = []
+            for button in source_row:
+                label = str(getattr(button, "text", "") or "").strip()
+                if not label:
+                    continue
+                pair.append(KeyboardButton(label))
+                if len(pair) == 2:
+                    rows.append(pair)
+                    pair = []
+            if pair:
+                rows.append(pair)
+        if not any(str(getattr(button, "text", "")).strip() == "🏠 منوی اصلی"
+                   for row in rows for button in row):
+            rows.append([KeyboardButton("🏠 منوی اصلی")])
+        routes = _routes_from_main_reply_keyboard(
+            ReplyKeyboardMarkup(rows, resize_keyboard=True)
+        )
+        routes["🏠 منوی اصلی"] = ("callback", "home")
+        _save_user_menu_routes(chat_id, routes, MENU_TYPE_KEYBOARD)
+        return ReplyKeyboardMarkup(
+            rows,
+            resize_keyboard=True,
+            input_field_placeholder="پیامت رو بنویس یا از منو انتخاب کن…",
+        )
+
+    # ReplyKeyboardRemove is respected only when an input step explicitly asks for it.
+    return markup
+
+
+def _bot_argument(args, kwargs, name, positional_index, default=None):
+    if name in kwargs:
+        return kwargs[name]
+    if len(args) > positional_index:
+        return args[positional_index]
+    return default
+
+def _seen_user_menu_mode(chat_id):
+    try:
+        user_id = int(chat_id)
+        with db() as con:
+            row = con.execute("SELECT menu_mode FROM user_menu_state WHERE user_id=?", (user_id,)).fetchone()
+            if row:
+                return str(row["menu_mode"] or "")
+            row = con.execute("SELECT menu_type_seen FROM users WHERE user_id=?", (user_id,)).fetchone()
+        return str(row["menu_type_seen"] or "") if row else ""
+    except (sqlite3.Error, TypeError, ValueError):
+        return ""
+
+async def _remove_stale_reply_keyboard(self, chat_id):
+    if chat_id is None or _seen_user_menu_mode(chat_id) != MENU_TYPE_KEYBOARD:
+        return
+    try:
+        await _ORIGINAL_BOT_SEND_MESSAGE(
+            self, chat_id=chat_id,
+            text="🔄 نوع منو تغییر کرده است؛ منوی جدید نمایش داده می‌شود.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        _set_user_seen_mode(chat_id, MENU_TYPE_INLINE)
+    except Exception:
+        logger.debug("Could not remove stale reply keyboard", exc_info=True)
+
+async def _mode_aware_send_message(self, *args, **kwargs):
+    markup = kwargs.get("reply_markup")
+    chat_id = _bot_argument(args, kwargs, "chat_id", 0)
+    mode = get_main_menu_type()
+    if mode == MENU_TYPE_INLINE and not isinstance(markup, ReplyKeyboardRemove):
+        await _remove_stale_reply_keyboard(self, chat_id)
+    if isinstance(markup, (InlineKeyboardMarkup, ReplyKeyboardMarkup)):
+        kwargs = dict(kwargs)
+        kwargs["reply_markup"] = _prepare_outgoing_markup(chat_id, markup)
+    result = await _ORIGINAL_BOT_SEND_MESSAGE(self, *args, **kwargs)
+    if isinstance(markup, (InlineKeyboardMarkup, ReplyKeyboardMarkup)) and getattr(result, "message_id", None) is not None:
+        try:
+            _USER_LAST_MENU_MESSAGE_IDS[int(chat_id)] = int(result.message_id)
+        except (TypeError, ValueError):
+            pass
+    return result
+
+async def _mode_aware_edit_message_text(self, *args, **kwargs):
+    markup = kwargs.get("reply_markup")
+    chat_id = _bot_argument(args, kwargs, "chat_id", 1)
+    text_value = _bot_argument(args, kwargs, "text", 0)
+    message_id = _bot_argument(args, kwargs, "message_id", 2)
+    mode = get_main_menu_type()
+    if mode == MENU_TYPE_INLINE and not isinstance(markup, ReplyKeyboardRemove):
+        await _remove_stale_reply_keyboard(self, chat_id)
+    if mode == MENU_TYPE_KEYBOARD and isinstance(markup, (InlineKeyboardMarkup, ReplyKeyboardMarkup)) and chat_id is not None:
+        converted = _prepare_outgoing_markup(chat_id, markup)
+        # Telegram cannot edit an inline message into a ReplyKeyboard. Send the
+        # same screen as a new message with the ReplyKeyboard, then clear old inline buttons.
+        send_options = {}
+        allowed = {
+            "parse_mode", "entities", "link_preview_options", "business_connection_id",
+            "message_thread_id", "disable_notification", "protect_content",
+            "message_effect_id", "allow_paid_broadcast", "direct_messages_topic_id",
+            "read_timeout", "write_timeout", "connect_timeout", "pool_timeout",
+        }
+        for key in allowed:
+            if key in kwargs:
+                send_options[key] = kwargs[key]
+        sent = await _ORIGINAL_BOT_SEND_MESSAGE(
+            self, chat_id=chat_id, text=text_value, reply_markup=converted, **send_options
+        )
+        if getattr(sent, "message_id", None) is not None:
+            try:
+                _USER_LAST_MENU_MESSAGE_IDS[int(chat_id)] = int(sent.message_id)
+            except (TypeError, ValueError):
+                pass
+        if message_id is not None:
+            try:
+                await _ORIGINAL_BOT_EDIT_MESSAGE_REPLY_MARKUP(
+                    self, chat_id=chat_id, message_id=message_id, reply_markup=None
+                )
+            except Exception:
+                logger.debug("Could not clear old inline menu after keyboard-mode switch", exc_info=True)
+        return sent
+    if mode == MENU_TYPE_KEYBOARD and markup is None and chat_id is not None:
+        result = await _ORIGINAL_BOT_EDIT_MESSAGE_TEXT(self, *args, **kwargs)
+        if message_id is not None:
+            try:
+                await _ORIGINAL_BOT_EDIT_MESSAGE_REPLY_MARKUP(
+                    self, chat_id=chat_id, message_id=message_id, reply_markup=None
+                )
+            except Exception:
+                logger.debug("Could not clear legacy inline markup", exc_info=True)
+        return result
+    if isinstance(markup, (InlineKeyboardMarkup, ReplyKeyboardMarkup)):
+        if mode == MENU_TYPE_INLINE and isinstance(markup, ReplyKeyboardMarkup):
+            kwargs = dict(kwargs)
+            kwargs["reply_markup"] = None
+        else:
+            kwargs = dict(kwargs)
+            kwargs["reply_markup"] = _prepare_outgoing_markup(chat_id, markup)
+    result = await _ORIGINAL_BOT_EDIT_MESSAGE_TEXT(self, *args, **kwargs)
+    if isinstance(markup, InlineKeyboardMarkup) and getattr(result, "message_id", None) is not None:
+        try:
+            _USER_LAST_MENU_MESSAGE_IDS[int(chat_id)] = int(result.message_id)
+        except (TypeError, ValueError):
+            pass
+    return result
+
+# Install once during import. This keeps the existing handlers intact and applies
+# the global mode to every Bot.send_message / Bot.edit_message_text call site.
+Bot.send_message = _mode_aware_send_message
+Bot.edit_message_text = _mode_aware_edit_message_text
 
 
 class _KeyboardMenuQuery:
     """Route ReplyKeyboard taps through existing callback logic."""
     def __init__(self, update, context, data):
+        from types import SimpleNamespace
         self._update = update
         self._context = context
         self.data = data
         self.from_user = update.effective_user
-        self.message = update.effective_message
+        chat_id = update.effective_chat.id if update.effective_chat else update.effective_user.id
+        message_id = _USER_LAST_MENU_MESSAGE_IDS.get(int(update.effective_user.id))
+        if message_id is None and update.effective_message is not None:
+            message_id = update.effective_message.message_id
+        # Existing callback paths that store the menu message_id keep working
+        # even though a ReplyKeyboard tap arrives as a new user text message.
+        self.message = SimpleNamespace(chat_id=chat_id, message_id=message_id)
 
     async def answer(self, *args, **kwargs):
         return None
@@ -925,52 +1239,108 @@ class _KeyboardMenuQuery:
         return None
 
 
+def _user_expecting_text_input(context):
+    """Avoid treating ordinary answers as menu taps while a form is waiting for text."""
+    state = getattr(context, "user_data", {}) or {}
+    if state.get("editor_wait_key"):
+        return True
+    if state.get("coupon_category_add_state"):
+        return True
+    if state.get("pending_product_id") is not None:
+        return True
+    if state.get("pending_product_coupon_input") is not None:
+        return True
+    if state.get("pending_stars_coupon"):
+        return True
+    if state.get("pending_product_coupon"):
+        return True
+    if state.get("config_wait_volume") or state.get("config_wait_duration"):
+        return True
+    if state.get("vip_wait_volume") or state.get("vip_wait_duration"):
+        return True
+    if state.get("admin_coupon_state"):
+        step = (state.get("admin_coupon_state") or {}).get("step")
+        if step in {"code", "amount", "recipients", "expiry_hours", "expiry_date"}:
+            return True
+    coupon_edit = state.get("coupon_edit_state")
+    if coupon_edit:
+        field = str(coupon_edit.get("field", ""))
+        if field in {"code", "amount", "userlimit", "expiry_date", "expiry_time", "recipient", "min"}:
+            return True
+    product_state = state.get("product_admin_state")
+    if product_state:
+        action = str(product_state.get("action", ""))
+        if action in {"add_name", "edit_name", "add_price", "edit_price", "price", "name"}:
+            return True
+    ui_state = state.get("uiadm_state")
+    if ui_state and str(ui_state.get("step", "")) in {"id", "text", "label"}:
+        return True
+    return False
+
+
 async def dispatch_keyboard_menu_text(update, context):
-    """Route exact main-menu keyboard labels into the existing callback handlers."""
+    """Route menu taps, while leaving active free-text input to its own workflow."""
     current_mode = get_main_menu_type()
     message = update.effective_message
     user = update.effective_user
     if not message or not message.text or not user:
         return False
-    routes = {str(item["text"]).strip(): str(item["callback"]) for item in _main_menu_items()}
-    routes["🏠 منوی اصلی"] = "home"
-    callback_data = routes.get(message.text.strip())
-    if not callback_data:
-        return False
 
-    seen_mode = ""
-    try:
-        with db() as con:
-            row = con.execute(
-                "SELECT menu_type_seen FROM users WHERE user_id=?", (user.id,)
-            ).fetchone()
-        seen_mode = str(row["menu_type_seen"] or "") if row else ""
-    except sqlite3.Error:
-        logger.exception("Could not determine stale reply-keyboard state")
-    stale_keyboard = current_mode == MENU_TYPE_INLINE and seen_mode == MENU_TYPE_KEYBOARD
-    if current_mode != MENU_TYPE_KEYBOARD and not stale_keyboard:
-        return False
-    if stale_keyboard:
-        await message.reply_text(
-            "🔄 منوی قبلی به‌روزرسانی شد.", reply_markup=ReplyKeyboardRemove()
+    label = message.text.strip()
+    routes = _load_user_menu_routes(user.id)
+    if current_mode == MENU_TYPE_KEYBOARD:
+        # During a text-entry step, ordinary answers take precedence over menu labels.
+        # Navigation remains available so users can escape the current step.
+        navigation_labels = {
+            "🏠 منوی اصلی", "🔙 بازگشت", "⬅️ بازگشت", "↩️ بازگشت",
+            "⬅️ بازگشت به مدیریت", "❌ لغو", "لغو",
+        }
+        is_navigation = (
+            label in navigation_labels
+            or "بازگشت" in label
+            or "منوی اصلی" in label
+            or label.startswith("❌ لغو")
         )
-    try:
-        with db() as con:
-            con.execute("UPDATE users SET menu_type_seen=? WHERE user_id=?", (current_mode, user.id))
-    except sqlite3.Error:
-        logger.exception("Could not update the user's seen menu type")
+        if _user_expecting_text_input(context) and not is_navigation:
+            return False
+        # Only route labels belonging to the user's most recently shown menu.
+        action = routes.get(label)
+        if action is None:
+            return False
+        action_type, action_value = action
+        _set_user_seen_mode(user.id, current_mode)
 
-    from types import SimpleNamespace
-    query = _KeyboardMenuQuery(update, context, callback_data)
-    synthetic_update = SimpleNamespace(
-        callback_query=query,
-        effective_user=update.effective_user,
-        effective_chat=update.effective_chat,
-        effective_message=update.effective_message,
-        update_id=getattr(update, "update_id", None),
-    )
-    await _callbacks_impl(synthetic_update, context)
-    return True
+        if action_type == "url":
+            await message.reply_text(f"🔗 برای ادامه، این لینک را باز کن:\n{action_value}")
+            return True
+        if action_type != "callback" or not action_value:
+            await message.reply_text("این گزینه در حالت فعلی قابل اجرا نیست. از منوی فعلی گزینه دیگری انتخاب کن.")
+            return True
+
+        from types import SimpleNamespace
+        query = _KeyboardMenuQuery(update, context, action_value)
+        synthetic_update = SimpleNamespace(
+            callback_query=query,
+            effective_user=update.effective_user,
+            effective_chat=update.effective_chat,
+            effective_message=update.effective_message,
+            update_id=getattr(update, "update_id", None),
+        )
+        await _callbacks_impl(synthetic_update, context)
+        return True
+
+    # If the global mode changed from keyboard to inline, only intercept a label
+    # that belonged to the old keyboard. Arbitrary text/IDs/links must continue
+    # into the current input workflow so in-progress orders are not discarded.
+    if label not in routes:
+        return False
+    seen_mode = _seen_user_menu_mode(user.id)
+    if seen_mode == MENU_TYPE_KEYBOARD:
+        await message.reply_text("🔄 نوع منو تغییر کرده است؛ منوی جدید نمایش داده شد.", reply_markup=ReplyKeyboardRemove())
+        _set_user_seen_mode(user.id, MENU_TYPE_INLINE)
+        await message.reply_text(bot_text("main_menu"), reply_markup=main_menu())
+        return True
+    return False
 
 
 def back_menu():
@@ -1074,18 +1444,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(user)
     _start_mark("register_user")
 
-    current_menu_type = get_main_menu_type()
-    with db() as con:
-        seen_row = con.execute(
-            "SELECT menu_type_seen FROM users WHERE user_id=?", (user.id,)
-        ).fetchone()
-        previous_menu_type = str(seen_row["menu_type_seen"] or "") if seen_row else ""
-    if current_menu_type == MENU_TYPE_INLINE and previous_menu_type == MENU_TYPE_KEYBOARD:
-        await update.effective_message.reply_text(
-            "🔄 منوی قبلی به‌روزرسانی شد.", reply_markup=ReplyKeyboardRemove()
-        )
-    with db() as con:
-        con.execute("UPDATE users SET menu_type_seen=? WHERE user_id=?", (current_menu_type, user.id))
+    current_menu_type = MENU_TYPE_KEYBOARD
+    _set_user_seen_mode(user.id, current_menu_type)
 
     # ثبت معرف فقط یک بار؛ دعوت کردن خود کاربر مجاز نیست.
     if context.args and context.args[0].startswith("ref_"):
@@ -1126,18 +1486,20 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("⛔ دسترسی مجاز نیست.")
         return
 
+    current_mode = get_main_menu_type()
+    mode_label = "⌨️ کیبورد معمولی" if current_mode == MENU_TYPE_KEYBOARD else "💎 دکمه‌های شیشه‌ای"
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 آمار فروشگاه", callback_data="admin_stats", style="primary")],
         [InlineKeyboardButton("🛍 محصولات و قیمت‌ها", callback_data="admin_products", style="primary")],
         [InlineKeyboardButton("📦 آخرین سفارش‌ها", callback_data="admin_orders", style="primary")],
         [InlineKeyboardButton("🏷️ مدیریت کدهای تخفیف", callback_data="admin_coupons", style="primary")],
-        [InlineKeyboardButton("⌨️ نوع منو: کیبورد", callback_data="admin_menu_set_keyboard", style="primary")],
-        [InlineKeyboardButton("💎 نوع منو: شیشه‌ای", callback_data="admin_menu_set_inline", style="primary")],
+        [InlineKeyboardButton(f"⌨️ تغییر به کیبورد معمولی{' ✅' if current_mode == MENU_TYPE_KEYBOARD else ''}", callback_data="admin_menu_set_keyboard", style="primary")],
+        [InlineKeyboardButton(f"💎 تغییر به شیشه‌ای{' ✅' if current_mode == MENU_TYPE_INLINE else ''}", callback_data="admin_menu_set_inline", style="primary")],
         [InlineKeyboardButton("📝 ویرایش متن‌ها و دکمه‌ها", callback_data="uiadm_home", style="primary")],
         [InlineKeyboardButton("🏠 منوی اصلی", callback_data="home", style="primary")],
     ])
     await update.effective_message.reply_text(
-        bot_text("admin_title"),
+        f"{bot_text('admin_title')}\n\n🔹 حالت منوی کل ربات: {mode_label}",
         reply_markup=keyboard,
     )
 
@@ -1242,9 +1604,9 @@ async def _show_product_category(query, category, user_id):
         "premium": "💎 تلگرام پرمیوم", "stars": "⭐ تلگرام استارز",
         "gifts": "🎁 گیفت تلگرام", "boost": "🚀 بوست تلگرام",
         "numbers": "📱 شماره مجازی", "members": "👥 ممبر تلگرام",
-        "reactions": "🔥 ری‌اکشن تلگرام", "views": "👀 ویو تلگرام",
+        "reactions": "💙 ری‌اکشن تلگرام", "views": "👀 ویو تلگرام",
         "instagram_followers": "📸 فالوور اینستاگرام",
-        "instagram_likes": "❤️ لایک اینستاگرام",
+        "instagram_likes": "💙 لایک اینستاگرام",
     }
     title = labels.get(category, f"🛍 {category}")
     if not rows:
@@ -1913,7 +2275,16 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "home":
         # Explicit main-menu destination: do not reuse wallet or previous submenu renderers.
-        for key in ("pending_product_id", "pending_stars_coupon", "stars_coupon", "pending_product_coupon", "pending_product_coupon_input"):
+        # Returning home cancels only transient in-memory forms/drafts; no database
+        # customers, products, order, receipt, wallet or payment history is deleted.
+        for key in (
+            "pending_product_id", "pending_stars_coupon", "stars_coupon",
+            "pending_product_coupon", "pending_product_coupon_input",
+            "admin_coupon_state", "coupon_category_add_state", "coupon_edit_categories",
+            "coupon_edit_state", "coupon_scope_state", "product_admin_state",
+            "editor_wait_key", "uiadm_state", "config_wait_volume",
+            "config_wait_duration", "vip_wait_volume", "vip_wait_duration",
+        ):
             context.user_data.pop(key, None)
         context.user_data["current_screen"] = "home"
         context.user_data["screen_history"] = []
@@ -2843,18 +3214,20 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if data == "admin":
+            current_mode = get_main_menu_type()
+            mode_label = "⌨️ کیبورد معمولی" if current_mode == MENU_TYPE_KEYBOARD else "💎 دکمه‌های شیشه‌ای"
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("📊 آمار فروشگاه", callback_data="admin_stats")],
                 [InlineKeyboardButton("🛍 محصولات و قیمت‌ها", callback_data="admin_products")],
                 [InlineKeyboardButton("📦 آخرین سفارش‌ها", callback_data="admin_orders")],
                 [InlineKeyboardButton("🏷️ مدیریت کدهای تخفیف", callback_data="admin_coupons")],
-                [InlineKeyboardButton("⌨️ نوع منو: کیبورد", callback_data="admin_menu_set_keyboard")],
-                [InlineKeyboardButton("💎 نوع منو: شیشه‌ای", callback_data="admin_menu_set_inline")],
+                [InlineKeyboardButton(f"⌨️ تغییر به کیبورد معمولی{' ✅' if current_mode == MENU_TYPE_KEYBOARD else ''}", callback_data="admin_menu_set_keyboard")],
+                [InlineKeyboardButton(f"💎 تغییر به شیشه‌ای{' ✅' if current_mode == MENU_TYPE_INLINE else ''}", callback_data="admin_menu_set_inline")],
                 [InlineKeyboardButton("📝 ویرایش متن‌ها و دکمه‌ها", callback_data="uiadm_home")],
                 [InlineKeyboardButton("🏠 منوی اصلی", callback_data="home")],
             ])
             await query.edit_message_text(
-                "⚙️ پنل مدیریت SEYED PREMIUM",
+                f"⚙️ پنل مدیریت SEYED PREMIUM\n\n🔹 حالت منوی کل ربات: {mode_label}",
                 reply_markup=keyboard
             )
             return
@@ -2867,15 +3240,11 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if data in ("admin_menu_set_keyboard", "admin_menu_set_inline"):
-            selected = MENU_TYPE_KEYBOARD if data == "admin_menu_set_keyboard" else MENU_TYPE_INLINE
-            set_main_menu_type(selected)
-            confirmation = (
-                "✅ نوع منو با موفقیت روی کیبورد معمولی تنظیم شد."
-                if selected == MENU_TYPE_KEYBOARD
-                else "✅ نوع منو با موفقیت روی منوی شیشه‌ای تنظیم شد."
-            )
+            selected_mode = MENU_TYPE_KEYBOARD if data == "admin_menu_set_keyboard" else MENU_TYPE_INLINE
+            set_main_menu_type(selected_mode)
+            selected_label = "کیبورد معمولی" if selected_mode == MENU_TYPE_KEYBOARD else "منوی شیشه‌ای"
             await query.edit_message_text(
-                menu_settings_text(confirmation),
+                menu_settings_text(f"✅ حالت {selected_label} فعال شد."),
                 reply_markup=menu_settings_keyboard(),
             )
             return
@@ -3521,10 +3890,10 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "gifts": "🎁 گیفت",
                 "numbers": "📱 شماره مجازی",
                 "members": "👥 ممبر تلگرام",
-                "reactions": "🔥 ری‌اکشن تلگرام",
+                "reactions": "💙 ری‌اکشن تلگرام",
                 "views": "👀 ویو تلگرام",
                 "instagram_followers": "📸 فالوور اینستاگرام",
-                "instagram_likes": "❤️ لایک اینستاگرام",
+                "instagram_likes": "💙 لایک اینستاگرام",
                 "instagram_views": "🎬 ویو اینستاگرام",
             }
 
@@ -4025,17 +4394,20 @@ async def cancel_coupon_creation(update: Update, context: ContextTypes.DEFAULT_T
 
 async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    # Admin workflows (including coupon expiry numeric replies) must not be blocked by channel checks.
-    if not user or user.id != ADMIN_ID:
-        if not await require_channel_membership(update, context):
-            return
     message = update.effective_message
     if user:
         register_user(user)
 
-    # Route menu taps before free-text order/coupon workflows can consume them.
+    # Route exact menu taps before membership/input workflows consume the text.
+    # Protected callbacks still enforce channel membership, and this lets non-members
+    # activate the visible membership-check button in keyboard mode.
     if message and message.text and await dispatch_keyboard_menu_text(update, context):
         return
+
+    # Admin workflows (including coupon expiry numeric replies) must not be blocked by channel checks.
+    if not user or user.id != ADMIN_ID:
+        if not await require_channel_membership(update, context):
+            return
 
     # Admin coupon panel: create / activate / deactivate.
     # لغو ساخت کد تخفیف از داخل پیام متنی
