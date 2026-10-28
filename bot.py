@@ -855,8 +855,8 @@ def _main_menu_items():
     ]
 
 
-def main_menu():
-    """Build the main menu in the globally selected Telegram menu style."""
+def main_menu(user_id=None):
+    """Build the main menu; expose management entry only to the bot owner."""
     items = _main_menu_items()
     if get_main_menu_type() == MENU_TYPE_INLINE:
         rows = []
@@ -887,6 +887,9 @@ def main_menu():
     if not any(str(getattr(button, "text", "")).strip() == "🏠 منوی اصلی"
                for row in rows for button in row):
         rows.append([KeyboardButton("🏠 منوی اصلی")])
+    # Owner-only entry at the bottom of the reply keyboard. Never show it to users.
+    if user_id is not None and int(user_id) == ADMIN_ID:
+        rows.append([KeyboardButton("👑 مدیریت کل ربات")])
     return ReplyKeyboardMarkup(
         rows,
         resize_keyboard=True,
@@ -1009,9 +1012,11 @@ def _routes_from_inline_markup(markup, keyboard_labels=False):
                 routes[label] = (action_type, action_value)
     return routes
 
-def _routes_from_main_reply_keyboard(markup):
+def _routes_from_main_reply_keyboard(markup, user_id=None):
     available = {str(item["text"]).strip(): str(item["callback"]) for item in _main_menu_items()}
     available["🏠 منوی اصلی"] = "home"
+    if user_id is not None and int(user_id) == ADMIN_ID:
+        available["👑 مدیریت کل ربات"] = "admin"
     labels = []
     for row in getattr(markup, "keyboard", None) or []:
         for button in row:
@@ -1079,7 +1084,7 @@ def _prepare_outgoing_markup(chat_id, markup):
                    for row in rows for button in row):
             rows.append([KeyboardButton("🏠 منوی اصلی")])
         routes = _routes_from_main_reply_keyboard(
-            ReplyKeyboardMarkup(rows, resize_keyboard=True)
+            ReplyKeyboardMarkup(rows, resize_keyboard=True), user_id=chat_id
         )
         routes["🏠 منوی اصلی"] = ("callback", "home")
         _save_user_menu_routes(chat_id, routes, MENU_TYPE_KEYBOARD)
@@ -1469,7 +1474,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = bot_text("welcome")
     _start_mark("welcome text")
 
-    markup = main_menu()
+    markup = main_menu(update.effective_user.id)
     _start_mark("main_menu build")
 
     await update.effective_message.reply_text(text, reply_markup=markup)
@@ -1696,11 +1701,11 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     logger.debug("Could not remove previous inline keyboard", exc_info=True)
                 await context.bot.send_message(
-                    chat_id=user_id, text=bot_text("main_menu"), reply_markup=main_menu()
+                    chat_id=user_id, text=bot_text("main_menu"), reply_markup=main_menu(user_id)
                 )
             else:
                 await query.edit_message_text(
-                    "🏠 منوی اصلی", reply_markup=main_menu()
+                    "🏠 منوی اصلی", reply_markup=main_menu(user_id)
                 )
         return
 
@@ -2296,7 +2301,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=user_id,
                 text=bot_text("main_menu"),
-                reply_markup=main_menu(),
+                reply_markup=main_menu(user_id),
             )
         else:
             await query.edit_message_text(
