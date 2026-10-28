@@ -485,8 +485,9 @@ def jalali_date(value):
 
 
 async def _safe_callback_answer(query):
+    """Acknowledge Telegram callback once; never recursively schedule itself."""
     try:
-        context.application.create_task(_safe_callback_answer(query))
+        await query.answer()
     except Exception:
         logger.debug("Callback answer could not be sent", exc_info=True)
 
@@ -511,6 +512,48 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _button,
             time.perf_counter() - _handler_started,
         )
+
+
+async def _show_product_category(query, category, user_id):
+    """Render any database-backed product category without a hard-coded category whitelist."""
+    with db() as con:
+        rows = con.execute(
+            "SELECT id, name, price FROM products WHERE category=? AND active=1 ORDER BY id",
+            (category,),
+        ).fetchall()
+    labels = {
+        "premium": "💎 تلگرام پرمیوم", "stars": "⭐ تلگرام استارز",
+        "gifts": "🎁 گیفت تلگرام", "boost": "🚀 بوست تلگرام",
+        "numbers": "📱 شماره مجازی", "members": "👥 ممبر تلگرام",
+        "reactions": "🔥 ری‌اکشن تلگرام", "views": "👀 ویو تلگرام",
+        "instagram_followers": "📸 فالوور اینستاگرام",
+        "instagram_likes": "❤️ لایک اینستاگرام",
+    }
+    title = labels.get(category, f"🛍 {category}")
+    if not rows:
+        await query.edit_message_text(
+            f"{title}\n\nفعلاً محصول فعالی در این دسته ثبت نشده است.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ بازگشت به خدمات", callback_data="cat_stars")],
+                [InlineKeyboardButton("🏠 منوی اصلی", callback_data="home")],
+            ]),
+        )
+        return
+    keyboard = []
+    for row in rows:
+        price = int(row["price"] or 0)
+        price_text = f"{price:,} تومان" if price > 0 else "استعلام قیمت"
+        keyboard.append([InlineKeyboardButton(
+            f"{row['name']} | {price_text}", callback_data=f"buy_{row['id']}", style="success"
+        )])
+    keyboard.extend([
+        [InlineKeyboardButton("⬅️ بازگشت به خدمات", callback_data="cat_stars")],
+        [InlineKeyboardButton("🏠 منوی اصلی", callback_data="home")],
+    ])
+    await query.edit_message_text(
+        f"{title}\n\nمحصول موردنظر را انتخاب کن.\nقیمت صفر یعنی قیمت هنوز توسط مدیر تنظیم نشده است.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
 
 
 async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1198,9 +1241,14 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "stars_custom":
-        await query.answer(
-            "ثبت مقدار دلخواه را در مرحله بعد فعال می‌کنیم.",
-            show_alert=True
+        await query.edit_message_text(
+            "✏️ استارز به مقدار دلخواه | SEYED PREMIUM\n\n"
+            "برای این گزینه هنوز روش قیمت‌گذاری و ثبت سفارش امن تعریف نشده است؛ بنابراین فعلاً سفارش مقدار دلخواه ثبت نمی‌شود.\n"
+            "می‌توانی یکی از بسته‌های موجود را انتخاب کنی یا به منوی خدمات برگردی.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⭐ انتخاب بسته‌های استارز", callback_data="service_stars")],
+                [InlineKeyboardButton("🏠 منوی اصلی", callback_data="home")],
+            ]),
         )
         return
 
@@ -1212,12 +1260,12 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if data == "cat_numbers":
-        return
-
-
-
     if data == "home":
+        # Explicit main-menu destination: do not reuse wallet or previous submenu renderers.
+        for key in ("pending_product_id", "pending_stars_coupon", "stars_coupon"):
+            context.user_data.pop(key, None)
+        context.user_data["current_screen"] = "home"
+        context.user_data["screen_history"] = []
         await query.edit_message_text(
             bot_text("main_menu"),
             reply_markup=main_menu(),
@@ -1726,8 +1774,43 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Configurable service buttons must have a route, even when a new category is added.
+    if data.startswith("service_") and data != "service_stars":
+        service_category = data[len("service_"):]
+        await _show_product_category(query, service_category, user_id)
+        return
+
+    if data == "free_stars":
+        await query.edit_message_text(
+            "⭐ استارز رایگان | SEYED PREMIUM\n\n"
+            "این قابلیت هنوز به منبع واقعی دریافت استارز متصل نشده است؛ بنابراین در حال حاضر استارز رایگان ثبت یا پرداخت نمی‌شود.\n\n"
+            "برای دیدن خدمات فروشگاه از منوی اصلی استفاده کن.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🛍 خرید سرویس", callback_data="cat_stars")],
+                [InlineKeyboardButton("🏠 منوی اصلی", callback_data="home")],
+            ]),
+        )
+        return
+
+    if data == "faq":
+        await query.edit_message_text(
+            "❓ سؤالات متداول | SEYED PREMIUM\n\n"
+            "📦 سفارش پس از ثبت برای بررسی مدیر ارسال می‌شود.\n"
+            "💳 پرداخت و تحویل فقط پس از بررسی و تأیید مدیر انجام می‌شود.\n"
+            "🎧 برای پیگیری سفارش با پشتیبانی تماس بگیر.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🎧 پشتیبانی", callback_data="support")],
+                [InlineKeyboardButton("🏠 منوی اصلی", callback_data="home")],
+            ]),
+        )
+        return
+
     if data.startswith("cat_"):
         category = data[4:]
+        if category not in PRODUCTS:
+            # Categories added in the database/configuration remain navigable.
+            await _show_product_category(query, category, user_id)
+            return
         if category not in PRODUCTS:
             await query.edit_message_text("❌ دسته‌بندی پیدا نشد.", reply_markup=back_menu())
             return
@@ -1997,7 +2080,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
                 text,
                 reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("↩️ بازگشت به پنل مدیریت", callback_data="admin")
+                    InlineKeyboardButton("🏠 منوی اصلی", callback_data="home")
                 ]])
             )
         return
@@ -2068,7 +2151,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"متن فعلی:\n{bot_text(key)}\n\n"
             "حالا متن جدید را به‌صورت یک پیام متنی بفرست.",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("↩️ بازگشت", callback_data="edit_content")]
+                [InlineKeyboardButton("🏠 منوی اصلی", callback_data="home")]
             ])
         )
         return
@@ -2129,9 +2212,13 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 buttons.append([
                     InlineKeyboardButton(
+                        "🔴 غیرفعال‌سازی" if r["active"] else "🟢 فعال‌سازی",
+                        callback_data="admin_coupon_toggle_" + code,
+                    ),
+                    InlineKeyboardButton(
                         f"🗑️ حذف {code}",
-                        callback_data="admin_coupon_delete_" + code
-                    )
+                        callback_data="admin_coupon_delete_" + code,
+                    ),
                 ])
 
             if not rows:
@@ -2146,6 +2233,50 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "\n".join(lines),
                 reply_markup=InlineKeyboardMarkup(buttons)
             )
+            return
+
+        if data.startswith("admin_coupon_toggle_"):
+            code = data[len("admin_coupon_toggle_"):]
+            with db() as con:
+                row = con.execute(
+                    "SELECT active FROM discount_codes WHERE code=?", (code,)
+                ).fetchone()
+                if not row:
+                    await query.answer("این کد وجود ندارد یا حذف شده است.", show_alert=True)
+                    return
+                new_active = 0 if int(row["active"] or 0) else 1
+                con.execute(
+                    "UPDATE discount_codes SET active=? WHERE code=?",
+                    (new_active, code),
+                )
+            await query.answer("کد تخفیف فعال شد." if new_active else "کد تخفیف غیرفعال شد.")
+            # نمایش مجدد فهرست با وضعیت جدید
+            with db() as con:
+                rows = con.execute("""
+                    SELECT code, discount_amount, category, product_name, active,
+                           expires_at, max_uses, total_uses, recipient_type
+                    FROM discount_codes ORDER BY code LIMIT 30
+                """).fetchall()
+            lines = ["🏷️ مدیریت کدهای تخفیف", "", "برای تغییر وضعیت یا حذف، دکمه کنار هر کد را بزن."]
+            buttons = []
+            for r in rows:
+                code2 = r["code"]
+                scope = "همه محصولات" if r["category"] == "all" else r["category"]
+                state_text = "🟢 فعال" if r["active"] else "🔴 غیرفعال"
+                expiry = r["expires_at"] or "بدون انقضا"
+                uses = "نامحدود" if r["max_uses"] is None else f"{int(r['total_uses'] or 0)}/{int(r['max_uses'])}"
+                lines.append(f"\n🏷️ {code2}\n💰 تخفیف: {int(r['discount_amount']):,} تومان\n🎯 محدوده: {scope} | {state_text}\n⏳ انقضا: {expiry}\n🔢 مصرف کل: {uses}")
+                buttons.append([
+                    InlineKeyboardButton("🔴 غیرفعال‌سازی" if r["active"] else "🟢 فعال‌سازی", callback_data="admin_coupon_toggle_" + code2),
+                    InlineKeyboardButton(f"🗑️ حذف {code2}", callback_data="admin_coupon_delete_" + code2),
+                ])
+            if not rows:
+                lines.append("\nهنوز کدی ساخته نشده است.")
+            buttons.extend([
+                [InlineKeyboardButton("➕ ساخت کد تخفیف", callback_data="admin_coupon_create")],
+                [InlineKeyboardButton("🏠 بازگشت به مدیریت", callback_data="admin")],
+            ])
+            await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
             return
 
         if data.startswith("admin_coupon_delete_"):
@@ -2179,9 +2310,13 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 buttons.append([
                     InlineKeyboardButton(
+                        "🔴 غیرفعال‌سازی" if r["active"] else "🟢 فعال‌سازی",
+                        callback_data="admin_coupon_toggle_" + code2,
+                    ),
+                    InlineKeyboardButton(
                         f"🗑️ حذف {code2}",
-                        callback_data="admin_coupon_delete_" + code2
-                    )
+                        callback_data="admin_coupon_delete_" + code2,
+                    ),
                 ])
 
             if not rows:
