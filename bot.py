@@ -2385,12 +2385,12 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        if data == "admin_products" or data.startswith("admin_p_"):
+        if data == "admin_products" or data.startswith("admin_products_page_") or data.startswith("admin_p_"):
             if user_id != ADMIN_ID:
                 await query.answer("دسترسی مجاز نیست.", show_alert=True)
                 return
 
-            # صفحه‌بندی پویا: محصولات فعلی و محصولات آینده از دیتابیس خوانده می‌شوند.
+            # صفحه‌بندی قبل از پردازش سایر callbackها تشخیص داده می‌شود.
             products_page = 1
             if data.startswith("admin_products_page_"):
                 try:
@@ -2413,6 +2413,14 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "instagram_likes": "❤️ لایک اینستاگرام",
                 "instagram_views": "🎬 ویو اینستاگرام",
             }
+
+            # دسته‌های موجود در دیتابیس نیز به‌صورت پویا به گزینه‌ها اضافه می‌شوند.
+            with db() as con:
+                existing_categories = [r[0] for r in con.execute(
+                    "SELECT DISTINCT category FROM products WHERE category IS NOT NULL AND category != '' ORDER BY category"
+                ).fetchall()]
+            for existing_category in existing_categories:
+                categories.setdefault(existing_category, existing_category)
 
             if data == "admin_p_add":
                 keyboard = [
@@ -2494,10 +2502,12 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             elif data.startswith("admin_p_setcat_"):
-                parts = data.split("_")
+                # فرمت: admin_p_setcat_<product_id>_<category_key>؛ کلید دسته ممکن است underscore داشته باشد.
+                prefix = "admin_p_setcat_"
+                payload = data[len(prefix):]
                 try:
-                    pid = int(parts[3])
-                    category = parts[4]
+                    pid_text, category = payload.split("_", 1)
+                    pid = int(pid_text)
                 except (ValueError, IndexError):
                     await query.answer("درخواست نامعتبر است.", show_alert=True)
                     return
