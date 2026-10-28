@@ -251,7 +251,6 @@ PRODUCTS = {
 
 DEFAULT_COUPON_CATEGORIES = {
     "stars": "⭐ استارز تلگرام",
-    "ton": "💎 تون (TON)",
     "gifts": "🎁 گیفت تلگرام",
     "premium": "👑 پرمیوم تلگرام",
     "boost": "🚀 بوست تلگرام",
@@ -326,6 +325,8 @@ def list_coupon_categories(con):
         product_rows = []
     for row in product_rows:
         key = str(row[0]).strip()
+        if key.casefold() in {"ton", "tons"}:
+            continue
         if key == "configs":
             key = "config"
         if key:
@@ -335,7 +336,7 @@ def list_coupon_categories(con):
                 (key, label, utc_now().isoformat(timespec="seconds")),
             )
     return [dict(row) for row in con.execute(
-        "SELECT category_key, display_name FROM coupon_categories WHERE active=1 ORDER BY sort_order, display_name COLLATE NOCASE"
+        "SELECT category_key, display_name FROM coupon_categories WHERE active=1 AND lower(category_key) NOT IN ('ton', 'tons') AND lower(display_name) NOT LIKE '%ton (ton)%' ORDER BY sort_order, display_name COLLATE NOCASE"
     ).fetchall()]
 
 
@@ -3327,9 +3328,11 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "SELECT category_key, display_name FROM coupon_categories WHERE active=1 ORDER BY sort_order, display_name"
                 ).fetchall()
             for existing_category in existing_categories:
-                categories.setdefault(existing_category, existing_category)
+                if str(existing_category).strip().casefold() not in {"ton", "tons"}:
+                    categories.setdefault(existing_category, existing_category)
             for saved_category in saved_categories:
-                categories[saved_category["category_key"]] = saved_category["display_name"]
+                if str(saved_category["category_key"]).strip().casefold() not in {"ton", "tons"}:
+                    categories[saved_category["category_key"]] = saved_category["display_name"]
 
             if data == "admin_p_add":
                 keyboard = [
