@@ -75,6 +75,41 @@ def format_expiry_iran(value):
         return f"زمان نامعتبر: {value}"
     return expiry.astimezone(IRAN_TZ).strftime("%Y-%m-%d %H:%M:%S (Asia/Tehran)")
 
+
+def jalali_to_gregorian(jy, jm, jd):
+    """Convert a Jalali date to Gregorian date without external dependencies."""
+    jy = int(jy); jm = int(jm); jd = int(jd)
+    if not (1 <= jm <= 12 and 1 <= jd <= (31 if jm <= 6 else 30)):
+        raise ValueError("invalid Jalali date")
+    jy -= 979
+    days = 365 * jy + (jy // 33) * 8 + ((jy % 33 + 3) // 4)
+    days += sum(31 if i < 6 else 30 for i in range(jm - 1))
+    days += jd - 1 + 79
+    gy = 1600 + 400 * (days // 146097)
+    days %= 146097
+    leap = True
+    if days >= 36525:
+        days -= 1
+        gy += 100 * (days // 36524)
+        days %= 36524
+        if days >= 365:
+            days += 1
+        else:
+            leap = False
+    gy += 4 * (days // 1461)
+    days %= 1461
+    if days >= 366:
+        leap = False
+        days -= 1
+        gy += days // 365
+        days %= 365
+    month_days = [31, 29 if leap else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    gm = 1
+    while gm <= 12 and days >= month_days[gm - 1]:
+        days -= month_days[gm - 1]
+        gm += 1
+    return datetime(gy, gm, days + 1, tzinfo=IRAN_TZ)
+
 # EDITOR_PANEL_INSTALLED
 import json
 SETTINGS_FILE = Path(__file__).with_name("bot_settings.json")
@@ -204,6 +239,7 @@ def ensure_discount_schema(con):
     columns = {row[1] for row in con.execute("PRAGMA table_info(discount_codes)").fetchall()}
     migrations = {
         "expires_at": "TEXT",
+        "min_order_amount": "INTEGER NOT NULL DEFAULT 0",
         "discount_type": "TEXT NOT NULL DEFAULT 'fixed'",
         "max_uses": "INTEGER",
         "per_user_limit": "INTEGER",
@@ -1251,6 +1287,10 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         )
                         return
 
+                    if int(row["min_order_amount"] or 0) > price:
+                        con.rollback()
+                        await query.answer(f"حداقل مبلغ خرید این کد {int(row['min_order_amount']):,} تومان است.", show_alert=True)
+                        return
                     raw_discount = int(row["discount_amount"])
                     discount_type = row["discount_type"] if "discount_type" in row.keys() else "fixed"
                     if discount_type == "percent":
@@ -2290,59 +2330,168 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "admin_coupons":
             with db() as con:
                 ensure_discount_schema(con)
-                con.execute("""
-                    CREATE TABLE IF NOT EXISTS discount_codes (
-                        code TEXT PRIMARY KEY,
-                        discount_amount INTEGER NOT NULL,
-                        category TEXT NOT NULL DEFAULT 'stars',
-                        product_name TEXT,
-                        active INTEGER NOT NULL DEFAULT 1
-                    )
-                """)
                 rows = con.execute("""
                     SELECT code, discount_amount, discount_type, category, product_name, active,
-                           expires_at, max_uses, total_uses, recipient_type
-                    FROM discount_codes ORDER BY code LIMIT 30
+                           expires_at, max_uses, per_user_limit, total_uses, recipient_type,
+                           min_order_amount
+                    FROM discount_codes ORDER BY created_at DESC, code LIMIT 30
                 """).fetchall()
-
-            lines = ["🏷️ مدیریت کدهای تخفیف", "", "برای حذف هر کد، دکمهٔ کنارش را بزن."]
+            lines = ["🏷️ کدهای تخفیف", ""]
             buttons = []
-
             for r in rows:
-                code = r["code"]
-                scope = coupon_category_label(r["category"])
-                state = "🟢 فعال" if r["active"] else "🔴 غیرفعال"
-                expiry_text = format_expiry_iran(r["expires_at"])
-                usage_text = "نامحدود" if r["max_uses"] is None else f"{int(r['total_uses'] or 0)}/{int(r['max_uses'])}"
-                lines.append(
-                    f"\n🏷️ {code}\n"
-                    f"💰 تخفیف: {(str(int(r['discount_amount'])) + '%') if r['discount_type'] == 'percent' else (format(int(r['discount_amount']), ',') + ' تومان')}\n"
-                    f"🎯 محدوده: {scope} | {state}\n"
-                    f"⏳ انقضا: {expiry_text}\n"
-                    f"🔢 مصرف کل: {usage_text}"
-                )
+                code = str(r["code"])
+                expired = not expiry_is_valid(r["expires_at"])
+                state_label = "⌛ منقضی‌شده" if expired else ("🟢 فعال" if r["active"] else "🔴 غیرفعال")
+                amount_text = f"{int(r['discount_amount'])}%" if r["discount_type"] == "percent" else f"{int(r['discount_amount']):,} تومان"
+                total = "نامحدود" if r["max_uses"] is None else str(int(r["max_uses"]))
+                used = int(r["total_uses"] or 0)
+                lines.append(f"⌛ {code} — {amount_text}\nاستفاده: {used}/{total} | انقضا: {format_expiry_iran(r['expires_at'])}")
+                buttons.append([InlineKeyboardButton(f"✏️ {code}", callback_data="admin_coupon_view_" + code)])
                 buttons.append([
-                    InlineKeyboardButton(
-                        "🔴 غیرفعال‌سازی" if r["active"] else "🟢 فعال‌سازی",
-                        callback_data="admin_coupon_toggle_" + code,
-                    ),
-                    InlineKeyboardButton(
-                        f"🗑️ حذف {code}",
-                        callback_data="admin_coupon_delete_" + code,
-                    ),
+                    InlineKeyboardButton("🔴 غیرفعال" if r["active"] else "🟢 فعال‌سازی", callback_data="admin_coupon_toggle_" + code),
+                    InlineKeyboardButton("🗑️", callback_data="admin_coupon_delete_" + code),
                 ])
-
             if not rows:
-                lines.append("\nهنوز کدی ساخته نشده است.")
-
+                lines.append("هنوز کدی تعریف نشده.")
             buttons.extend([
-                [InlineKeyboardButton("➕ ساخت کد تخفیف", callback_data="admin_coupon_create")],
-                [InlineKeyboardButton("🏠 بازگشت به مدیریت", callback_data="admin")],
+                [InlineKeyboardButton("➕ افزودن کد تخفیف جدید", callback_data="admin_coupon_create")],
+                [InlineKeyboardButton("🎁 تخفیف پلکانی زیرمجموعه‌گیری", callback_data="admin_coupon_referral")],
+                [InlineKeyboardButton("⬅️ بازگشت", callback_data="admin")],
             ])
+            await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
+            return
 
+        if data.startswith("admin_coupon_view_"):
+            code = data[len("admin_coupon_view_"):]
+            with db() as con:
+                ensure_discount_schema(con)
+                r = con.execute("SELECT * FROM discount_codes WHERE code=?", (code,)).fetchone()
+            if not r:
+                await query.answer("این کد در دیتابیس وجود ندارد.", show_alert=True)
+                return
+            expired = not expiry_is_valid(r["expires_at"])
+            status = "⌛ منقضی‌شده" if expired else ("🟢 فعال" if r["active"] else "🔴 غیرفعال")
+            amount_text = f"{int(r['discount_amount'])}%" if r["discount_type"] == "percent" else f"{int(r['discount_amount']):,} تومان (مبلغ ثابت)"
+            max_uses = "نامحدود" if r["max_uses"] is None else str(int(r["max_uses"]))
+            per_user = "نامحدود" if r["per_user_limit"] is None else str(int(r["per_user_limit"]))
+            recipient = "همه کاربران" if r["recipient_type"] == "all" else (r["recipient_ids"] or "کاربران انتخاب‌شده")
+            detail = (
+                f"🏷️ کد تخفیف: {code}\n\n"
+                f"وضعیت: {status}\n"
+                f"مقدار تخفیف: {amount_text}\n"
+                f"تعداد استفاده: {int(r['total_uses'] or 0)} از {max_uses}\n"
+                f"انقضا: {format_expiry_iran(r['expires_at'])}\n"
+                f"اختصاص به کاربر: {recipient}\n"
+                f"حداقل مبلغ خرید: {int(r['min_order_amount'] or 0):,} تومان\n"
+                f"📦 دسته‌های محصول: {coupon_category_label(r['category'])}\n"
+                f"محصول مشخص: {r['product_name'] or 'همه محصولات محدوده انتخاب‌شده'}\n\n"
+                "از دکمه‌های زیر ویرایش کن:"
+            )
+            buttons = [
+                [InlineKeyboardButton("✏️ تغییر کد", callback_data="admin_coupon_edit_code_" + code), InlineKeyboardButton("💯 تغییر مقدار تخفیف", callback_data="admin_coupon_edit_amount_" + code)],
+                [InlineKeyboardButton("🔢 تعداد مجاز استفاده", callback_data="admin_coupon_edit_max_" + code), InlineKeyboardButton("📅 تاریخ انقضا", callback_data="admin_coupon_edit_expiry_" + code)],
+                [InlineKeyboardButton("👤 اختصاص به یک کاربر خاص", callback_data="admin_coupon_edit_recipient_" + code)],
+                [InlineKeyboardButton("🧾 حداقل مبلغ خرید", callback_data="admin_coupon_edit_min_" + code)],
+                [InlineKeyboardButton("📦 دسته‌های محصول", callback_data="admin_coupon_edit_scope_" + code)],
+                [InlineKeyboardButton("♾️ حذف انقضا", callback_data="admin_coupon_clear_expiry_" + code)],
+                [InlineKeyboardButton("🔄 ریست تعداد استفاده", callback_data="admin_coupon_reset_" + code)],
+                [InlineKeyboardButton("🗑️ حذف این کد", callback_data="admin_coupon_delete_" + code)],
+                [InlineKeyboardButton("⬅️ بازگشت به لیست", callback_data="admin_coupons")],
+            ]
+            await query.edit_message_text(detail, reply_markup=InlineKeyboardMarkup(buttons))
+            return
+
+        if data.startswith("admin_coupon_clear_expiry_"):
+            code = data[len("admin_coupon_clear_expiry_"):]
+            with db() as con:
+                ensure_discount_schema(con)
+                cur = con.execute("UPDATE discount_codes SET expires_at=NULL WHERE code=?", (code,))
+            if not cur.rowcount:
+                await query.answer("کد پیدا نشد.", show_alert=True)
+                return
+            await query.answer("انقضا حذف شد.")
+            await query.edit_message_text("♾️ محدودیت انقضا حذف شد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ بازگشت به کد", callback_data="admin_coupon_view_" + code)]]))
+            return
+
+        if data.startswith("admin_coupon_reset_"):
+            code = data[len("admin_coupon_reset_"):]
+            with db() as con:
+                ensure_discount_schema(con)
+                con.execute("UPDATE discount_codes SET total_uses=0, used_by=NULL, used_order_id=NULL, used_at=NULL WHERE code=?", (code,))
+                # Keep audit records intact; coupon_usage is the authoritative count in validation,
+                # so reset its rows transactionally as well.
+                con.execute("DELETE FROM coupon_usage WHERE code=?", (code,))
+            await query.answer("شمارنده مصرف صفر شد.")
+            await query.edit_message_text("🔄 تعداد استفادهٔ این کد صفر شد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ بازگشت به کد", callback_data="admin_coupon_view_" + code)]]))
+            return
+
+        if data.startswith("admin_coupon_edit_"):
+            parts = data.split("_", 4)
+            if len(parts) < 5:
+                await query.answer("درخواست ویرایش نامعتبر است.", show_alert=True)
+                return
+            field, code = parts[3], parts[4]
+            if field == "scope":
+                with db() as con:
+                    categories = [str(r[0]) for r in con.execute("SELECT DISTINCT category FROM products WHERE category IS NOT NULL AND TRIM(category)!='' ORDER BY category").fetchall()]
+                buttons = [[InlineKeyboardButton("🌐 همه خدمات و محصولات", callback_data="admin_coupon_setscope_all_" + code)]]
+                for i, cat in enumerate(categories):
+                    context.user_data.setdefault("coupon_edit_categories", {})[code] = categories
+                    buttons.append([InlineKeyboardButton(coupon_category_label(cat), callback_data=f"admin_coupon_setscope_{i}_{code}")])
+                buttons.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="admin_coupon_view_" + code)])
+                await query.edit_message_text("📦 دستهٔ جدید را انتخاب کن:", reply_markup=InlineKeyboardMarkup(buttons))
+                return
+            if field == "expiry":
+                context.user_data["coupon_edit_state"] = {"code": code, "field": "expiry"}
+                await query.edit_message_text("📅 تاریخ شمسی را به شکل YYYY-MM-DD وارد کن، یا برای انقضای ساعتی عددی مثل 6h بفرست. برای بدون انقضا از دکمهٔ حذف انقضا استفاده کن. مثال: 1405-08-07 یا 6h")
+                return
+            prompts = {
+                "code": "✏️ کد جدید را وارد کن (فقط حروف انگلیسی، عدد، _ یا -):",
+                "amount": "💯 مقدار جدید تخفیف را وارد کن؛ برای درصد 1 تا 100 و برای مبلغ ثابت عدد تومان:",
+                "max": "🔢 سقف مصرف کلی را وارد کن (0 = نامحدود):",
+                "recipient": "👤 برای همه کاربران ALL بفرست یا شناسه عددی/@username را وارد کن:",
+                "min": "🧾 حداقل مبلغ خرید را به تومان وارد کن (0 = بدون حداقل):",
+            }
+            if field not in prompts:
+                await query.answer("این گزینه پشتیبانی نمی‌شود.", show_alert=True)
+                return
+            context.user_data["coupon_edit_state"] = {"code": code, "field": field}
+            await query.edit_message_text(prompts[field] + "\nبرای لغو /cancel بفرست.")
+            return
+
+        if data.startswith("admin_coupon_setscope_all_"):
+            code = data[len("admin_coupon_setscope_all_"):]
+            with db() as con:
+                ensure_discount_schema(con)
+                con.execute("UPDATE discount_codes SET category='all', product_name=NULL WHERE code=?", (code,))
+            await query.answer("محدوده روی همه خدمات تنظیم شد.")
+            await query.edit_message_text("🌐 محدوده کد روی همه خدمات و محصولات تنظیم شد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ بازگشت به کد", callback_data="admin_coupon_view_" + code)]]))
+            return
+
+        if data.startswith("admin_coupon_setscope_"):
+            rest = data[len("admin_coupon_setscope_"):]
+            try:
+                idx_text, code = rest.split("_", 1)
+                idx = int(idx_text)
+                categories = context.user_data.get("coupon_edit_categories", {}).get(code, [])
+                category = categories[idx]
+            except (ValueError, IndexError, TypeError):
+                await query.answer("دسته انتخاب‌شده معتبر نیست؛ صفحه را دوباره باز کن.", show_alert=True)
+                return
+            with db() as con:
+                ensure_discount_schema(con)
+                con.execute("UPDATE discount_codes SET category=?, product_name=NULL WHERE code=?", (category, code))
+            await query.answer("محدوده کد تغییر کرد.")
+            await query.edit_message_text(f"📦 محدودهٔ کد تغییر کرد: {coupon_category_label(category)}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ بازگشت به کد", callback_data="admin_coupon_view_" + code)]]))
+            return
+
+        if data == "admin_coupon_referral":
+            await query.answer("مدیریت تخفیف پلکانی زیرمجموعه‌گیری در نسخهٔ فعلی به جدول/تنظیمات جداگانه متصل نیست.", show_alert=True)
             await query.edit_message_text(
-                "\n".join(lines),
-                reply_markup=InlineKeyboardMarkup(buttons)
+                "🎁 تخفیف پلکانی زیرمجموعه‌گیری\n\n"
+                "برای اینکه این بخش واقعی و امن باشد، باید قواعد فعلی پاداش دعوت و ساختار ذخیره‌سازی آن مشخص شود. "
+                "هیچ تنظیم ساختگی یا نمایشی اعمال نشد.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ بازگشت", callback_data="admin_coupons")]])
             )
             return
 
@@ -2550,7 +2699,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        if data in ("admin_coupon_expiry_hours", "admin_coupon_expiry_days", "admin_coupon_expiry_never"):
+        if data in ("admin_coupon_expiry_hours", "admin_coupon_expiry_days", "admin_coupon_expiry_date", "admin_coupon_expiry_never"):
             state = context.user_data.get("admin_coupon_state")
             if not state or state.get("step") != "expiry_choice":
                 await query.answer("این مرحله منقضی شده؛ ساخت کد را دوباره شروع کن.", show_alert=True)
@@ -2565,6 +2714,9 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif data == "admin_coupon_expiry_days":
                 state["step"] = "expiry_days"
                 await query.edit_message_text("📅 چند روز اعتبار داشته باشد؟\nمثال: 1 یعنی دقیقاً 24 ساعت\nاز 1 تا 36500 روز")
+            elif data == "admin_coupon_expiry_date":
+                state["step"] = "expiry_date"
+                await query.edit_message_text("📅 تاریخ انقضا را به شمسی وارد کن؛ فرمت YYYY-MM-DD\nمثال: 1405-08-07")
             return
 
         if data == "admin_coupon_toggle":
@@ -3075,6 +3227,76 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await message.reply_text("❌ ساخت کد تخفیف لغو شد.")
             return
 
+    coupon_edit_state = context.user_data.get("coupon_edit_state")
+    if message and message.text and coupon_edit_state and user and user.id == ADMIN_ID:
+        answer = message.text.strip()
+        if answer.lower() == "/cancel":
+            context.user_data.pop("coupon_edit_state", None)
+            await message.reply_text("❌ ویرایش لغو شد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ بازگشت به کد", callback_data="admin_coupon_view_" + coupon_edit_state["code"])]]))
+            return
+        code = coupon_edit_state["code"]
+        field = coupon_edit_state["field"]
+        try:
+            with db() as con:
+                ensure_discount_schema(con)
+                row = con.execute("SELECT * FROM discount_codes WHERE code=?", (code,)).fetchone()
+                if not row:
+                    raise LookupError("coupon not found")
+                if field == "code":
+                    new_code = answer.upper()
+                    if not re.fullmatch(r"[A-Z0-9_-]{3,40}", new_code):
+                        await message.reply_text("❌ کد باید ۳ تا ۴۰ حرف انگلیسی، عدد، _ یا - باشد.")
+                        return
+                    if con.execute("SELECT 1 FROM discount_codes WHERE UPPER(code)=? AND code<>?", (new_code, code)).fetchone():
+                        await message.reply_text("❌ این کد قبلاً ثبت شده است.")
+                        return
+                    con.execute("UPDATE discount_codes SET code=? WHERE code=?", (new_code, code))
+                    con.execute("UPDATE coupon_usage SET code=? WHERE code=?", (new_code, code))
+                    code = new_code
+                elif field == "amount":
+                    value = int(answer.replace(",", "").replace("٬", ""))
+                    if value <= 0 or (row["discount_type"] == "percent" and value > 100):
+                        raise ValueError("amount")
+                    con.execute("UPDATE discount_codes SET discount_amount=? WHERE code=?", (value, code))
+                elif field == "max":
+                    value = int(answer)
+                    if value < 0: raise ValueError("max")
+                    con.execute("UPDATE discount_codes SET max_uses=? WHERE code=?", (value or None, code))
+                elif field == "min":
+                    value = int(answer.replace(",", "").replace("٬", ""))
+                    if value < 0: raise ValueError("min")
+                    con.execute("UPDATE discount_codes SET min_order_amount=? WHERE code=?", (value, code))
+                elif field == "recipient":
+                    if answer.upper() == "ALL":
+                        con.execute("UPDATE discount_codes SET recipient_type='all', recipient_ids='[]' WHERE code=?", (code,))
+                    elif re.fullmatch(r"(?:\d{3,20}|@[A-Za-z0-9_]{5,32})", answer):
+                        con.execute("UPDATE discount_codes SET recipient_type='selected', recipient_ids=? WHERE code=?", (json.dumps([answer], ensure_ascii=False), code))
+                    else:
+                        await message.reply_text("❌ ALL یا یک شناسه عددی/@username معتبر وارد کن.")
+                        return
+                elif field == "expiry":
+                    if re.fullmatch(r"[1-9]\d{0,5}h", answer.lower()):
+                        hours = int(answer[:-1])
+                        expiry = utc_now() + timedelta(hours=hours)
+                        con.execute("UPDATE discount_codes SET expires_at=? WHERE code=?", (expiry.isoformat(timespec="seconds"), code))
+                    else:
+                        match = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", answer)
+                        if not match: raise ValueError("expiry format")
+                        expiry_local = jalali_to_gregorian(*map(int, match.groups()))
+                        if expiry_local.astimezone(timezone.utc) <= utc_now(): raise ValueError("past")
+                        con.execute("UPDATE discount_codes SET expires_at=? WHERE code=?", (expiry_local.astimezone(timezone.utc).isoformat(timespec="seconds"), code))
+                else:
+                    raise ValueError("unsupported field")
+            context.user_data.pop("coupon_edit_state", None)
+            await message.reply_text("✅ تغییرات در دیتابیس ذخیره شد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 مشاهده کد", callback_data="admin_coupon_view_" + code)]]))
+        except LookupError:
+            context.user_data.pop("coupon_edit_state", None)
+            await message.reply_text("❌ کد موردنظر پیدا نشد.")
+        except Exception as exc:
+            logger.exception("Coupon edit failed: code=%s field=%s", code, field)
+            await message.reply_text("❌ تغییر ذخیره نشد. مقدار را بررسی کن و دوباره تلاش کن؛ جزئیات در لاگ ثبت شد.")
+        return
+
     admin_state = context.user_data.get("admin_coupon_state")
     if message and message.text and admin_state and user and user.id == ADMIN_ID:
         answer = message.text.strip()
@@ -3187,11 +3409,30 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 "بعد از پایان مدت، کد به‌صورت خودکار در زمان استفاده نامعتبر می‌شود.\n"
                 "♾️ بدون انقضا یعنی کد از نظر زمان محدودیت ندارد.",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⏱️ انتخاب بر اساس ساعت", callback_data="admin_coupon_expiry_hours")],
-                    [InlineKeyboardButton("📅 انتخاب بر اساس روز", callback_data="admin_coupon_expiry_days")],
+                    [InlineKeyboardButton("⏱️ مدت اعتبار بر اساس ساعت", callback_data="admin_coupon_expiry_hours")],
+                    [InlineKeyboardButton("📅 تاریخ شمسی", callback_data="admin_coupon_expiry_date")],
                     [InlineKeyboardButton("♾️ بدون انقضا", callback_data="admin_coupon_expiry_never")],
+                    [InlineKeyboardButton("❌ لغو", callback_data="admin_coupon_creation_cancel")],
                 ])
             )
+            return
+
+        if step == "expiry_date":
+            try:
+                match = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", answer)
+                if not match:
+                    raise ValueError("format")
+                expiry_local = jalali_to_gregorian(*map(int, match.groups()))
+                if expiry_local.astimezone(timezone.utc) <= utc_now():
+                    raise ValueError("past")
+                admin_state["expires_at"] = expiry_local.astimezone(timezone.utc).isoformat(timespec="seconds")
+                admin_state.pop("expiry_duration_seconds", None)
+                admin_state["expiry_label"] = answer
+                admin_state["step"] = "max_uses"
+            except (ValueError, OverflowError):
+                await message.reply_text("❌ تاریخ شمسی معتبر و آینده وارد کن. فرمت: YYYY-MM-DD؛ مثال: 1405-08-07")
+                return
+            await message.reply_text("📅 تاریخ انقضا ثبت شد: " + answer + "\n🔢 حداکثر تعداد استفادهٔ کلی را وارد کن (0 = نامحدود):")
             return
 
         if step in ("expiry_hours", "expiry_days"):
@@ -3288,7 +3529,7 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     duration_seconds = admin_state.get("expiry_duration_seconds")
                     expires_at_utc = (
                         (created_at_utc + timedelta(seconds=int(duration_seconds))).isoformat(timespec="seconds")
-                        if duration_seconds is not None else None
+                        if duration_seconds is not None else admin_state.get("expires_at")
                     )
                     con.execute("""
                         INSERT INTO discount_codes
@@ -3393,7 +3634,18 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                                 invalid_reason = "⛔ این کد برای حساب کاربری شما مجاز نیست."
                         except (ValueError, TypeError):
                             invalid_reason = "⚠️ تنظیم کاربران مجاز این کد خراب است؛ با پشتیبانی تماس بگیرید."
-            discount = int(coupon_row["discount_amount"]) if coupon_row and not invalid_reason else 0
+            discount = 0
+            if coupon_row and not invalid_reason:
+                raw_discount = int(coupon_row["discount_amount"])
+                if int(coupon_row["min_order_amount"] or 0) > original_price:
+                    invalid_reason = f"❌ حداقل مبلغ خرید این کد {int(coupon_row['min_order_amount']):,} تومان است."
+                elif coupon_row["discount_type"] == "percent":
+                    if not 1 <= raw_discount <= 100:
+                        invalid_reason = "❌ درصد تخفیف این کد معتبر نیست."
+                    else:
+                        discount = (original_price * raw_discount) // 100
+                else:
+                    discount = raw_discount
             if invalid_reason or not coupon_row or discount <= 0 or original_price <= discount:
                 error_text = invalid_reason or "❌ مبلغ تخفیف این کد برای این بسته معتبر نیست."
                 await message.reply_text(
