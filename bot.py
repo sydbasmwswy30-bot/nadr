@@ -4,8 +4,9 @@ from service_menu import service_menu
 import logging
 import sqlite3
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from telegram import (
     Update,
@@ -32,6 +33,47 @@ ADMIN_ID = 8762160338
 def toman(value):
     return f"{int(value or 0):,}".replace(",", "٬")
 DB_FILE = Path(__file__).with_name("shop.db")
+IRAN_TZ = ZoneInfo("Asia/Tehran")
+
+
+def utc_now():
+    """Current real server time as an aware UTC datetime."""
+    return datetime.now(timezone.utc)
+
+
+def parse_expiry(value):
+    """Parse stored expiry. New values are UTC-aware; legacy naive values are treated as Iran local time."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=IRAN_TZ)
+        return parsed.astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def expiry_is_valid(value, now=None):
+    """A coupon expires at the exact instant now >= expires_at."""
+    if not value:
+        return True
+    expiry = parse_expiry(value)
+    if expiry is None:
+        return False
+    current = now or utc_now()
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return current.astimezone(timezone.utc) < expiry
+
+
+def format_expiry_iran(value):
+    if not value:
+        return "بدون انقضا"
+    expiry = parse_expiry(value)
+    if expiry is None:
+        return f"زمان نامعتبر: {value}"
+    return expiry.astimezone(IRAN_TZ).strftime("%Y-%m-%d %H:%M:%S (Asia/Tehran)")
 
 # EDITOR_PANEL_INSTALLED
 import json
@@ -131,6 +173,46 @@ def db():
     connection.execute("PRAGMA busy_timeout=10000")
     connection.execute("PRAGMA synchronous=NORMAL")
     return connection
+
+
+def ensure_discount_schema(con):
+    """Apply additive, non-destructive migrations for the discount system."""
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS discount_codes (
+            code TEXT PRIMARY KEY,
+            discount_amount INTEGER NOT NULL,
+            category TEXT NOT NULL DEFAULT 'stars',
+            product_name TEXT,
+            active INTEGER NOT NULL DEFAULT 1
+        )
+    """)
+    columns = {row[1] for row in con.execute("PRAGMA table_info(discount_codes)").fetchall()}
+    migrations = {
+        "expires_at": "TEXT",
+        "max_uses": "INTEGER",
+        "per_user_limit": "INTEGER",
+        "total_uses": "INTEGER NOT NULL DEFAULT 0",
+        "recipient_type": "TEXT NOT NULL DEFAULT 'all'",
+        "recipient_ids": "TEXT",
+        "created_by": "INTEGER",
+        "created_at": "TEXT",
+        "used_by": "INTEGER",
+        "used_order_id": "INTEGER",
+        "used_at": "TEXT",
+    }
+    for column, definition in migrations.items():
+        if column not in columns:
+            con.execute(f"ALTER TABLE discount_codes ADD COLUMN {column} {definition}")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS coupon_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            order_id INTEGER NOT NULL,
+            discount_amount INTEGER NOT NULL,
+            used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
 
 
 def init_db():
@@ -1019,6 +1101,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             with db() as con:
                 con.execute("BEGIN IMMEDIATE")
+                ensure_discount_schema(con)
 
                 con.execute("""
                     CREATE TABLE IF NOT EXISTS wallet_payment_claims (
@@ -1110,10 +1193,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if valid and row["product_name"]:
                         valid = row["product_name"] == f"استارز {amount} عدد"
                     if valid and row["expires_at"]:
-                        try:
-                            valid = datetime.now() < datetime.fromisoformat(row["expires_at"])
-                        except (ValueError, TypeError):
-                            valid = False
+                        valid = expiry_is_valid(row["expires_at"])
 
                     total = con.execute(
                         "SELECT COUNT(*) FROM coupon_usage WHERE code=?",
@@ -2179,6 +2259,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if data == "admin_coupons":
             with db() as con:
+                ensure_discount_schema(con)
                 con.execute("""
                     CREATE TABLE IF NOT EXISTS discount_codes (
                         code TEXT PRIMARY KEY,
@@ -2201,7 +2282,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 code = r["code"]
                 scope = "همه محصولات" if r["category"] == "all" else r["category"]
                 state = "🟢 فعال" if r["active"] else "🔴 غیرفعال"
-                expiry_text = r["expires_at"] or "بدون انقضا"
+                expiry_text = format_expiry_iran(r["expires_at"])
                 usage_text = "نامحدود" if r["max_uses"] is None else f"{int(r['total_uses'] or 0)}/{int(r['max_uses'])}"
                 lines.append(
                     f"\n🏷️ {code}\n"
@@ -2238,6 +2319,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data.startswith("admin_coupon_toggle_"):
             code = data[len("admin_coupon_toggle_"):]
             with db() as con:
+                ensure_discount_schema(con)
                 row = con.execute(
                     "SELECT active FROM discount_codes WHERE code=?", (code,)
                 ).fetchone()
@@ -2263,7 +2345,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 code2 = r["code"]
                 scope = "همه محصولات" if r["category"] == "all" else r["category"]
                 state_text = "🟢 فعال" if r["active"] else "🔴 غیرفعال"
-                expiry = r["expires_at"] or "بدون انقضا"
+                expiry = format_expiry_iran(r["expires_at"])
                 uses = "نامحدود" if r["max_uses"] is None else f"{int(r['total_uses'] or 0)}/{int(r['max_uses'])}"
                 lines.append(f"\n🏷️ {code2}\n💰 تخفیف: {int(r['discount_amount']):,} تومان\n🎯 محدوده: {scope} | {state_text}\n⏳ انقضا: {expiry}\n🔢 مصرف کل: {uses}")
                 buttons.append([
@@ -2282,6 +2364,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data.startswith("admin_coupon_delete_"):
             code = data[len("admin_coupon_delete_"):]
             with db() as con:
+                ensure_discount_schema(con)
                 row = con.execute(
                     "SELECT code FROM discount_codes WHERE code=?", (code,)
                 ).fetchone()
@@ -2888,6 +2971,7 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 return
             try:
                 with db() as con:
+                    ensure_discount_schema(con)
                     duplicate = con.execute(
                         "SELECT 1 FROM discount_codes WHERE UPPER(code)=? LIMIT 1", (code,)
                     ).fetchone()
@@ -2971,16 +3055,16 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 if step == "expiry_hours":
                     if not 1 <= value <= 876000:
                         raise ValueError("hours out of range")
-                    delta = timedelta(hours=value)
+                    duration_seconds = value * 3600
                     label = f"{value} ساعت"
                 else:
                     if not 1 <= value <= 36500:
                         raise ValueError("days out of range")
-                    delta = timedelta(days=value)
+                    duration_seconds = value * 86400
                     label = f"{value} روز"
-                # Calculate from current time when the admin submits the value.
-                expiry_dt = datetime.now() + delta
-                admin_state["expires_at"] = expiry_dt.isoformat(timespec="seconds")
+                # Duration is remembered only; expiry starts after successful database insert.
+                admin_state["expiry_duration_seconds"] = duration_seconds
+                admin_state["expires_at"] = None
                 admin_state["expiry_label"] = label
                 admin_state["step"] = "max_uses"
             except (ValueError, OverflowError):
@@ -2992,7 +3076,8 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 return
             await message.reply_text(
                 f"✅ مدت اعتبار ثبت شد: {label}\n"
-                f"📅 زمان انقضا: {admin_state['expires_at']}\n\n"
+                f"⏱ مدت اعتبار: {label}\n\n"
+                "زمان انقضا دقیقاً پس از ذخیره موفق کد محاسبه می‌شود.\n"
                 "🔢 سقف مصرف کل را بفرست.\n0 = نامحدود\nبرای لغو /cancel را بفرست."
             )
             return
@@ -3021,6 +3106,7 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             admin_state["per_user_limit"] = n or None
             try:
                 with db() as con:
+                    ensure_discount_schema(con)
                     con.execute("""
                         CREATE TABLE IF NOT EXISTS discount_codes (
                             code TEXT PRIMARY KEY,
@@ -3048,18 +3134,25 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                         if col not in cols:
                             con.execute(f"ALTER TABLE discount_codes ADD COLUMN {col} {definition}")
 
+                    # Calculate expiry only at the final save step, using real UTC server time.
+                    created_at_utc = utc_now()
+                    duration_seconds = admin_state.get("expiry_duration_seconds")
+                    expires_at_utc = (
+                        (created_at_utc + timedelta(seconds=int(duration_seconds))).isoformat(timespec="seconds")
+                        if duration_seconds is not None else None
+                    )
                     con.execute("""
                         INSERT INTO discount_codes
                         (code, discount_amount, category, product_name, active,
                          expires_at, max_uses, per_user_limit, total_uses,
                          recipient_type, recipient_ids, created_by, created_at)
-                        VALUES (?, ?, ?, NULL, 1, ?, ?, ?, 0, ?, ?, ?, CURRENT_TIMESTAMP)
+                        VALUES (?, ?, ?, NULL, 1, ?, ?, ?, 0, ?, ?, ?, ?)
                     """, (
                         admin_state["code"], admin_state["discount_amount"],
-                        admin_state["category"], admin_state["expires_at"],
+                        admin_state["category"], expires_at_utc,
                         admin_state["max_uses"], admin_state["per_user_limit"],
                         admin_state["recipient_type"], admin_state["recipient_ids"],
-                        user.id
+                        user.id, created_at_utc.isoformat(timespec="seconds")
                     ))
 
                 state = admin_state.copy()
@@ -3070,7 +3163,7 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     f"💰 تخفیف: {state['discount_amount']:,} تومان\n"
                     f"🎯 محدوده: {state['category']}\n"
                     f"👥 کاربران: {'همه' if state['recipient_type'] == 'all' else state['recipient_ids']}\n"
-                    f"⏳ انقضا: {state['expires_at'] or 'بدون انقضا'}\n"
+                    f"⏳ انقضا (ایران): {format_expiry_iran(expires_at_utc.isoformat() if expires_at_utc else None)}\n"
                     f"🔢 سقف کل: {state['max_uses'] or 'نامحدود'}\n"
                     f"👤 سقف هر کاربر: {state['per_user_limit'] or 'نامحدود'}"
                 )
@@ -3090,6 +3183,7 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
         original_price = int(pending_coupon.get("price", 0))
         try:
             with db() as con:
+                ensure_discount_schema(con)
                 con.execute("""
                     CREATE TABLE IF NOT EXISTS discount_codes (
                         code TEXT PRIMARY KEY,
@@ -3115,12 +3209,18 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     VALUES ('STAR20000', 20000, 'stars', NULL, 1)
                 """)
                 coupon_row = con.execute("""
-                    SELECT discount_amount FROM discount_codes
+                    SELECT * FROM discount_codes
                     WHERE code=? AND active=1 AND category IN ('stars', 'all')
                     AND used_by IS NULL
                     AND (product_name IS NULL OR product_name=?)
                     LIMIT 1
                 """, (code, f"استارز {amount} عدد")).fetchone()
+                if coupon_row and not expiry_is_valid(coupon_row["expires_at"]):
+                    coupon_row = None
+                if coupon_row and "max_uses" in coupon_row.keys() and coupon_row["max_uses"] is not None:
+                    usage_count = con.execute("SELECT COUNT(*) FROM coupon_usage WHERE code=?", (code,)).fetchone()[0] if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='coupon_usage'").fetchone() else 0
+                    if usage_count >= int(coupon_row["max_uses"]):
+                        coupon_row = None
             discount = int(coupon_row["discount_amount"]) if coupon_row else 0
             if not coupon_row or discount <= 0 or original_price <= discount:
                 await message.reply_text(
