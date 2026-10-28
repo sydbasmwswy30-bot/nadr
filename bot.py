@@ -3363,22 +3363,25 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 else:
                     await message.reply_text("❌ مبلغ باید عدد صحیح مثبت باشد.")
                 return
-            admin_state.update(discount_amount=amount, step="scope_choice")
-            with db() as con:
-                category_rows = con.execute(
-                    "SELECT category, COUNT(*) AS n FROM products WHERE active=1 GROUP BY category ORDER BY category"
-                ).fetchall()
-            categories = [(str(r["category"]), int(r["n"] or 0)) for r in category_rows if str(r["category"] or "").strip()]
-            admin_state["scope_categories"] = [c for c, _ in categories]
-            buttons = [[InlineKeyboardButton("🌐 همه خدمات", callback_data="admin_coupon_scope_all")]]
-            for idx, (category, count) in enumerate(categories):
-                label = coupon_category_label(category)
-                buttons.append([InlineKeyboardButton(f"{label} ({count} محصول)", callback_data=f"admin_coupon_scope_cat_{idx}")])
-            buttons.append([InlineKeyboardButton("❌ لغو ساخت", callback_data="admin_coupon_creation_cancel")])
+            # Scope and recipient restriction screens are removed: coupons apply to everyone and every product.
+            admin_state.update(
+                discount_amount=amount,
+                category="all",
+                product_name=None,
+                recipient_type="all",
+                recipient_ids="[]",
+                step="expiry_choice",
+            )
             await message.reply_text(
-                "🎯 محدودهٔ کد تخفیف را انتخاب کن.\n"
-                "فهرست از دسته‌بندی‌های فعال دیتابیس ساخته شده؛ دسته‌های جدید نیز خودکار نمایش داده می‌شوند.",
-                reply_markup=InlineKeyboardMarkup(buttons)
+                "⏳ مدت اعتبار کد تخفیف را انتخاب کن\n\n"
+                "این کد برای همه کاربران و همه محصولات (فعلی و آینده) فعال خواهد بود.\n"
+                "بعد از پایان مدت، کد هنگام استفاده به‌صورت خودکار نامعتبر می‌شود.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⏱️ مدت اعتبار بر اساس ساعت", callback_data="admin_coupon_expiry_hours")],
+                    [InlineKeyboardButton("📅 تاریخ شمسی", callback_data="admin_coupon_expiry_date")],
+                    [InlineKeyboardButton("♾️ بدون انقضا", callback_data="admin_coupon_expiry_never")],
+                    [InlineKeyboardButton("❌ لغو", callback_data="admin_coupon_creation_cancel")],
+                ])
             )
             return
 
@@ -3563,9 +3566,6 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     "✅ کوپن ساخته شد.\n\n"
                     f"🏷️ کد: {state['code']}\n"
                     f"💰 تخفیف: {(str(state['discount_amount']) + '%') if state.get('discount_type') == 'percent' else (format(state['discount_amount'], ',') + ' تومان')}\n"
-                    f"🎯 محدوده: {coupon_category_label(state['category'])}\n"
-                    f"📦 محصول: {state.get('product_name') or 'تمام محصولات محدوده انتخاب‌شده'}\n"
-                    f"👥 کاربران: {'همه' if state['recipient_type'] == 'all' else state['recipient_ids']}\n"
                     f"⏳ انقضا: {format_coupon_expiry(expires_at_utc.isoformat() if expires_at_utc else None, state.get('expiry_label'))}\n"
                     f"🔢 سقف کل: {state['max_uses'] or 'نامحدود'}\n"
                     f"👤 سقف هر کاربر: {state['per_user_limit'] or 'نامحدود'}",
