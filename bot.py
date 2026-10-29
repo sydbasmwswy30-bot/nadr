@@ -1242,6 +1242,8 @@ _AUTO_PRICING_KEY = "auto_pricing_v1"
 _AUTO_PRICING_CACHE = None
 _AUTO_PRICING_REFRESH_LOCK = None
 _PROVIDER_PRODUCTS_URL = "https://pay.tgsuperstars.com/api/partner/v1/products"
+# Free, read-only public price quote endpoint; no API key and no purchase requests are made.
+_PUBLIC_PRICE_API_BASE = "https://api-stars.duckdns.org/api/v1/prices/quote"
 _FX_DATA_URL = "https://raw.githubusercontent.com/iran-market/iran-market.github.io/main/data/popular.json"
 _PROVIDER_REFRESH_COOLDOWN_SECONDS = 30
 _PROVIDER_FORCE_REFRESH_COOLDOWN_SECONDS = 5
@@ -1260,7 +1262,7 @@ def _auto_pricing_defaults():
         "catalog_valid": False,
         "catalog_updated_at": "",
         "catalog_attempted_at": "",
-        "catalog_error": "کلید API تأمین‌کننده تنظیم نشده است.",
+        "catalog_error": "قیمت عمومی هنوز دریافت نشده است.",
         "fx_rate_toman": "",
         "fx_valid": False,
         "fx_source_updated_at": "",
@@ -1555,7 +1557,7 @@ def pricing_panel_text(cfg=None, note=""):
         status,
         f"وضعیت سیستم: {'روشن' if cfg.get('enabled') else 'خاموش'}",
         f"کلید تأمین‌کننده: {key_state}",
-        f"منبع کاتالوگ: TgSuperstars (واسطه؛ رسمیِ Fragment نیست) — {catalog_state}",
+        f"منبع کاتالوگ: {'TgSuperstars (با کلید)' if str(cfg.get('provider_api_key') or '').strip() else 'API عمومی قیمت (بدون کلید؛ غیررسمی)'} — {catalog_state}",
         f"آخرین دریافت کاتالوگ: {_pricing_time_text(cfg.get('catalog_updated_at'))}",
         f"بسته‌های پرمیوم دریافتی: {premium_terms_text}",
         f"نرخ ارز عمومی USDT→تومان: {fx_text} — {fx_state}",
@@ -1565,7 +1567,7 @@ def pricing_panel_text(cfg=None, note=""):
         f"بررسی دوره‌ای: هر {int(cfg.get('refresh_interval_minutes', 30))} دقیقه (خوراک ارز حدود هر ۳۰ دقیقه به‌روزرسانی می‌شود)",
     ]
     if not cfg.get("provider_api_key"):
-        lines.append("\nبرای دریافت قیمت مرجع زنده، کلید API فعال تأمین‌کننده لازم است؛ بدون آن قیمت ساختگی یا ذخیره‌شده نمایش داده نمی‌شود. طبق مستندات تأمین‌کننده، فعال‌سازی کلید ممکن است به شارژ اولیهٔ حساب نیاز داشته باشد.")
+        lines.append("\nمنبع رایگان فقط قیمت مرجع را می‌خواند و خرید انجام نمی‌دهد. این منبع شخص ثالث و غیررسمی است؛ اگر قیمت تازه/معتبر برنگردد، فروش قیمت‌گذاری‌شده متوقف می‌ماند.")
     if ready:
         sample_stars = auto_pricing_quote("stars", 100, cfg)
         sample_premium = auto_pricing_quote("premium", 3, cfg)
@@ -1601,6 +1603,45 @@ def pricing_panel_keyboard(cfg=None):
     ])
 
 
+async def _fetch_public_price_catalog(client):
+    """Read-only public price quotes. Never creates purchases or uses wallet credentials."""
+    async def get_quote(product, amount):
+        response = await client.get(
+            _PUBLIC_PRICE_API_BASE,
+            params={"product": product, "amount": int(amount)},
+            headers={"Accept": "application/json", "User-Agent": "SEYED-PREMIUM-price-check/1.0"},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("پاسخ سرویس قیمت ساختار معتبری ندارد.")
+        quote = payload.get("data", payload)
+        if isinstance(quote, dict) and isinstance(quote.get("quote"), dict):
+            quote = quote["quote"]
+        if not isinstance(quote, dict):
+            raise ValueError("ساختار قیمت دریافت‌شده معتبر نیست.")
+        prices = quote.get("prices") or {}
+        if not isinstance(prices, dict):
+            raise ValueError("قیمت‌های دریافتی معتبر نیستند.")
+        stale = quote.get("stale", payload.get("stale", False))
+        if stale is True or quote.get("unavailable") is True or payload.get("unavailable") is True:
+            raise ValueError("منبع قیمت دادهٔ قدیمی یا ناموجود اعلام کرد.")
+        usdt = _pricing_decimal(prices.get("usdt", quote.get("usdt")))
+        if usdt is None or usdt <= 0:
+            raise ValueError("قیمت USDT در پاسخ منبع وجود ندارد یا معتبر نیست.")
+        return usdt
+
+    stars_reference = await get_quote("stars", 50)
+    premium_prices = {}
+    for months in (3, 6, 12):
+        premium_prices[str(months)] = str(await get_quote("premium", months))
+    return {
+        "stars_price_per_star_usd": str(stars_reference / Decimal(50)),
+        "stars_max_per_order": 1000000,
+        "premium_usd": premium_prices,
+    }
+
+
 async def refresh_auto_pricing(force=False):
     """Refresh provider catalog and public FX data without treating failed feeds as live."""
     global _AUTO_PRICING_REFRESH_LOCK
@@ -1611,71 +1652,75 @@ async def refresh_auto_pricing(force=False):
         now_iso = utc_now().isoformat(timespec="seconds")
         api_key = str(cfg.get("provider_api_key") or "").strip()
 
-        if not api_key:
-            cfg["catalog_valid"] = False
-            cfg["catalog_error"] = "کلید API تأمین‌کننده تنظیم نشده است."
-        else:
-            last_age = _pricing_timestamp_age(cfg.get("catalog_attempted_at"))
-            due = (
-                last_age is None
-                or last_age >= _PROVIDER_REFRESH_COOLDOWN_SECONDS
-                or (force and last_age >= _PROVIDER_FORCE_REFRESH_COOLDOWN_SECONDS)
-            )
-            if due:
-                cfg["catalog_attempted_at"] = now_iso
-                save_auto_pricing_config(cfg)
-                try:
-                    async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
+        last_age = _pricing_timestamp_age(cfg.get("catalog_attempted_at"))
+        due = (
+            last_age is None
+            or last_age >= _PROVIDER_REFRESH_COOLDOWN_SECONDS
+            or (force and last_age >= _PROVIDER_FORCE_REFRESH_COOLDOWN_SECONDS)
+        )
+        if due:
+            cfg["catalog_attempted_at"] = now_iso
+            save_auto_pricing_config(cfg)
+            try:
+                async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
+                    if api_key:
+                        # Optional paid-provider route retained for users who already have a key.
                         response = await client.get(_PROVIDER_PRODUCTS_URL, headers={"Authorization": f"Bearer {api_key}"})
-                    response.raise_for_status()
-                    payload = response.json()
-                    catalog = payload.get("data", payload) if isinstance(payload, dict) else None
-                    payload_meta = payload.get("meta") or {}
-                    catalog_meta = catalog.get("meta") or {} if isinstance(catalog, dict) else {}
-                    if (not isinstance(catalog, dict)
-                            or payload.get("unavailable") is True
-                            or catalog.get("unavailable") is True
-                            or payload.get("stale") is True
-                            or catalog.get("stale") is True
-                            or payload_meta.get("stale") is True
-                            or catalog_meta.get("stale") is True
-                            or str(payload.get("source_status", "")).lower() in {"stale", "unavailable"}
-                            or str(catalog.get("source_status", "")).lower() in {"stale", "unavailable"}):
-                        raise ValueError("کاتالوگ تأمین‌کننده قیمت را موقتاً در دسترس اعلام نکرد یا دادهٔ آن کش‌شده است.")
-                    stars_info = catalog.get("stars") or {}
-                    stars_currency = str(stars_info.get("currency") or catalog.get("currency") or "USD").upper()
-                    unit_price = _pricing_decimal(stars_info.get("price_per_star"))
-                    if stars_currency not in {"USD", "USDT"} or unit_price is None:
-                        raise ValueError("قیمت هر استارز یا واحد پول کاتالوگ معتبر نیست.")
-                    premium_raw = catalog.get("premium") or {}
-                    premium_prices = {}
-                    for months in (3, 6, 12):
-                        item = premium_raw.get(str(months)) or premium_raw.get(months)
-                        if not isinstance(item, dict):
-                            continue
-                        currency = str(item.get("currency") or catalog.get("currency") or "USD").upper()
-                        value = _pricing_decimal(item.get("partner_price"))
-                        if currency in {"USD", "USDT"} and value is not None:
-                            premium_prices[str(months)] = str(value)
-                    try:
-                        upstream_max = int(stars_info.get("max_per_order") or 50000)
-                    except (TypeError, ValueError):
-                        upstream_max = 50000
-                    cfg["catalog_prices"] = {
-                        "stars_price_per_star_usd": str(unit_price),
-                        "stars_max_per_order": max(50, upstream_max),
-                        "premium_usd": premium_prices,
-                    }
-                    cfg["catalog_valid"] = True
-                    cfg["catalog_updated_at"] = utc_now().isoformat(timespec="seconds")
-                    cfg["catalog_error"] = ""
-                except Exception as exc:
-                    logger.warning("Live pricing catalog refresh failed: %s", type(exc).__name__)
-                    cfg["catalog_valid"] = False
-                    cfg["catalog_error"] = f"دریافت کاتالوگ ناموفق بود ({type(exc).__name__})."
-                save_auto_pricing_config(cfg)
-            elif not cfg.get("catalog_valid"):
-                cfg["catalog_error"] = cfg.get("catalog_error") or "تلاش بعدی پس از پایان محدودیت درخواست انجام می‌شود."
+                        response.raise_for_status()
+                        payload = response.json()
+                        catalog = payload.get("data", payload) if isinstance(payload, dict) else None
+                        payload_meta = payload.get("meta") or {}
+                        catalog_meta = catalog.get("meta") or {} if isinstance(catalog, dict) else {}
+                        if (not isinstance(catalog, dict)
+                                or payload.get("unavailable") is True
+                                or catalog.get("unavailable") is True
+                                or payload.get("stale") is True
+                                or catalog.get("stale") is True
+                                or payload_meta.get("stale") is True
+                                or catalog_meta.get("stale") is True
+                                or str(payload.get("source_status", "")).lower() in {"stale", "unavailable"}
+                                or str(catalog.get("source_status", "")).lower() in {"stale", "unavailable"}):
+                            raise ValueError("کاتالوگ تأمین‌کننده قیمت را موقتاً در دسترس اعلام نکرد یا دادهٔ آن کش‌شده است.")
+                        stars_info = catalog.get("stars") or {}
+                        stars_currency = str(stars_info.get("currency") or catalog.get("currency") or "USD").upper()
+                        unit_price = _pricing_decimal(stars_info.get("price_per_star"))
+                        if stars_currency not in {"USD", "USDT"} or unit_price is None:
+                            raise ValueError("قیمت هر استارز یا واحد پول کاتالوگ معتبر نیست.")
+                        premium_raw = catalog.get("premium") or {}
+                        premium_prices = {}
+                        for months in (3, 6, 12):
+                            item = premium_raw.get(str(months)) or premium_raw.get(months)
+                            if not isinstance(item, dict):
+                                continue
+                            currency = str(item.get("currency") or catalog.get("currency") or "USD").upper()
+                            value = _pricing_decimal(item.get("partner_price"))
+                            if currency in {"USD", "USDT"} and value is not None:
+                                premium_prices[str(months)] = str(value)
+                        try:
+                            upstream_max = int(stars_info.get("max_per_order") or 50000)
+                        except (TypeError, ValueError):
+                            upstream_max = 50000
+                        catalog_prices = {
+                            "stars_price_per_star_usd": str(unit_price),
+                            "stars_max_per_order": max(50, upstream_max),
+                            "premium_usd": premium_prices,
+                        }
+                    else:
+                        # Free read-only quote source; does not place orders or require credentials.
+                        catalog_prices = await _fetch_public_price_catalog(client)
+                if not catalog_prices.get("premium_usd", {}).get("3") or not catalog_prices.get("premium_usd", {}).get("6") or not catalog_prices.get("premium_usd", {}).get("12"):
+                    raise ValueError("قیمت یکی از بسته‌های پرمیوم از منبع دریافت نشد.")
+                cfg["catalog_prices"] = catalog_prices
+                cfg["catalog_valid"] = True
+                cfg["catalog_updated_at"] = utc_now().isoformat(timespec="seconds")
+                cfg["catalog_error"] = ""
+            except Exception as exc:
+                logger.warning("Live pricing catalog refresh failed: %s", type(exc).__name__)
+                cfg["catalog_valid"] = False
+                cfg["catalog_error"] = f"دریافت کاتالوگ ناموفق بود ({type(exc).__name__})."
+            save_auto_pricing_config(cfg)
+        elif not cfg.get("catalog_valid"):
+            cfg["catalog_error"] = cfg.get("catalog_error") or "تلاش بعدی پس از پایان محدودیت درخواست انجام می‌شود."
 
         fx_age = _pricing_timestamp_age(cfg.get("fx_attempted_at"))
         if fx_age is None or fx_age >= _FX_REFRESH_COOLDOWN_SECONDS:
