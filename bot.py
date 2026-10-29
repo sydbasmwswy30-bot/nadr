@@ -190,7 +190,10 @@ EDITABLE_TEXTS = {
     "views_button": ("دکمه ویو تلگرام", "👀 ویو تلگرام"),
     "instagram_followers_button": ("دکمه فالوور اینستاگرام", "📸 فالوور اینستاگرام"),
     "instagram_likes_button": ("دکمه لایک اینستاگرام", "💙 لایک اینستاگرام"),
-
+    "payment_card_number": ("شماره کارت پرداخت", "هنوز تنظیم نشده"),
+    "payment_card_owner": ("نام صاحب کارت", "هنوز تنظیم نشده"),
+    "payment_instructions": ("راهنمای پرداخت و ارسال رسید", "پس از پرداخت، تصویر واضح رسید را همین‌جا ارسال کنید. سفارش فقط پس از بررسی و تأیید مدیر قابل تحویل است."),
+    "stars_menu_description": ("متن راهنمای منوی استارز", "🎁 استارز - انتخاب بسته\n\nبسته موردنظرت رو انتخاب کن 👇\n\n🔐 بدون نیاز به ورود به اکانت\n⚡️ تحویل طبق روند ثبت سفارش\n🍦 امکان سفارش با مقدار دلخواه\n💰 امکان بررسی موجودی و تخفیف\n💬 پشتیبانی در تمام مراحل"),
 
 }
 
@@ -220,15 +223,19 @@ _PREMIUM_MAIN_MENU_ITEMS = [
 _DEFAULT_UI_MENUS = {
     "main": deepcopy(_PREMIUM_MAIN_MENU_ITEMS),
     "services": [
-        {"id": "stars", "text": "⭐ استارز تلگرام", "callback": "service_stars", "enabled": True},
-        {"id": "premium", "text": "💎 پرمیوم تلگرام", "callback": "service_premium", "enabled": True},
-        {"id": "gifts", "text": "🎁 گیفت تلگرام", "callback": "service_gifts", "enabled": True},
-        {"id": "boost", "text": "🚀 بوست تلگرام", "callback": "service_boost", "enabled": True},
-        {"id": "members", "text": "👥 ممبر تلگرام", "callback": "service_members", "enabled": True},
-        {"id": "reactions", "text": "💙 ری‌اکشن تلگرام", "callback": "service_reactions", "enabled": True},
-        {"id": "views", "text": "👁️ بازدید تلگرام", "callback": "service_views", "enabled": True},
-        {"id": "instagram_followers", "text": "📸 فالوور اینستاگرام", "callback": "service_instagram_followers", "enabled": True},
-        {"id": "instagram_likes", "text": "💙 لایک اینستاگرام", "callback": "service_instagram_likes", "enabled": True},
+        {"id": "stars", "text": "✦ اسـتـارز تـلـگـرام", "callback": "service_stars", "enabled": True, "row": 1, "button_style": "success"},
+        {"id": "premium", "text": "◇ پـریـمـیـوم تـلـگـرام", "callback": "service_premium", "enabled": True, "row": 1, "button_style": "success"},
+        {"id": "gifts", "text": "❖ گـیـفـت تـلـگـرام", "callback": "service_gifts", "enabled": True, "row": 2, "button_style": "primary"},
+        {"id": "boost", "text": "➤ بـوسـت تـلـگـرام", "callback": "service_boost", "enabled": True, "row": 3, "button_style": "danger"},
+        {"id": "members", "text": "♙ مـمـبـر تـلـگـرام", "callback": "service_members", "enabled": True, "row": 4, "button_style": "primary"},
+        {"id": "reactions", "text": "ϟ ری‌اکـشـن تـلـگـرام", "callback": "service_reactions", "enabled": True, "row": 5, "button_style": "success"},
+        {"id": "views", "text": "◎ ویـو ویدیـو", "callback": "service_views", "enabled": True, "row": 6, "button_style": "danger"},
+        {"id": "instagram_followers", "text": "▣ فـالـوور ایـنـسـتـاگـرام", "callback": "service_instagram_followers", "enabled": True, "row": 7, "button_style": "primary"},
+        {"id": "instagram_likes", "text": "♡ لایـک ایـنـسـتـاگـرام", "callback": "service_instagram_likes", "enabled": True, "row": 8, "button_style": "success"},
+    ],
+    "stars": [
+        {"id": "custom_amount", "text": "✎ مقدار دلخواه", "callback": "stars_custom", "enabled": True, "row": 13, "button_style": "primary"},
+        {"id": "back_services", "text": "‹ بازگشت", "callback": "back_to_services", "enabled": True, "row": 14, "button_style": "danger"},
     ],
 }
 _LEGACY_SETTINGS_FILE = Path(__file__).with_name("bot_settings.json")  # read-only migration source
@@ -452,6 +459,52 @@ def apply_main_menu_redesign_v4_once():
             )
     except Exception:
         logger.exception("Could not apply luxury icon menu v4; stored shop data was not reset")
+
+
+def apply_services_menu_design_once():
+    """Apply the owner's approved service labels/colors without overwriting later edits."""
+    marker_key = "services_menu_design_v1"
+    styles = {
+        "stars": "success", "premium": "success", "gifts": "primary",
+        "boost": "danger", "members": "primary", "reactions": "success",
+        "views": "danger", "instagram_followers": "primary", "instagram_likes": "success",
+    }
+    labels = {
+        "stars": "✦ اسـتـارز تـلـگـرام",
+        "premium": "◇ پـریـمـیـوم تـلـگـرام",
+        "gifts": "❖ گـیـفـت تـلـگـرام",
+        "boost": "➤ بـوسـت تـلـگـرام",
+        "members": "♙ مـمـبـر تـلـگـرام",
+        "reactions": "ϟ ری‌اکـشـن تـلـگـرام",
+        "views": "◎ ویـو ویدیـو",
+        "instagram_followers": "▣ فـالـوور ایـنـسـتـاگـرام",
+        "instagram_likes": "♡ لایـک ایـنـسـتـاگـرام",
+    }
+    try:
+        with db() as con:
+            marker = con.execute("SELECT value FROM app_settings WHERE key=?", (marker_key,)).fetchone()
+        if marker and str(marker["value"] or "") == "done":
+            return
+        settings = load_bot_settings()
+        services = settings.setdefault("menus", {}).setdefault("services", deepcopy(_DEFAULT_UI_MENUS["services"]))
+        default_old = {str(item.get("id")): str(item.get("text", "")) for item in _DEFAULT_UI_MENUS["services"]}
+        for item in services:
+            if not isinstance(item, dict):
+                continue
+            item_id = str(item.get("id", ""))
+            if item_id in labels:
+                # Change only missing/default/known-old labels; respect custom text entered by the owner.
+                text_now = str(item.get("text", "")).strip()
+                if not text_now or text_now == default_old.get(item_id) or text_now == legacy_labels.get(item_id) or text_now in labels.values():
+                    item["text"] = labels[item_id]
+                item.setdefault("button_style", styles[item_id])
+                item.setdefault("row", 1 if item_id in ("stars", "premium") else
+                                {"gifts":2,"boost":3,"members":4,"reactions":5,"views":6,"instagram_followers":7,"instagram_likes":8}.get(item_id, 99))
+        save_bot_settings(settings)
+        with db() as con:
+            con.execute("INSERT INTO app_settings(key, value) VALUES (?, 'done') ON CONFLICT(key) DO UPDATE SET value='done'", (marker_key,))
+    except Exception:
+        logger.exception("Could not apply service menu design; existing settings were retained")
 
 
 def bot_text(key):
@@ -938,6 +991,22 @@ def init_db():
                 active INTEGER NOT NULL DEFAULT 1
             )
         """)
+        # Additive catalog metadata: do not replace or reset the existing shop.db.
+        product_columns = {row["name"] for row in con.execute("PRAGMA table_info(products)").fetchall()}
+        additive_product_columns = {
+            "button_text": "TEXT NOT NULL DEFAULT ''",
+            "icon": "TEXT NOT NULL DEFAULT ''",
+            "button_style": "TEXT NOT NULL DEFAULT 'success'",
+            "sort_order": "INTEGER NOT NULL DEFAULT 0",
+            "description": "TEXT NOT NULL DEFAULT ''",
+            "image_file_id": "TEXT NOT NULL DEFAULT ''",
+            "star_amount": "INTEGER",
+            "currency": "TEXT NOT NULL DEFAULT 'تومان'",
+            "old_price": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for column_name, column_ddl in additive_product_columns.items():
+            if column_name not in product_columns:
+                con.execute(f"ALTER TABLE products ADD COLUMN {column_name} {column_ddl}")
         con.execute("""
             CREATE TABLE IF NOT EXISTS orders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -948,6 +1017,17 @@ def init_db():
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        order_columns = {row["name"] for row in con.execute("PRAGMA table_info(orders)").fetchall()}
+        additive_order_columns = {
+            "currency": "TEXT NOT NULL DEFAULT 'تومان'",
+            "order_details": "TEXT NOT NULL DEFAULT ''",
+            "receipt_file_id": "TEXT NOT NULL DEFAULT ''",
+            "receipt_submitted_at": "TEXT",
+            "payment_method": "TEXT NOT NULL DEFAULT ''",
+        }
+        for column_name, column_ddl in additive_order_columns.items():
+            if column_name not in order_columns:
+                con.execute(f"ALTER TABLE orders ADD COLUMN {column_name} {column_ddl}")
         # Additive, non-destructive storage for persistent global bot settings.
         con.execute("""
             CREATE TABLE IF NOT EXISTS app_settings (
@@ -1011,17 +1091,94 @@ def init_db():
         # ردیف حذف نمی‌شود تا سابقه و ارجاع‌های احتمالی دیتابیس حفظ شوند.
         con.execute("UPDATE products SET active=0 WHERE LOWER(TRIM(name)) IN ('1 views', '1 view')")
 
-        # هر بستهٔ ثابت استارز یک محصول مستقل دارد؛ قیمت‌های موجود دست‌نخورده می‌مانند.
-        for amount in (50, 75, 100, 150, 250, 350, 500, 1000, 2500, 5000, 10000, 50000):
-            name = f"استارز {amount} عدد"
+        # Parse existing package amounts once before seeding. This prevents legacy names such
+        # as "⭐ 500 استارز" from being duplicated by the fixed default catalog.
+        amount_marker = con.execute(
+            "SELECT value FROM app_settings WHERE key='stars_amount_backfill_v1'"
+        ).fetchone()
+        if not amount_marker:
+            for old_star in con.execute(
+                "SELECT id, name FROM products WHERE category='stars' AND star_amount IS NULL ORDER BY id"
+            ).fetchall():
+                match = re.search(r"(?<!\d)(\d[\d,٬، ]*)", normalize_ascii_digits(str(old_star["name"])))
+                if not match:
+                    continue
+                try:
+                    detected_amount = int(re.sub(r"[,٬، ]", "", match.group(1)))
+                except ValueError:
+                    continue
+                if detected_amount > 0:
+                    # Preserve the first row for a repeated amount; later duplicates stay hidden.
+                    already = con.execute(
+                        "SELECT id FROM products WHERE category='stars' AND star_amount=? LIMIT 1",
+                        (detected_amount,),
+                    ).fetchone()
+                    if not already:
+                        con.execute("UPDATE products SET star_amount=? WHERE id=?", (detected_amount, old_star["id"]))
             con.execute(
-                "INSERT INTO products(category, name, price, active) "
-                "SELECT 'stars', ?, 0, 1 WHERE NOT EXISTS "
-                "(SELECT 1 FROM products WHERE category='stars' AND name=?)",
-                (name, name),
+                "INSERT INTO app_settings(key, value) VALUES ('stars_amount_backfill_v1', 'done') "
+                "ON CONFLICT(key) DO UPDATE SET value='done'"
             )
 
+        # هر بستهٔ ثابت استارز یک محصول مستقل دارد؛ قیمت‌های موجود دست‌نخورده می‌مانند.
+        fixed_stars = (50, 75, 100, 150, 250, 350, 500, 1000, 2500, 5000, 10000, 50000)
+        for position, amount in enumerate(fixed_stars, start=1):
+            name = f"استارز {amount} عدد"
+            style = {50: "success", 75: "primary", 100: "danger", 150: "success",
+                     250: "primary", 350: "danger", 500: "success", 1000: "primary",
+                     2500: "danger", 5000: "success", 10000: "primary", 50000: "danger"}[amount]
+            con.execute(
+                "INSERT INTO products(category, name, price, active, icon, button_style, sort_order, star_amount) "
+                "SELECT 'stars', ?, 0, 1, '✧', ?, ?, ? WHERE NOT EXISTS "
+                "(SELECT 1 FROM products WHERE category='stars' AND (name=? OR star_amount=?))",
+                (name, style, position * 10, amount, name, amount),
+            )
 
+        # One-time, additive migration for existing Stars products. This marker prevents
+        # later restarts from overwriting an administrator's chosen icon, color or order.
+        style_by_amount = {50: "success", 75: "primary", 100: "danger", 150: "success",
+                           250: "primary", 350: "danger", 500: "success", 1000: "primary",
+                           2500: "danger", 5000: "success", 10000: "primary", 50000: "danger"}
+        marker = con.execute(
+            "SELECT value FROM app_settings WHERE key='stars_icons_colors_v1'"
+        ).fetchone()
+        if not marker:
+            rows = con.execute(
+                "SELECT id, name, star_amount, sort_order FROM products WHERE category='stars' ORDER BY id"
+            ).fetchall()
+            known_order = {amount: (index + 1) * 10 for index, amount in enumerate(fixed_stars)}
+            extra_order = max((int(row['sort_order'] or 0) for row in rows), default=0) + 10
+            for row in rows:
+                amount = row["star_amount"]
+                if amount is None:
+                    match = re.search(r"(?<!\d)(\d[\d,٬، ]*)", normalize_ascii_digits(str(row["name"])))
+                    if match:
+                        try:
+                            candidate = int(re.sub(r"[,٬، ]", "", match.group(1)))
+                            amount = candidate if candidate > 0 else None
+                        except ValueError:
+                            amount = None
+                if amount is None:
+                    continue
+                amount = int(amount)
+                order = known_order.get(amount, extra_order)
+                if amount not in known_order:
+                    extra_order += 10
+                con.execute(
+                    "UPDATE products SET star_amount=?, icon='✧', button_style=?, sort_order=? "
+                    "WHERE id=? AND category='stars'",
+                    (amount, style_by_amount.get(amount, "primary"), order, int(row["id"])),
+                )
+            con.execute(
+                "INSERT INTO app_settings(key, value) VALUES ('stars_icons_colors_v1', 'done') "
+                "ON CONFLICT(key) DO UPDATE SET value='done'"
+            )
+
+        # Backfill legacy ordering once. A manager may later intentionally set sort_order=0.
+        sort_marker = con.execute("SELECT value FROM app_settings WHERE key='product_sort_order_backfill_v1'").fetchone()
+        if not sort_marker:
+            con.execute("UPDATE products SET sort_order=id WHERE sort_order=0")
+            con.execute("INSERT INTO app_settings(key, value) VALUES ('product_sort_order_backfill_v1', 'done') ON CONFLICT(key) DO UPDATE SET value='done'")
 
     with db() as con:
         con.execute("CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id)")
@@ -1055,6 +1212,7 @@ def init_db():
     apply_main_menu_redesign_once()
     apply_main_menu_redesign_v3_once()
     apply_main_menu_redesign_v4_once()
+    apply_services_menu_design_once()
 
 def register_user(user):
     with db() as con:
@@ -1077,77 +1235,44 @@ import re
 
 
 def service_menu(text_fn=None):
-    """Build the approved SEYED PREMIUM services menu, preserving existing callbacks."""
-    items = configured_buttons("services")
-    by_id = {str(item.get("id", "")): item for item in items if isinstance(item, dict)}
-
-    # Approved Sample 2: Stars + Premium together in green, then one full-width
-    # button per row. These are Unicode text icons; Telegram keyboard buttons do
-    # not support embedding custom SVG images directly in their labels.
-    layout = [
-        (["stars", "premium"], "success"),
-        (["gifts"], "primary"),
-        (["boost"], "danger"),
-        (["members"], "primary"),
-        (["reactions"], "success"),
-        (["views"], "danger"),
-        (["instagram_followers"], "primary"),
-        (["instagram_likes"], "success"),
-    ]
-    labels = {
-        "stars": "✦ اسـتـارز تـلـگـرام",
-        "premium": "◇ پـریـمـیـوم تـلـگـرام",
-        "gifts": "❖ گـیـفـت تـلـگـرام",
-        "boost": "➤ بـوسـت تـلـگـرام",
-        "members": "♙ مـمـبـر تـلـگـرام",
-        "reactions": "ϟ ری‌اکـشـن تـلـگـرام",
-        "views": "◎ ویـو ویدیـو",
-        "instagram_followers": "▣ فـالـوور ایـنـسـتـاگـرام",
-        "instagram_likes": "♡ لایـک ایـنـسـتـاگـرام",
-    }
-    rows = []
-    included = set()
-    for ids, style in layout:
-        row = []
-        for item_id in ids:
-            item = by_id.get(item_id)
-            if not item or not item.get("enabled", True):
-                continue
-            callback = str(item.get("callback", "")).strip()
-            if not callback:
-                continue
-            row.append(InlineKeyboardButton(labels[item_id], callback_data=callback, style=style))
-            included.add(item_id)
-        if row:
-            rows.append(row)
-
-    # Preserve any additional services configured by the owner instead of hiding them.
-    for item in items:
+    """Build the service menu from editable settings; labels/order/styles update without restart."""
+    configured = configured_buttons("services")
+    valid_styles = {"primary", "success", "danger"}
+    if not configured:
+        configured = deepcopy(_DEFAULT_UI_MENUS["services"])
+    grouped = {}
+    ordered_row_numbers = []
+    for index, item in enumerate(configured):
         if not isinstance(item, dict):
-            continue
-        item_id = str(item.get("id", ""))
-        if item_id in included or item_id in labels or not item.get("enabled", True):
             continue
         label = str(item.get("text", "")).strip()
         callback = str(item.get("callback", "")).strip()
-        if label and callback:
-            rows.append([InlineKeyboardButton(label, callback_data=callback, style="primary")])
-
+        if not label or not callback:
+            continue
+        try:
+            row_no = int(item.get("row", index + 1) or index + 1)
+        except (TypeError, ValueError):
+            row_no = index + 1
+        if row_no not in grouped:
+            grouped[row_no] = []
+            ordered_row_numbers.append(row_no)
+        style = str(item.get("button_style", "") or "").strip().lower()
+        if style not in valid_styles:
+            style = _button_style_for(label, callback) or "primary"
+        grouped[row_no].append(InlineKeyboardButton(label[:64], callback_data=callback, style=style))
+    rows = []
+    for row_no in ordered_row_numbers:
+        row = grouped[row_no]
+        # Telegram supports at most 8 buttons per row; service rows are designed as 1 or 2.
+        for offset in range(0, min(len(row), 8), 2):
+            rows.append(row[offset:offset + 2])
     rows.append([InlineKeyboardButton("⌂ مـنـوی اصـلـی", callback_data="home", style="danger")])
     return InlineKeyboardMarkup(rows)
 
 
 def stars_menu():
-    packages = [
-        (50, "۵۰"), (75, "۷۵"), (100, "۱۰۰"), (150, "۱۵۰"),
-        (250, "۲۵۰"), (350, "۳۵۰"), (500, "۵۰۰"), (1000, "۱۰۰۰"),
-        (2500, "۲۵۰۰"), (5000, "۵۰۰۰"), (10000, "۱۰ هزار"), (50000, "۵۰ هزار"),
-    ]
-    rows = [[InlineKeyboardButton(f"🎁 {label} استارز", callback_data=f"stars_pack_{amount}", style="success")]
-            for amount, label in packages]
-    rows.append([InlineKeyboardButton("✏️ استارز به مقدار دلخواه", callback_data="stars_custom", style="success")])
-    rows.append([InlineKeyboardButton("↩️ بازگشت", callback_data="back_to_services", style="danger")])
-    return InlineKeyboardMarkup(rows)
+    """Compatibility alias: the active Stars menu is built from the database catalog."""
+    return build_stars_menu()
 
 
 def stars_detail_menu(amount):
@@ -1161,15 +1286,8 @@ def stars_detail_menu(amount):
 
 
 def stars_text():
-    return (
-        "🎁 استارز - انتخاب بسته\n\n"
-        "بسته موردنظرت رو انتخاب کن 👇\n\n"
-        "🔐 بدون نیاز به ورود به اکانت\n"
-        "⚡️ تحویل سریع و طبق روند ثبت سفارش\n"
-        "🍦 امکان سفارش با مقدار دلخواه\n"
-        "🔘 دارای کش‌بک\n"
-        "💬 پشتیبانی در تمام مراحل"
-    )
+    """Stars introduction is edited from the same central text manager."""
+    return bot_text("stars_menu_description")
 
 
 MENU_TYPE_DEFAULT = "keyboard"
@@ -1323,9 +1441,9 @@ def _button_style_for(label, callback=None):
     return "primary"
 
 
-def _styled_keyboard_button(label, callback=None):
-    """Build a colored ReplyKeyboardButton when the installed PTB supports styles."""
-    style = _button_style_for(label, callback)
+def _styled_keyboard_button(label, callback=None, style_override=None):
+    """Build a colored ReplyKeyboardButton, using an editable style when supplied."""
+    style = style_override if style_override in {"primary", "success", "danger"} else _button_style_for(label, callback)
     try:
         if style:
             return KeyboardButton(str(label), style=style)
@@ -1366,7 +1484,8 @@ def _restyle_inline_button(button):
     """Return a copy of an ordinary inline button with a semantic Telegram style."""
     label = str(getattr(button, "text", "") or "")
     callback = getattr(button, "callback_data", None)
-    style = _button_style_for(label, callback)
+    existing_style = getattr(button, "style", None)
+    style = existing_style if existing_style in {"primary", "success", "danger"} else _button_style_for(label, callback)
     try:
         data = button.to_dict()
         data["style"] = style
@@ -1405,11 +1524,19 @@ def _is_services_menu_markup(markup):
     )
 
 
+def _is_stars_menu_markup(markup):
+    """Keep the one-package-per-row Stars catalog intact in both inline and reply modes."""
+    source_rows = getattr(markup, "inline_keyboard", None) or []
+    callbacks = [str(getattr(button, "callback_data", "") or "").strip()
+                 for row in source_rows for button in (row or [])]
+    return sum(value.startswith("stars_pack_") for value in callbacks) >= 6
+
+
 def _premium_inline_rows(markup):
     """Standardize inline rows; keep the approved services layout exactly as authored."""
     source_rows = getattr(markup, "inline_keyboard", None) or []
-    if _is_services_menu_markup(markup):
-        # Do not pair one-button service rows; these rows and colors are user-approved.
+    if _is_services_menu_markup(markup) or _is_stars_menu_markup(markup):
+        # Do not pair one-button service or Stars rows; these layouts are user-approved.
         return [
             [_restyle_inline_button(button) for button in row]
             for row in source_rows if row
@@ -1507,9 +1634,11 @@ def main_menu(user_id=None):
                 label = str(item.get("text", "")).strip()
                 callback = str(item.get("callback", "")).strip()
                 if label and callback:
+                    chosen_style = item.get("button_style")
+                    if chosen_style not in {"primary", "success", "danger"}:
+                        chosen_style = _button_style_for(label, callback)
                     row.append(InlineKeyboardButton(
-                        label, callback_data=callback,
-                        style=_button_style_for(label, callback),
+                        label, callback_data=callback, style=chosen_style,
                     ))
             if row:
                 rows.append(row)
@@ -1524,7 +1653,7 @@ def main_menu(user_id=None):
             label = str(item.get("text", "")).strip()
             callback = str(item.get("callback", "")).strip()
             if label and callback:
-                row.append(_styled_keyboard_button(label, callback))
+                row.append(_styled_keyboard_button(label, callback, item.get("button_style")))
         if row:
             rows.append(row)
     if user_id is not None and int(user_id) == ADMIN_ID:
@@ -1680,8 +1809,8 @@ def _prepare_outgoing_markup(chat_id, markup):
 
     if isinstance(markup, InlineKeyboardMarkup):
         routes = _routes_from_inline_markup(markup, keyboard_labels=True)
-        if _is_services_menu_markup(markup):
-            # The services menu has one paired row, followed by full-width rows.
+        if _is_services_menu_markup(markup) or _is_stars_menu_markup(markup):
+            # The services menu has one paired row and the Stars catalog has one package per row.
             # Preserve those exact row boundaries in reply-keyboard mode too.
             rows = []
             for source_row in (getattr(markup, "inline_keyboard", None) or []):
@@ -1690,16 +1819,17 @@ def _prepare_outgoing_markup(chat_id, markup):
                     label = str(getattr(button, "text", "") or "").strip()[:64]
                     callback = getattr(button, "callback_data", None)
                     if label and callback and not getattr(button, "url", None):
-                        row.append(_styled_keyboard_button(label, callback))
+                        row.append(_styled_keyboard_button(label, callback, getattr(button, "style", None)))
                 if row:
                     rows.append(row)
             labels = {str(getattr(button, "text", "") or "").strip() for row in rows for button in row}
             home_label = "⌂ مـنـوی اصـلـی"
-            if not any(str(getattr(button, "callback_data", "") or "") == "home"
-                       for source_row in (getattr(markup, "inline_keyboard", None) or [])
-                       for button in (source_row or [])):
-                rows.append([_styled_keyboard_button(home_label, "home")])
-            routes[home_label] = ("callback", "home")
+            if _is_services_menu_markup(markup):
+                if not any(str(getattr(button, "callback_data", "") or "") == "home"
+                           for source_row in (getattr(markup, "inline_keyboard", None) or [])
+                           for button in (source_row or [])):
+                    rows.append([_styled_keyboard_button(home_label, "home")])
+                routes[home_label] = ("callback", "home")
             if chat_id is not None and int(chat_id) == ADMIN_ID and "👑 مدیریت کل ربات" not in labels:
                 rows.append([_styled_keyboard_button("👑 مدیریت کل ربات", "admin")])
                 routes["👑 مدیریت کل ربات"] = ("callback", "admin")
@@ -1717,7 +1847,7 @@ def _prepare_outgoing_markup(chat_id, markup):
                 label = str(getattr(button, "text", "") or "").strip()[:64]
                 if not label or getattr(button, "url", None):
                     continue
-                pair.append(_styled_keyboard_button(label, getattr(button, "callback_data", None)))
+                pair.append(_styled_keyboard_button(label, getattr(button, "callback_data", None), getattr(button, "style", None)))
                 if len(pair) == 2:
                     rows.append(pair)
                     pair = []
@@ -1766,7 +1896,7 @@ def _prepare_outgoing_markup(chat_id, markup):
                         callback = _route_for_main_label(label)
                         if label == "👑 مدیریت کل ربات":
                             callback = "admin"
-                        row.append(_styled_keyboard_button(label, callback))
+                        row.append(_styled_keyboard_button(label, callback, getattr(button, "style", None)))
                 if row:
                     rows.append(row)
             labels = {str(getattr(button, "text", "") or "").strip() for row in rows for button in row}
@@ -2256,33 +2386,48 @@ def persian_digits(value):
 
 
 def build_stars_menu():
-    """ساخت منوی استارز از همان کاتالوگ محصولات مدیریت؛ محصولات آینده هم خودکار دیده می‌شوند."""
+    """Render Stars packages from catalog rows; admin changes appear without restart."""
     with db() as con:
         rows = con.execute(
-            "SELECT id, name FROM products WHERE category='stars' AND active=1 ORDER BY id"
+            "SELECT id, name, star_amount, button_text, icon, button_style, sort_order "
+            "FROM products WHERE category='stars' AND active=1 AND star_amount IS NOT NULL "
+            "ORDER BY sort_order, id"
         ).fetchall()
     buttons = []
+    seen_amounts = set()
+    valid_styles = {"primary", "success", "danger"}
     for row in rows:
-        # دکمه‌های فعلی و بسته‌های جدیدی که مدیر با نام «استارز N عدد» اضافه کند.
-        import re
-        match = re.search(r"(\d[\d,٬]*)", row["name"].replace("،", ","))
-        if not match:
-            continue
         try:
-            amount = int(match.group(1).replace(",", "").replace("٬", ""))
-        except ValueError:
+            amount = int(row["star_amount"] or 0)
+        except (TypeError, ValueError):
             continue
+        # Invalid or duplicate amounts must not create ambiguous callback routing.
+        if amount <= 0 or amount in seen_amounts:
+            continue
+        seen_amounts.add(amount)
+        default_label = f"{persian_digits(f'{amount:,}'.replace(',', '٬'))} استارز تلگرام"
+        label = str(row["button_text"] or "").strip() or default_label
+        icon = str(row["icon"] or "✧").strip() or "✧"
+        style = str(row["button_style"] or "primary").strip().lower()
+        if style not in valid_styles:
+            style = "primary"
+        button_label = label if label.startswith(icon) else f"{icon} {label}"
         buttons.append([InlineKeyboardButton(
-            f"🎁 {persian_digits(amount)} استارز",
+            button_label[:64],
             callback_data=f"stars_pack_{amount}",
-            style="success",
+            style=style,
         )])
-    buttons.append([InlineKeyboardButton(
-        "✏️ استارز به مقدار دلخواه", callback_data="stars_custom", style="success"
-    )])
-    buttons.append([InlineKeyboardButton(
-        "↩️ بازگشت", callback_data="back_to_services", style="danger"
-    )])
+    # These two non-product buttons are also stored in the central UI settings and editable in admin.
+    special = configured_buttons("stars")
+    for item in sorted(special, key=lambda x: (int(x.get("row", 999) or 999), str(x.get("id", "")))):
+        label = str(item.get("text", "")).strip()
+        callback = str(item.get("callback", "")).strip()
+        if not label or not callback:
+            continue
+        style = str(item.get("button_style", "primary") or "primary").strip().lower()
+        if style not in valid_styles:
+            style = "primary"
+        buttons.append([InlineKeyboardButton(label[:64], callback_data=callback, style=style)])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -2340,7 +2485,8 @@ async def _show_product_category(query, category, user_id):
     """Render any database-backed product category without a hard-coded category whitelist."""
     with db() as con:
         rows = con.execute(
-            "SELECT id, name, price FROM products WHERE category=? AND active=1 ORDER BY id",
+            "SELECT id, name, price, button_text, icon, button_style, sort_order, currency, old_price FROM products "
+            "WHERE category=? AND active=1 ORDER BY sort_order, id",
             (category,),
         ).fetchall()
     labels = {
@@ -2364,9 +2510,19 @@ async def _show_product_category(query, category, user_id):
     keyboard = []
     for row in rows:
         price = int(row["price"] or 0)
-        price_text = f"{price:,} تومان" if price > 0 else "استعلام قیمت"
+        currency = str(row["currency"] or "تومان")
+        price_text = f"{price:,} {currency}" if price > 0 else "استعلام قیمت"
+        old_price = int(row["old_price"] or 0)
+        if old_price > price > 0:
+            price_text = f"{old_price:,} ← {price:,} {currency}"
+        label = str(row["button_text"] or "").strip() or str(row["name"])
+        icon = str(row["icon"] or "").strip()
+        style = str(row["button_style"] or "success").strip().lower()
+        if style not in {"primary", "success", "danger"}:
+            style = "success"
         keyboard.append([InlineKeyboardButton(
-            f"{row['name']} | {price_text}", callback_data=f"buy_{row['id']}", style="success"
+            f"{icon + ' ' if icon else ''}{label} | {price_text}"[:64],
+            callback_data=f"buy_{row['id']}", style=style
         )])
     keyboard.extend([
         [InlineKeyboardButton("⬅️ بازگشت به خدمات", callback_data="cat_stars")],
@@ -2543,6 +2699,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("منوی اصلی", callback_data="uiadm_menu_main")],
                 [InlineKeyboardButton("منوی خدمات", callback_data="uiadm_menu_services")],
+                [InlineKeyboardButton("منوی انتخاب استارز", callback_data="uiadm_menu_stars")],
                 [InlineKeyboardButton("ویرایش متن‌ها", callback_data="uiadm_texts")],
                 [InlineKeyboardButton("بازگشت به مدیریت", callback_data="admin")],
             ])
@@ -2572,6 +2729,9 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data.startswith("uiadm_menu_"):
             menu = data[len("uiadm_menu_"):]
             cfg = ui_load()
+            if menu not in {"main", "services", "stars"}:
+                await query.answer("این منو پشتیبانی نمی‌شود.", show_alert=True)
+                return
             items = cfg.get("menus", {}).get(menu, [])
             kb = []
             for item in items:
@@ -2587,7 +2747,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data.startswith("uiadm_item_"):
             payload = data[len("uiadm_item_"):]
             menu = next(
-                (m for m in ("services", "main")
+                (m for m in ("services", "main", "stars")
                  if payload.startswith(m + "_")),
                 None
             )
@@ -2600,17 +2760,71 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             state["uiadm_state"] = {"kind": "button", "menu": menu, "id": button_id}
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✏️ تغییر نام", callback_data="uiadm_rename")],
+                [InlineKeyboardButton("✏️ تغییر متن دکمه", callback_data="uiadm_rename")],
+                [InlineKeyboardButton("🎨 تغییر رنگ دکمه", callback_data="uiadm_style")],
+                [InlineKeyboardButton("🧭 تغییر عملکرد/مقصد", callback_data="uiadm_callback")],
                 [InlineKeyboardButton("🔁 فعال/غیرفعال", callback_data="uiadm_toggle")],
                 [InlineKeyboardButton("⬆️ جابه‌جایی به بالا", callback_data="uiadm_up")],
                 [InlineKeyboardButton("⬇️ جابه‌جایی به پایین", callback_data="uiadm_down")],
-                [InlineKeyboardButton("🗑 حذف دکمه", callback_data="uiadm_delete")],
+                [InlineKeyboardButton("🗑 غیرفعال‌کردن دکمه", callback_data="uiadm_delete")],
                 [InlineKeyboardButton("↩️ بازگشت", callback_data=f"uiadm_menu_{menu}")],
             ])
             await query.edit_message_text(f"مدیریت دکمه: {button_id}", reply_markup=kb)
             return
 
-        if data in ("uiadm_rename", "uiadm_add_main", "uiadm_add_services"):
+        if data == "uiadm_style":
+            old = state.get("uiadm_state", {})
+            if old.get("kind") != "button":
+                await query.answer("ابتدا دکمه را انتخاب کن.", show_alert=True)
+                return
+            menu_name, item_id = old.get("menu"), old.get("id")
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🟢 سبز", callback_data="uiadm_style_set_success", style="success")],
+                [InlineKeyboardButton("🔵 آبی", callback_data="uiadm_style_set_primary", style="primary")],
+                [InlineKeyboardButton("🔴 قرمز", callback_data="uiadm_style_set_danger", style="danger")],
+                [InlineKeyboardButton("↩️ بازگشت", callback_data=f"uiadm_item_{menu_name}_{item_id}")],
+            ])
+            await query.edit_message_text("رنگ واقعی دکمه را انتخاب کن:", reply_markup=kb)
+            return
+
+        if data.startswith("uiadm_style_set_"):
+            style = data.removeprefix("uiadm_style_set_")
+            old = state.get("uiadm_state", {})
+            if old.get("kind") != "button" or style not in {"primary", "success", "danger"}:
+                await query.answer("درخواست یا رنگ نامعتبر است.", show_alert=True)
+                return
+            cfg = ui_load()
+            items = cfg.get("menus", {}).get(old["menu"], [])
+            item = next((x for x in items if str(x.get("id")) == str(old["id"])), None)
+            if not item:
+                await query.answer("دکمه پیدا نشد.", show_alert=True)
+                return
+            item["button_style"] = style
+            ui_save(cfg)
+            await query.edit_message_text("✅ رنگ دکمه ذخیره شد.", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("بازگشت به ویرایش دکمه", callback_data=f"uiadm_item_{old['menu']}_{old['id']}")],
+                [InlineKeyboardButton("مدیریت منو", callback_data=f"uiadm_menu_{old['menu']}")],
+            ]))
+            return
+
+        if data == "uiadm_callback":
+            old = state.get("uiadm_state", {})
+            if old.get("kind") != "button":
+                await query.answer("ابتدا دکمه را انتخاب کن.", show_alert=True)
+                return
+            cfg = ui_load()
+            item = next((x for x in cfg.get("menus", {}).get(old["menu"], []) if str(x.get("id")) == str(old["id"])), None)
+            if not item:
+                await query.answer("دکمه پیدا نشد.", show_alert=True)
+                return
+            state["uiadm_state"] = {**old, "kind": "callback"}
+            await query.edit_message_text(
+                "شناسهٔ عملکرد موجود را بفرست. فقط عملکردهای پیاده‌سازی‌شده پذیرفته می‌شوند.\n\n"
+                f"مقدار فعلی: {item.get('callback', '')}\nبرای لغو /cancel را بفرست."
+            )
+            return
+
+        if data in ("uiadm_rename", "uiadm_add_main", "uiadm_add_services", "uiadm_add_stars"):
             if data == "uiadm_rename":
                 old = state.get("uiadm_state", {})
                 if old.get("kind") != "button":
@@ -2639,12 +2853,17 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 items[idx]["enabled"] = not items[idx].get("enabled", True)
             elif data == "uiadm_up" and idx > 0:
                 items[idx-1], items[idx] = items[idx], items[idx-1]
+                if "row" in items[idx-1] or "row" in items[idx]:
+                    items[idx-1]["row"], items[idx]["row"] = items[idx].get("row"), items[idx-1].get("row")
             elif data == "uiadm_down" and idx < len(items)-1:
                 items[idx+1], items[idx] = items[idx], items[idx+1]
+                if "row" in items[idx+1] or "row" in items[idx]:
+                    items[idx+1]["row"], items[idx]["row"] = items[idx].get("row"), items[idx+1].get("row")
             elif data == "uiadm_delete":
-                items.pop(idx)
+                items[idx]["enabled"] = False
             ui_save(cfg)
-            await query.edit_message_text("✅ تغییر ذخیره شد.", reply_markup=InlineKeyboardMarkup([
+            result_text = "✅ دکمه غیرفعال شد؛ برای بازیابی از گزینهٔ فعال/غیرفعال استفاده کن." if data == "uiadm_delete" else "✅ تغییر ذخیره شد."
+            await query.edit_message_text(result_text, reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("بازگشت به منو", callback_data=f"uiadm_menu_{st['menu']}")],
                 [InlineKeyboardButton("پنل مدیریت", callback_data="uiadm_home")],
             ]))
@@ -2688,8 +2907,8 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             product = conn.execute(
                 "SELECT id, price, active FROM products "
-                "WHERE category = 'stars' AND name = ? LIMIT 1",
-                (f"استارز {amount} عدد",)
+                "WHERE category='stars' AND star_amount=? LIMIT 1",
+                (amount,)
             ).fetchone()
             user = conn.execute(
                 "SELECT balance FROM users WHERE user_id = ?",
@@ -2755,8 +2974,8 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             amount = int(data.rsplit("_", 1)[-1])
             with db() as con:
                 product = con.execute(
-                    "SELECT price, active FROM products WHERE category=? AND name=? LIMIT 1",
-                    ("stars", f"استارز {amount} عدد")
+                    "SELECT price, active FROM products WHERE category=? AND (star_amount=? OR name=?) LIMIT 1",
+                    ("stars", amount, f"استارز {amount} عدد")
                 ).fetchone()
             if not product or not product["active"] or int(product["price"] or 0) <= 0:
                 await query.answer("قیمت این بسته تنظیم نشده است.", show_alert=True)
@@ -2804,12 +3023,15 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         username = query.from_user.username
         recipient = f"@{username}" if is_self and username else ("خودم" if is_self else "پس از انتخاب گیرنده")
         recipient_id = str(user_id) if is_self else "پس از انتخاب گیرنده"
+        context.user_data["stars_recipient"] = {
+            "amount": int(amount), "recipient": recipient, "recipient_id": recipient_id,
+        }
 
         try:
             conn = db()
             product = conn.execute(
-                "SELECT price FROM products WHERE category = ? AND name = ? LIMIT 1",
-                ("stars", f"استارز {amount} عدد")
+                "SELECT price FROM products WHERE category = ? AND (star_amount = ? OR name = ?) LIMIT 1",
+                ("stars", amount, f"استارز {amount} عدد")
             ).fetchone()
             user = conn.execute(
                 "SELECT balance FROM users WHERE user_id = ?",
@@ -2873,8 +3095,8 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         with db() as con:
             product = con.execute(
-                "SELECT price, active FROM products WHERE category='stars' AND name=? LIMIT 1",
-                (f"استارز {amount} عدد",)
+                "SELECT price, active, currency FROM products WHERE category='stars' AND (star_amount=? OR name=?) LIMIT 1",
+                (amount, f"استارز {amount} عدد")
             ).fetchone()
 
         if not product or not product["active"] or int(product["price"] or 0) <= 0:
@@ -2888,18 +3110,126 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             discount = int(coupon.get("discount", 0))
         else:
             discount = 0
-        await query.edit_message_text(
+        card_number = str(bot_text("payment_card_number") or "").strip()
+        card_owner = str(bot_text("payment_card_owner") or "").strip()
+        payment_ready = bool(card_number and card_number.casefold() not in {"هنوز تنظیم نشده", "تنظیم نشده", "ثبت نشده"})
+        buttons = []
+        if payment_ready:
+            buttons.append([InlineKeyboardButton(
+                "✅ پرداخت کردم؛ ثبت سفارش و ارسال رسید",
+                callback_data=f"stars_receipt_start_{amount}", style="success"
+            )])
+        buttons.append([InlineKeyboardButton("❌ لغو سفارش", callback_data="stars_detail_back", style="danger")])
+        payment_text = (
             "💳 پرداخت کارت‌به‌کارت | SEYED PREMIUM\n\n"
             f"⭐ محصول: {amount} استارز\n"
-            f"💰 مبلغ: {toman(price)} تومان\n\n"
-            "🏦 شماره کارت: هنوز تنظیم نشده است\n"
-            "👤 نام صاحب کارت: هنوز تنظیم نشده است\n\n"
-            "⚠️ تا زمان تنظیم اطلاعات کارت، پرداخت انجام نده.\n"
-            "پس از تنظیم کارت، ارسال رسید و تأیید مدیر باید انجام شود.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("❌ لغو سفارش", callback_data="stars_detail_back", style="danger")
-            ]])
+            f"💰 مبلغ: {toman(price)} {str(product['currency'] or 'تومان')}\n\n"
+            f"🏦 شماره کارت: {card_number}\n"
+            f"👤 نام صاحب کارت: {card_owner or 'در تنظیمات وارد نشده'}\n\n"
+            + (bot_text("payment_instructions") if payment_ready else
+               "⚠️ اطلاعات کارت هنوز توسط مدیریت تنظیم نشده است؛ فعلاً پرداخت انجام نده. از پشتیبانی پیگیری کن.")
         )
+        await query.edit_message_text(payment_text, reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data.startswith("stars_receipt_start_"):
+        try:
+            amount = int(data.rsplit("_", 1)[-1])
+        except ValueError:
+            await query.answer("بسته معتبر نیست.", show_alert=True)
+            return
+        card_number = str(bot_text("payment_card_number") or "").strip()
+        if not card_number or card_number.casefold() in {"هنوز تنظیم نشده", "تنظیم نشده", "ثبت نشده"}:
+            await query.answer("اطلاعات پرداخت هنوز توسط مدیریت تنظیم نشده است.", show_alert=True)
+            return
+        user_id = query.from_user.id
+        recipient_info = context.user_data.get("stars_recipient") or {}
+        recipient_label = str(recipient_info.get("recipient", "گیرنده مشخص نشده"))
+        recipient_id = str(recipient_info.get("recipient_id", ""))
+        try:
+            with db() as con:
+                ensure_discount_schema(con)
+                con.execute("BEGIN IMMEDIATE")
+                product = con.execute(
+                    "SELECT id, name, price, currency, active FROM products WHERE category='stars' AND star_amount=? LIMIT 1",
+                    (amount,),
+                ).fetchone()
+                if not product or not product["active"] or int(product["price"] or 0) <= 0:
+                    con.rollback()
+                    await query.answer("محصول یا قیمت این بسته تنظیم نشده است.", show_alert=True)
+                    return
+                price = int(product["price"])
+                coupon = context.user_data.get("stars_coupon", {})
+                coupon_code = None
+                coupon_discount = 0
+                if int(coupon.get("amount", 0) or 0) == amount and coupon.get("code"):
+                    validation = validate_coupon_for_order(
+                        con, str(coupon["code"]), user_id, price, "stars", str(product["name"]), query.from_user.username
+                    )
+                    if not validation.get("ok"):
+                        con.rollback()
+                        await query.answer(validation.get("reason", "کد تخفیف معتبر نیست."), show_alert=True)
+                        return
+                    coupon_code = validation["code"]
+                    coupon_discount = int(validation["discount"])
+                    price = int(validation["final_price"])
+                order_details = f"مقدار: {amount} استارز؛ گیرنده: {recipient_label}؛ شناسه گیرنده: {recipient_id or 'ثبت نشده'}"
+                existing = con.execute(
+                    "SELECT id FROM orders WHERE user_id=? AND product_id=? AND status='در انتظار ارسال رسید' AND order_details=? ORDER BY id DESC LIMIT 1",
+                    (user_id, int(product["id"]), order_details),
+                ).fetchone()
+                if existing:
+                    order_id = int(existing["id"])
+                else:
+                    cur = con.execute(
+                        "INSERT INTO orders (user_id, product_id, price, status, currency, order_details, payment_method, coupon_code, coupon_discount) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (user_id, int(product["id"]), price, "در انتظار ارسال رسید", str(product["currency"] or "تومان"), order_details, "کارت‌به‌کارت", coupon_code, coupon_discount),
+                    )
+                    order_id = int(cur.lastrowid)
+                    if coupon_code:
+                        con.execute(
+                            "INSERT INTO coupon_usage (code, user_id, order_id, discount_amount, status) VALUES (?, ?, ?, ?, 'pending')",
+                            (coupon_code, user_id, order_id, coupon_discount),
+                        )
+                        con.execute("UPDATE discount_codes SET total_uses=COALESCE(total_uses,0)+1 WHERE code=?", (coupon_code,))
+            context.user_data["pending_receipt_order_id"] = order_id
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=(f"🧾 سفارش استارز #{order_id} ساخته شد و منتظر رسید است.\n"
+                          f"کاربر: {user_id}\nبسته: {amount} استارز\nمبلغ: {price:,} {str(product['currency'] or 'تومان')}\n"
+                          f"جزئیات: {order_details}\nوضعیت: در انتظار ارسال رسید"),
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("مشاهده سفارش", callback_data=f"admin_order_view_{order_id}")]]),
+                )
+            except Exception:
+                logger.warning("Could not notify admin about Stars order #%s", order_id, exc_info=True)
+            await query.edit_message_text(
+                f"✅ سفارش استارز #{order_id} ثبت شد.\n\n"
+                f"💰 مبلغ: {price:,} {str(product['currency'] or 'تومان')}\n"
+                "حالا تصویر واضح رسید پرداخت را در همین گفت‌وگو ارسال کن. پس از بررسی و تأیید مدیر، سفارش برای تحویل آماده می‌شود.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو سفارش", callback_data=f"cancel_receipt_order_{order_id}", style="danger")]]),
+            )
+        except Exception:
+            logger.exception("Could not create Stars payment order")
+            await query.answer("ثبت سفارش انجام نشد؛ دوباره تلاش کن.", show_alert=True)
+        return
+
+    if data.startswith("cancel_receipt_order_"):
+        try:
+            order_id = int(data.rsplit("_", 1)[-1])
+        except ValueError:
+            await query.answer("شماره سفارش معتبر نیست.", show_alert=True)
+            return
+        with db() as con:
+            cur = con.execute(
+                "UPDATE orders SET status='لغو شده' WHERE id=? AND user_id=? AND status='در انتظار ارسال رسید'",
+                (order_id, query.from_user.id),
+            )
+        context.user_data.pop("pending_receipt_order_id", None)
+        if cur.rowcount:
+            await query.edit_message_text(f"سفارش #{order_id} لغو شد؛ سوابق برای پیگیری محفوظ می‌ماند.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 منوی اصلی", callback_data="home")]]))
+        else:
+            await query.answer("سفارش در وضعیت قابل لغو نیست.", show_alert=True)
         return
 
     if data.startswith("stars_pay_wallet_"):
@@ -2939,8 +3269,8 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
 
                 product = con.execute(
-                    "SELECT id, price, active FROM products WHERE category=? AND name=? LIMIT 1",
-                    ("stars", f"استارز {amount} عدد")
+                    "SELECT id, price, active FROM products WHERE category=? AND (star_amount=? OR name=?) LIMIT 1",
+                    ("stars", amount, f"استارز {amount} عدد")
                 ).fetchone()
 
                 user_row = con.execute(
@@ -3658,9 +3988,9 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with db() as con:
             rows = con.execute(
                 """
-                SELECT id, name, price FROM products
+                SELECT id, name, price, button_text, icon, button_style, sort_order, currency, old_price FROM products
                 WHERE category=? AND active=1
-                ORDER BY id
+                ORDER BY sort_order, id
                 """,
                 (category,),
             ).fetchall()
@@ -3711,17 +4041,21 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     buttons.append(row_buttons)
         else:
             for product in rows:
-                price_text = f"{product['price']:,} تومان" if product["price"] else "استعلام قیمت"
-                button_text = (
-                    product["name"]
-                    if not product["price"] and "استعلام قیمت" in product["name"]
-                    else f"{product['name']} | {price_text}"
-                )
+                price_value = int(product["price"] or 0)
+                currency = str(product["currency"] or "تومان")
+                price_text = f"{price_value:,} {currency}" if price_value else "استعلام قیمت"
+                old_price = int(product["old_price"] or 0)
+                if old_price > price_value > 0:
+                    price_text = f"{old_price:,} ← {price_value:,} {currency}"
+                label = str(product["button_text"] or "").strip() or str(product["name"])
+                icon = str(product["icon"] or "").strip()
+                button_text = f"{icon + ' ' if icon else ''}{label} | {price_text}"
+                style = str(product["button_style"] or "success").strip().lower()
+                if style not in {"primary", "success", "danger"}:
+                    style = "success"
                 buttons.append([
                     InlineKeyboardButton(
-                        button_text,
-                        callback_data=f"buy_{product['id']}",
-                        style="success",
+                        button_text[:64], callback_data=f"buy_{product['id']}", style=style,
                     )
                 ])
         buttons.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="home", style="primary")])
@@ -3787,15 +4121,48 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("pending_product_coupon", None)
         context.user_data.pop("pending_product_coupon_input", None)
         prompt = product_details_prompt(product)
+        description = str(product["description"] or "").strip() if "description" in product.keys() else ""
+        if description:
+            prompt = description + "\n\n" + prompt
+        display_title = str(product["button_text"] or "").strip() or str(product["name"])
+        currency = str(product["currency"] or "تومان") if "currency" in product.keys() else "تومان"
+        current_price = int(product["price"] or 0)
+        old_price = int(product["old_price"] or 0) if "old_price" in product.keys() else 0
+        price_line = (f"💰 قیمت: {current_price:,} {currency}" if current_price > 0 else "💰 قیمت: استعلام قیمت")
+        if old_price > current_price > 0:
+            price_line = f"💰 قیمت: {old_price:,} ← {current_price:,} {currency}"
+        prompt = price_line + "\n\n" + prompt
         product_keyboard = []
         if int(product["price"] or 0) > 0:
             product_keyboard.append([InlineKeyboardButton("🏷️ وارد کردن کد تخفیف", callback_data=f"product_coupon_enter_{product_id}")])
         product_keyboard.append([InlineKeyboardButton("🏠 لغو سفارش", callback_data="home")])
-        await query.edit_message_text(
-            f"🛍 محصول انتخاب‌شده: {product['name']}\n\n{prompt}\n\n"
-            "برای لغو، /start را بزنید.",
-            reply_markup=InlineKeyboardMarkup(product_keyboard)
+        product_message = (
+            f"🛍 محصول انتخاب‌شده: {display_title}\n\n{prompt}\n\n"
+            "برای لغو، /start را بزنید."
         )
+        product_markup = InlineKeyboardMarkup(product_keyboard)
+        image_file_id = str(product["image_file_id"] or "").strip() if "image_file_id" in product.keys() else ""
+        if image_file_id:
+            # Photos are optional catalog metadata. If Telegram rejects the file_id or caption,
+            # fall back to a normal text screen without losing the customer's current state.
+            try:
+                # Keep the photo as presentation only. The actionable menu is sent
+                # through edit_message_text so the global inline/reply-keyboard mode
+                # and the same button-style handling apply consistently.
+                await context.bot.send_photo(
+                    chat_id=query.message.chat_id,
+                    photo=image_file_id,
+                    caption=product_message[:1024],
+                )
+                await query.edit_message_text(
+                    "✅ برای ادامهٔ سفارش، گزینه‌های زیر را انتخاب کن.",
+                    reply_markup=product_markup,
+                )
+            except Exception:
+                logger.warning("Could not show product image for product_id=%s", product_id, exc_info=True)
+                await query.edit_message_text(product_message, reply_markup=product_markup)
+        else:
+            await query.edit_message_text(product_message, reply_markup=product_markup)
         return
 
 
@@ -4754,22 +5121,121 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif data.startswith("admin_p_edit_"):
                 pid = int(data.rsplit("_", 1)[1])
                 with db() as con:
-                    row = con.execute("SELECT id, name, price, category FROM products WHERE id=?", (pid,)).fetchone()
+                    row = con.execute(
+                        "SELECT id, name, price, category, button_text, icon, button_style, sort_order, "
+                        "description, star_amount, currency, old_price, image_file_id FROM products WHERE id=?",
+                        (pid,),
+                    ).fetchone()
                 if not row:
                     await query.answer("محصول پیدا نشد.", show_alert=True)
                     return
                 keyboard = [
-                    [InlineKeyboardButton("✏️ ویرایش نام", callback_data=f"admin_p_name_{pid}")],
-                    [InlineKeyboardButton("💰 ویرایش قیمت", callback_data=f"admin_p_price_{pid}")],
+                    [InlineKeyboardButton("✏️ ویرایش نام", callback_data=f"admin_p_name_{pid}"),
+                     InlineKeyboardButton("💰 ویرایش قیمت", callback_data=f"admin_p_price_{pid}")],
+                    [InlineKeyboardButton("🏷️ متن دکمه", callback_data=f"admin_p_button_text_{pid}"),
+                     InlineKeyboardButton("✧ آیکون", callback_data=f"admin_p_icon_{pid}")],
+                    [InlineKeyboardButton("🎨 رنگ دکمه", callback_data=f"admin_p_style_{pid}"),
+                     InlineKeyboardButton("↕️ ترتیب نمایش", callback_data=f"admin_p_sort_order_{pid}")],
+                    [InlineKeyboardButton("📝 توضیحات محصول", callback_data=f"admin_p_description_{pid}"),
+                     InlineKeyboardButton("🖼️ تصویر محصول", callback_data=f"admin_p_image_{pid}")],
+                    [InlineKeyboardButton("💱 واحد پول", callback_data=f"admin_p_currency_{pid}"),
+                     InlineKeyboardButton("🏷️ قیمت قبلی", callback_data=f"admin_p_old_price_{pid}")],
                     [InlineKeyboardButton("📂 ویرایش دسته‌بندی", callback_data=f"admin_p_cat_{pid}")],
+                    [InlineKeyboardButton("⭐ مقدار بستهٔ استارز", callback_data=f"admin_p_star_amount_{pid}")],
+                    [InlineKeyboardButton("↩️ بازگشت به محصولات", callback_data="admin_products")],
+                ]
+                amount_text = str(row["star_amount"] or "تنظیم نشده")
+                text = (
+                    f"🛠 ویرایش محصول #{pid}\n\nنام: {row['name']}\n"
+                    f"متن دکمه: {row['button_text'] or 'همان نام محصول'}\n"
+                    f"آیکون: {row['icon'] or 'ندارد'} | رنگ: {row['button_style']}\n"
+                    f"قیمت: {int(row['price'] or 0):,} {row['currency'] or 'تومان'}\n"
+                    f"قیمت قبلی: {int(row['old_price'] or 0):,}\nدسته: {row['category']}\n"
+                    f"ترتیب: {int(row['sort_order'] or 0)} | مقدار استارز: {amount_text}\n"
+                    f"تصویر: {'ثبت‌شده' if row['image_file_id'] else 'ندارد'}\n"
+                    f"توضیحات: {str(row['description'] or '')[:300] or 'ثبت نشده'}"
+                )
+                await query.edit_message_text(text[:3900], reply_markup=InlineKeyboardMarkup(keyboard))
+                return
+
+            elif data.startswith("admin_p_style_set_"):
+                payload = data[len("admin_p_style_set_"):]
+                try:
+                    pid_text, style = payload.split("_", 1)
+                    pid = int(pid_text)
+                except (ValueError, IndexError):
+                    await query.answer("درخواست نامعتبر است.", show_alert=True)
+                    return
+                if style not in {"primary", "success", "danger"}:
+                    await query.answer("رنگ نامعتبر است.", show_alert=True)
+                    return
+                with db() as con:
+                    cur = con.execute("UPDATE products SET button_style=? WHERE id=?", (style, pid))
+                if cur.rowcount != 1:
+                    await query.answer("محصول پیدا نشد.", show_alert=True)
+                    return
+                await query.answer("رنگ دکمه ذخیره شد.", show_alert=True)
+                data = f"admin_p_edit_{pid}"
+                # Reuse the regular edit screen below by rebuilding it directly.
+                with db() as con:
+                    row = con.execute("SELECT id, name, price, category, button_text, icon, button_style, sort_order, description, star_amount, currency, old_price, image_file_id FROM products WHERE id=?", (pid,)).fetchone()
+                keyboard = [
+                    [InlineKeyboardButton("✏️ ویرایش نام", callback_data=f"admin_p_name_{pid}"), InlineKeyboardButton("💰 ویرایش قیمت", callback_data=f"admin_p_price_{pid}")],
+                    [InlineKeyboardButton("🏷️ متن دکمه", callback_data=f"admin_p_button_text_{pid}"), InlineKeyboardButton("✧ آیکون", callback_data=f"admin_p_icon_{pid}")],
+                    [InlineKeyboardButton("🎨 رنگ دکمه", callback_data=f"admin_p_style_{pid}"), InlineKeyboardButton("↕️ ترتیب نمایش", callback_data=f"admin_p_sort_order_{pid}")],
+                    [InlineKeyboardButton("📝 توضیحات محصول", callback_data=f"admin_p_description_{pid}"), InlineKeyboardButton("🖼️ تصویر محصول", callback_data=f"admin_p_image_{pid}")],
+                    [InlineKeyboardButton("💱 واحد پول", callback_data=f"admin_p_currency_{pid}"), InlineKeyboardButton("🏷️ قیمت قبلی", callback_data=f"admin_p_old_price_{pid}")],
+                    [InlineKeyboardButton("📂 ویرایش دسته‌بندی", callback_data=f"admin_p_cat_{pid}"), InlineKeyboardButton("⭐ مقدار بستهٔ استارز", callback_data=f"admin_p_star_amount_{pid}")],
                     [InlineKeyboardButton("↩️ بازگشت به محصولات", callback_data="admin_products")],
                 ]
                 await query.edit_message_text(
-                    f"🛠 ویرایش محصول #{pid}\n\n"
-                    f"نام: {row['name']}\nقیمت: {int(row['price'] or 0):,} تومان\nدسته: {row['category']}",
+                    f"🛠 ویرایش محصول #{pid}\n\nنام: {row['name']}\nمتن دکمه: {row['button_text'] or 'همان نام محصول'}\n"
+                    f"آیکون: {row['icon'] or 'ندارد'} | رنگ: {row['button_style']}\n"
+                    f"قیمت: {int(row['price'] or 0):,} {row['currency'] or 'تومان'}\nدسته: {row['category']}\n"
+                    f"ترتیب: {int(row['sort_order'] or 0)} | مقدار استارز: {row['star_amount'] or 'تنظیم نشده'}",
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
                 return
+
+            elif data.startswith("admin_p_style_"):
+                try:
+                    pid = int(data.rsplit("_", 1)[1])
+                except ValueError:
+                    await query.answer("شناسه محصول نامعتبر است.", show_alert=True)
+                    return
+                await query.edit_message_text(
+                    "رنگ موردنظر دکمه را انتخاب کن:",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🟢 سبز", callback_data=f"admin_p_style_set_{pid}_success", style="success")],
+                        [InlineKeyboardButton("🔵 آبی", callback_data=f"admin_p_style_set_{pid}_primary", style="primary")],
+                        [InlineKeyboardButton("🔴 قرمز", callback_data=f"admin_p_style_set_{pid}_danger", style="danger")],
+                        [InlineKeyboardButton("↩️ بازگشت", callback_data=f"admin_p_edit_{pid}")],
+                    ])
+                )
+                return
+
+            elif data.startswith(("admin_p_button_text_", "admin_p_icon_", "admin_p_sort_order_", "admin_p_description_", "admin_p_star_amount_", "admin_p_currency_", "admin_p_old_price_", "admin_p_image_")):
+                routes = (
+                    ("admin_p_button_text_", "edit_button_text", "متن جدید دکمه را بفرست (حداکثر ۶۴ نویسه؛ برای استفاده از نام محصول، کلمهٔ پاک را بفرست):"),
+                    ("admin_p_icon_", "edit_icon", "نماد متنی جدید را بفرست؛ برای حذف آیکون، کلمهٔ پاک را بفرست:"),
+                    ("admin_p_sort_order_", "edit_sort_order", "عدد ترتیب نمایش را بفرست؛ عدد کمتر زودتر نمایش داده می‌شود:"),
+                    ("admin_p_description_", "edit_description", "توضیحات محصول را بفرست (حداکثر ۱۲۰۰ نویسه؛ برای پاک‌کردن، کلمهٔ پاک):"),
+                    ("admin_p_star_amount_", "edit_star_amount", "مقدار بستهٔ استارز را به عدد بفرست؛ برای حذف این بسته از منوی استارز عدد ۰ را بفرست:"),
+                    ("admin_p_currency_", "edit_currency", "واحد پول را بفرست؛ مثال: تومان یا ریال:"),
+                    ("admin_p_old_price_", "edit_old_price", "قیمت قبلی را به عدد بفرست؛ برای نداشتن قیمت قبلی ۰ را بفرست:"),
+                    ("admin_p_image_", "edit_image", "حالا تصویر محصول را به‌صورت عکس در تلگرام بفرست. برای لغو /cancel را بزن."),
+                )
+                for prefix, action, prompt in routes:
+                    if data.startswith(prefix):
+                        pid = int(data[len(prefix):])
+                        with db() as con:
+                            product = con.execute("SELECT id, category FROM products WHERE id=?", (pid,)).fetchone()
+                        if not product:
+                            await query.answer("محصول پیدا نشد.", show_alert=True)
+                            return
+                        context.user_data["product_admin_state"] = {"action": action, "product_id": pid, "category": product["category"]}
+                        await query.edit_message_text(prompt + ("\nبرای لغو /cancel را بزن." if action != "edit_image" else ""))
+                        return
 
             elif data.startswith("admin_p_name_") or data.startswith("admin_p_price_"):
                 pid = int(data.rsplit("_", 1)[1])
@@ -4780,7 +5246,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await query.answer("محصول پیدا نشد.", show_alert=True)
                     return
                 context.user_data["product_admin_state"] = {"action": action, "product_id": pid}
-                prompt = "نام جدید محصول را بفرست:" if action == "edit_name" else "قیمت جدید را فقط به عدد و به تومان بفرست. برای قیمت نامشخص عدد 0 وارد کن:"
+                prompt = "نام جدید محصول را بفرست:" if action == "edit_name" else "قیمت جدید را فقط به عدد و بر اساس واحد پول محصول وارد کن. برای قیمت نامشخص عدد 0 وارد کن:"
                 await query.edit_message_text(prompt + "\n\nبرای لغو /cancel را بزن.")
                 return
 
@@ -4858,7 +5324,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 total_pages = max(1, (int(total_products) + products_per_page - 1) // products_per_page)
                 products_page = min(products_page, total_pages)
                 rows = con.execute(
-                    "SELECT id, category, name, price, active FROM products ORDER BY id LIMIT ? OFFSET ?",
+                    "SELECT id, category, name, price, active, currency, button_text, icon, button_style, sort_order, star_amount, old_price FROM products ORDER BY sort_order, id LIMIT ? OFFSET ?",
                     (products_per_page, (products_page - 1) * products_per_page),
                 ).fetchall()
 
@@ -4870,9 +5336,12 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             for r in rows:
                 price_value = int(r["price"] or 0)
-                price_text = f"{price_value:,} تومان" if price_value > 0 else "تنظیم نشده"
+                currency_value = str(r["currency"] or "تومان")
+                price_text = f"{price_value:,} {currency_value}" if price_value > 0 else "تنظیم نشده"
                 status = "🟢 فعال" if r["active"] else "🔴 غیرفعال"
-                text += f"#{r['id']} | {r['name']}\n📂 {r['category']} | 💰 {price_text}\nوضعیت: {status}\n\n"
+                text += (f"#{r['id']} | {r['name']}\n📂 {r['category']} | 💰 {price_text}\n"
+                         f"🔘 {r['icon'] or '—'} {r['button_text'] or r['name']} | رنگ: {r['button_style']}\n"
+                         f"↕️ ترتیب: {r['sort_order']} | مقدار استارز: {r['star_amount'] or '—'}\nوضعیت: {status}\n\n")
                 keyboard.append([
                     InlineKeyboardButton(
                         "🔴 غیرفعال" if r["active"] else "🟢 فعال",
@@ -4903,6 +5372,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     """
                     SELECT orders.id, orders.user_id, orders.product_id,
                            orders.price, orders.status, orders.created_at,
+                           orders.currency, orders.order_details, orders.receipt_file_id, orders.payment_method,
                            products.name
                     FROM orders
                     LEFT JOIN products ON products.id = orders.product_id
@@ -4941,7 +5411,10 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"📦 سفارش #{order['id']}\n\n"
                 f"👤 مشتری: {order['user_id']}\n"
                 f"🛍 محصول: {order['name'] or ('محصول #' + str(order['product_id']))}\n"
-                f"💰 مبلغ: {order['price']:,} تومان\n"
+                f"💰 مبلغ: {order['price']:,} {order['currency'] or 'تومان'}\n"
+                f"📝 جزئیات: {order['order_details'] or 'ثبت نشده'}\n"
+                f"💳 روش پرداخت: {order['payment_method'] or 'نامشخص'}\n"
+                f"🧾 رسید: {'ثبت شده' if order['receipt_file_id'] else 'ثبت نشده'}\n"
                 f"📌 وضعیت: {order['status']}\n"
                 f"🕒 تاریخ: {order['created_at']}",
                 reply_markup=InlineKeyboardMarkup(keyboard)
@@ -5005,18 +5478,18 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if pending_use:
                     con.execute("DELETE FROM coupon_usage WHERE order_id=? AND status='pending'", (order_id,))
                     con.execute("UPDATE discount_codes SET total_uses=MAX(0, COALESCE(total_uses, 0)-1) WHERE code=?", (pending_use["code"],))
-                con.execute("DELETE FROM orders WHERE id = ?", (order_id,))
+                con.execute("UPDATE orders SET status='لغو شده' WHERE id = ?", (order_id,))
 
             try:
                 await context.bot.send_message(
                     chat_id=customer_id,
-                    text=f"اطلاع‌رسانی SEYED PREMIUM: سفارش شماره #{order_id} توسط مدیریت حذف شد. برای پیگیری با پشتیبانی تماس بگیر."
+                    text=f"اطلاع‌رسانی SEYED PREMIUM: سفارش شماره #{order_id} توسط مدیریت لغو و بایگانی شد. برای پیگیری با پشتیبانی تماس بگیر."
                 )
             except Exception:
                 pass
 
             await query.edit_message_text(
-                f"✅ سفارش #{order_id} حذف شد.",
+                f"✅ سفارش #{order_id} لغو و بایگانی شد؛ تاریخچه حذف نشد.",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton(
                         "📦 بازگشت به سفارش‌ها",
@@ -5054,6 +5527,9 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await query.answer("این سفارش قبلاً رد شده؛ درخواست جدید ثبت شود.", show_alert=True)
                     return
                 customer_id = order["user_id"]
+                if approve and str(order["status"] or "") == "در انتظار ارسال رسید":
+                    await query.answer("هنوز رسیدی ثبت نشده است؛ پیش از تأیید باید رسید را بررسی کنید.", show_alert=True)
+                    return
                 if approve:
                     con.execute("UPDATE coupon_usage SET status='used' WHERE order_id=? AND status='pending'", (order_id,))
                 elif str(order["status"] or "") not in ("رد شده", "تأیید شده"):
@@ -5156,6 +5632,17 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cancel_coupon_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     message = update.effective_message
+    # Customer can cancel an order that is still awaiting a receipt; preserve its history.
+    if user and user.id != ADMIN_ID and context.user_data.get("pending_receipt_order_id"):
+        order_id = int(context.user_data.pop("pending_receipt_order_id"))
+        with db() as con:
+            con.execute(
+                "UPDATE orders SET status='لغو شده' WHERE id=? AND user_id=? AND status='در انتظار ارسال رسید'",
+                (order_id, user.id),
+            )
+        if message:
+            await message.reply_text(f"سفارش #{order_id} لغو شد؛ سوابق برای پیگیری محفوظ می‌ماند.")
+        return
     # The shared /cancel command also exits customer-side mediator and TON forms.
     if context.user_data.get("mediator_request_state") or context.user_data.get("ton_purchase_state"):
         context.user_data.pop("mediator_request_state", None)
@@ -5167,6 +5654,14 @@ async def cancel_coupon_creation(update: Update, context: ContextTypes.DEFAULT_T
             )
         return
     if not user or user.id != ADMIN_ID:
+        return
+
+    product_state = context.user_data.pop("product_admin_state", None)
+    ui_state = context.user_data.pop("uiadm_state", None)
+    editor_wait_key = context.user_data.pop("editor_wait_key", None)
+    if product_state or ui_state or editor_wait_key:
+        if message:
+            await message.reply_text("✅ عملیات ویرایش لغو شد؛ اطلاعات قبلی حفظ شدند.")
         return
 
     edit_state = context.user_data.pop("coupon_edit_state", None)
@@ -5339,6 +5834,87 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
     message = update.effective_message
     if user:
         register_user(user)
+
+    product_state = context.user_data.get("product_admin_state") or {}
+    if message and message.photo and product_state.get("action") == "edit_image":
+        if not user or user.id != ADMIN_ID:
+            context.user_data.pop("product_admin_state", None)
+            await message.reply_text("⛔ دسترسی مجاز نیست.")
+            return
+        file_id = message.photo[-1].file_id
+        with db() as con:
+            cur = con.execute("UPDATE products SET image_file_id=? WHERE id=?", (file_id, int(product_state.get("product_id", 0))))
+        context.user_data.pop("product_admin_state", None)
+        await message.reply_text("✅ تصویر محصول در دیتابیس ذخیره شد." if cur.rowcount else "محصول پیدا نشد.")
+        return
+
+    if message and message.photo and product_state.get("action"):
+        await message.reply_text("این مرحله منتظر متن است. عکس دریافت نشد؛ برای لغو /cancel را بزن.")
+        return
+
+    # Customer receipts: match the photo to exactly one pending order; never infer payment from a text claim.
+    if message and message.photo and user and user.id != ADMIN_ID:
+        pending_id = context.user_data.get("pending_receipt_order_id")
+        with db() as con:
+            if pending_id:
+                pending_rows = con.execute(
+                    "SELECT o.id, o.user_id, o.product_id, o.price, o.currency, o.order_details, p.name "
+                    "FROM orders o LEFT JOIN products p ON p.id=o.product_id "
+                    "WHERE o.id=? AND o.user_id=? AND o.status='در انتظار ارسال رسید' LIMIT 1",
+                    (int(pending_id), user.id),
+                ).fetchall()
+            else:
+                pending_rows = con.execute(
+                    "SELECT o.id, o.user_id, o.product_id, o.price, o.currency, o.order_details, p.name "
+                    "FROM orders o LEFT JOIN products p ON p.id=o.product_id "
+                    "WHERE o.user_id=? AND o.status='در انتظار ارسال رسید' ORDER BY o.id DESC LIMIT 2",
+                    (user.id,),
+                ).fetchall()
+        if len(pending_rows) != 1:
+            if len(pending_rows) > 1:
+                await message.reply_text("چند سفارش منتظر رسید دارید. برای جلوگیری از ثبت رسید روی سفارش اشتباه، با پشتیبانی تماس بگیرید و شماره سفارش را مشخص کنید.")
+            else:
+                await message.reply_text("سفارش فعالی که منتظر رسید باشد پیدا نشد. ابتدا سفارش را از فروشگاه ثبت کنید.")
+            return
+        order = pending_rows[0]
+        file_id = message.photo[-1].file_id
+        with db() as con:
+            cur = con.execute(
+                "UPDATE orders SET receipt_file_id=?, receipt_submitted_at=CURRENT_TIMESTAMP, status='در انتظار بررسی رسید' "
+                "WHERE id=? AND user_id=? AND status='در انتظار ارسال رسید'",
+                (file_id, int(order["id"]), user.id),
+            )
+        if cur.rowcount != 1:
+            await message.reply_text("وضعیت سفارش تغییر کرده است؛ رسید ثبت نشد. لطفاً از پشتیبانی پیگیری کن.")
+            return
+        context.user_data.pop("pending_receipt_order_id", None)
+        admin_caption = (
+            f"🧾 رسید جدید برای سفارش #{order['id']}\n"
+            f"👤 کاربر: {user.full_name} (@{user.username or 'بدون‌نام'})\n"
+            f"🆔 شناسه: {user.id}\n"
+            f"📦 محصول: {order['name'] or ('محصول #' + str(order['product_id']))}\n"
+            f"💰 مبلغ ادعاشده: {int(order['price'] or 0):,} {order['currency'] or 'تومان'}\n"
+            f"📝 مشخصات سفارش: {order['order_details'] or 'ثبت نشده'}\n"
+            "⚠️ رسید را دستی بررسی کنید؛ ارسال تصویر به معنی تأیید پرداخت نیست."
+        )
+        admin_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔎 جزئیات سفارش", callback_data=f"admin_order_view_{order['id']}")],
+            [InlineKeyboardButton("✅ تأیید سفارش", callback_data=f"admin_order_approve_{order['id']}", style="success"),
+             InlineKeyboardButton("❌ رد سفارش", callback_data=f"admin_order_reject_{order['id']}", style="danger")],
+        ])
+        try:
+            await context.bot.send_photo(chat_id=ADMIN_ID, photo=file_id, caption=admin_caption[:1024], reply_markup=admin_markup)
+        except Exception:
+            logger.exception("Could not forward receipt photo to admin for order #%s", order["id"])
+            try:
+                await context.bot.send_message(chat_id=ADMIN_ID, text=admin_caption, reply_markup=admin_markup)
+            except Exception:
+                logger.exception("Could not send receipt notification for order #%s", order["id"])
+        await message.reply_text(
+            f"✅ رسید سفارش #{order['id']} دریافت و برای بررسی مدیر ارسال شد.\n"
+            "سفارش هنوز تأیید نشده است؛ پس از بررسی مدیر وضعیت جدید به شما اعلام می‌شود."
+        )
+        return
 
     if await _handle_public_request_input(update, context):
         return
@@ -5892,6 +6468,46 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 [InlineKeyboardButton("مدیریت متن‌ها و دکمه‌ها", callback_data="uiadm_home")]
             ]))
             return
+        if kind == "callback":
+            allowed_exact = {
+                "home", "nav_back", "back_to_services", "service_stars", "service_premium",
+                "service_gifts", "service_boost", "service_members", "service_reactions",
+                "service_views", "service_instagram_followers", "service_instagram_likes",
+                "cat_stars", "cat_numbers", "wallet", "topup", "orders", "account",
+                "support", "free_stars", "config_menu", "mediator_request", "ton_buy",
+                "ton_gram", "faq", "invite", "stars_custom", "stars_detail_back",
+                "check_membership", "admin", "service_menu", "nft_market", "mini_app",
+            }
+            valid = value in allowed_exact
+            if not valid and value.startswith("buy_") and value[4:].isdigit():
+                with db() as con:
+                    valid = bool(con.execute("SELECT 1 FROM products WHERE id=?", (int(value[4:]),)).fetchone())
+            if not valid and value.startswith(("cat_", "service_")):
+                target = value.split("_", 1)[1]
+                if target in {"stars", "premium", "gifts", "boost", "members", "reactions", "views", "instagram_followers", "instagram_likes", "numbers", "config", "configs"}:
+                    valid = True
+                else:
+                    with db() as con:
+                        valid = bool(con.execute("SELECT 1 FROM products WHERE category=? LIMIT 1", (target,)).fetchone())
+            if not valid:
+                await message.reply_text("❌ این عملکرد در ربات تعریف نشده یا مقصد آن معتبر نیست. برای جلوگیری از دکمه خراب، یک عملکرد موجود وارد کن؛ برای لغو /cancel.")
+                return
+            cfg = ui_load()
+            items = cfg.get("menus", {}).get(ui_st["menu"], [])
+            item = next((x for x in items if str(x.get("id")) == str(ui_st["id"])), None)
+            if not item:
+                context.user_data.pop("uiadm_state", None)
+                await message.reply_text("دکمه پیدا نشد؛ عملیات بسته شد.")
+                return
+            item["callback"] = value
+            ui_save(cfg)
+            context.user_data["uiadm_state"] = {"kind": "button", "menu": ui_st["menu"], "id": ui_st["id"]}
+            await message.reply_text("✅ عملکرد ذخیره شد. فقط مقصدهایی که در کد پشتیبانی می‌شوند فعال خواهند بود.", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("بازگشت به ویرایش دکمه", callback_data=f"uiadm_item_{ui_st['menu']}_{ui_st['id']}")],
+                [InlineKeyboardButton("مدیریت منو", callback_data=f"uiadm_menu_{ui_st['menu']}")],
+            ]))
+            return
+
         if kind == "rename":
             cfg = ui_load()
             items = cfg.get("menus", {}).get(ui_st["menu"], [])
@@ -5919,16 +6535,47 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 await message.reply_text("شناسهٔ عملکرد موجود را دقیق بفرست؛ مثلاً home یا service_stars:")
                 return
             if step == "callback":
+                allowed_exact = {
+                    "home", "nav_back", "back_to_services", "service_stars", "service_premium",
+                    "service_gifts", "service_boost", "service_members", "service_reactions",
+                    "service_views", "service_instagram_followers", "service_instagram_likes",
+                    "cat_stars", "cat_numbers", "wallet", "topup", "orders", "account",
+                    "support", "free_stars", "config_menu", "mediator_request", "ton_buy",
+                    "ton_gram", "faq", "invite", "stars_custom", "stars_detail_back",
+                    "check_membership", "admin", "nft_market", "mini_app",
+                }
+                valid_callback = value in allowed_exact
+                if not valid_callback and value.startswith("buy_") and value[4:].isdigit():
+                    with db() as con:
+                        valid_callback = bool(con.execute("SELECT 1 FROM products WHERE id=?", (int(value[4:]),)).fetchone())
+                if not valid_callback and value.startswith(("cat_", "service_")):
+                    target = value.split("_", 1)[1]
+                    if target in {"stars", "premium", "gifts", "boost", "members", "reactions", "views", "instagram_followers", "instagram_likes", "numbers", "config", "configs"}:
+                        valid_callback = True
+                    else:
+                        with db() as con:
+                            valid_callback = bool(con.execute("SELECT 1 FROM products WHERE category=? LIMIT 1", (target,)).fetchone())
+                if not valid_callback:
+                    await message.reply_text("❌ عملکرد در کد ربات تعریف نشده یا مقصد معتبر نیست. یک عملکرد موجود وارد کن؛ برای لغو /cancel را بفرست.")
+                    return
                 cfg = ui_load()
                 menu = ui_st["menu"]
                 items = cfg.setdefault("menus", {}).setdefault(menu, [])
                 if not ui_st.get("id") or any(x.get("id") == ui_st["id"] for x in items):
                     await message.reply_text("❌ شناسه خالی است یا تکراری است. /cancel برای لغو")
                     return
-                items.append({"id": ui_st["id"], "text": ui_st["text"], "callback": value, "enabled": True})
+                try:
+                    new_row = max((int(item.get("row", 0) or 0) for item in items), default=0) + 1
+                except (TypeError, ValueError):
+                    new_row = len(items) + 1
+                items.append({
+                    "id": ui_st["id"], "text": ui_st["text"], "callback": value,
+                    "enabled": True, "row": new_row,
+                    "button_style": _button_style_for(ui_st["text"], value) or "primary",
+                })
                 ui_save(cfg)
                 context.user_data.pop("uiadm_state", None)
-                await message.reply_text("✅ دکمه ذخیره شد. فقط اگر عملکردش در کد موجود باشد کار می‌کند.")
+                await message.reply_text("✅ دکمه ذخیره شد و در منو فعال است. رنگ و ترتیب آن هم از همین پنل قابل ویرایش است.")
                 return
 
 
@@ -5947,14 +6594,42 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
         state = context.user_data.get("product_admin_state", {})
         action = state.get("action")
 
+        if action == "edit_image":
+            await message.reply_text("برای این مرحله باید عکس محصول را ارسال کنی؛ یا /cancel را بزن.")
+            return
+
         if action == "add_name":
             if not value or len(value) > 150:
                 await message.reply_text("نام محصول باید بین 1 تا 150 نویسه باشد. دوباره بفرست:")
                 return
             state["name"] = value
+            if str(state.get("category", "")).lower() == "stars":
+                state["action"] = "add_star_amount"
+                context.user_data["product_admin_state"] = state
+                await message.reply_text("مقدار دقیق این بسته را به عدد بفرست؛ مثال 750 یا 1500:")
+            else:
+                state["action"] = "add_price"
+                context.user_data["product_admin_state"] = state
+                await message.reply_text("قیمت محصول را فقط به عدد و به تومان بفرست. برای قیمت نامشخص عدد 0 وارد کن:")
+            return
+
+        if action == "add_star_amount":
+            try:
+                amount = int(normalize_ascii_digits(value).replace(",", "").replace("٬", "").replace("،", "").replace(" ", ""))
+                if amount <= 0 or amount > 1_000_000_000:
+                    raise ValueError
+            except ValueError:
+                await message.reply_text("مقدار نامعتبر است. عدد صحیح مثبت بفرست:")
+                return
+            with db() as con:
+                exists = con.execute("SELECT 1 FROM products WHERE category='stars' AND star_amount=?", (amount,)).fetchone()
+            if exists:
+                await message.reply_text("این مقدار استارز از قبل وجود دارد. مقدار دیگری وارد کن یا /cancel بزن:")
+                return
+            state["star_amount"] = amount
             state["action"] = "add_price"
             context.user_data["product_admin_state"] = state
-            await message.reply_text("قیمت محصول را فقط به عدد و به تومان بفرست. برای قیمت نامشخص عدد 0 وارد کن:")
+            await message.reply_text("حالا قیمت بسته را به تومان وارد کن؛ برای قیمت نامشخص ۰:")
             return
 
         if action == "add_price":
@@ -5966,9 +6641,15 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 await message.reply_text("قیمت نامعتبر است. یک عدد صحیح بین 0 تا 2,000,000,000 وارد کن:")
                 return
             with db() as con:
+                category = str(state["category"])
+                star_amount = state.get("star_amount") if category.lower() == "stars" else None
+                max_order = int(con.execute("SELECT COALESCE(MAX(sort_order), 0) FROM products WHERE category=?", (category,)).fetchone()[0] or 0)
+                star_styles = {50: "success", 75: "primary", 100: "danger", 150: "success", 250: "primary", 350: "danger", 500: "success", 1000: "primary", 2500: "danger", 5000: "success", 10000: "primary", 50000: "danger"}
+                style = star_styles.get(int(star_amount), "primary") if star_amount else "success"
                 cur = con.execute(
-                    "INSERT INTO products (category, name, price, active) VALUES (?, ?, ?, 1)",
-                    (state["category"], state["name"], price)
+                    "INSERT INTO products (category, name, price, active, icon, button_style, sort_order, star_amount) "
+                    "VALUES (?, ?, ?, 1, ?, ?, ?, ?)",
+                    (category, state["name"], price, "✧" if category.lower() == "stars" else "", style, max_order + 10, star_amount)
                 )
                 new_id = cur.lastrowid
             context.user_data.pop("product_admin_state", None)
@@ -5997,6 +6678,77 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 cur = con.execute("UPDATE products SET price=? WHERE id=?", (price, int(state["product_id"])))
             context.user_data.pop("product_admin_state", None)
             await message.reply_text("✅ قیمت محصول ویرایش شد." if cur.rowcount else "محصول پیدا نشد.")
+            return
+
+        pid = int(state.get("product_id", 0) or 0)
+        clear = value.strip().casefold() in {"/clear", "پاک", "پاک کردن", "حذف"}
+        if action == "edit_button_text":
+            if not clear and len(value) > 64:
+                await message.reply_text("متن دکمه حداکثر ۶۴ نویسه است:")
+                return
+            new_value = "" if clear else value
+            with db() as con:
+                cur = con.execute("UPDATE products SET button_text=? WHERE id=?", (new_value, pid))
+        elif action == "edit_icon":
+            if not clear and len(value) > 16:
+                await message.reply_text("نماد باید حداکثر ۱۶ نویسه باشد:")
+                return
+            new_value = "" if clear else value
+            with db() as con:
+                cur = con.execute("UPDATE products SET icon=? WHERE id=?", (new_value, pid))
+        elif action == "edit_sort_order":
+            try:
+                number = int(normalize_ascii_digits(value.replace(",", "").replace("٬", "").strip()))
+                if not -1_000_000 <= number <= 1_000_000:
+                    raise ValueError
+            except ValueError:
+                await message.reply_text("ترتیب باید عدد صحیح بین ‎-۱۰۰۰۰۰۰ تا ۱۰۰۰۰۰۰ باشد:")
+                return
+            with db() as con:
+                cur = con.execute("UPDATE products SET sort_order=? WHERE id=?", (number, pid))
+        elif action == "edit_description":
+            if not clear and len(value) > 1200:
+                await message.reply_text("توضیحات حداکثر ۱۲۰۰ نویسه است:")
+                return
+            with db() as con:
+                cur = con.execute("UPDATE products SET description=? WHERE id=?", ("" if clear else value, pid))
+        elif action == "edit_star_amount":
+            try:
+                number = int(normalize_ascii_digits(value.replace(",", "").replace("٬", "").replace("،", "").strip()))
+                if number < 0 or number > 1_000_000_000:
+                    raise ValueError
+            except ValueError:
+                await message.reply_text("مقدار باید عدد صحیح از ۰ تا ۱٬۰۰۰٬۰۰۰٬۰۰۰ باشد:")
+                return
+            with db() as con:
+                if number > 0:
+                    clash = con.execute("SELECT 1 FROM products WHERE category='stars' AND star_amount=? AND id<>?", (number, pid)).fetchone()
+                    if clash:
+                        await message.reply_text("این مقدار استارز برای محصول دیگری ثبت شده است. مقدار دیگری وارد کن:")
+                        return
+                cur = con.execute("UPDATE products SET star_amount=? WHERE id=?", (number or None, pid))
+        elif action == "edit_currency":
+            if not value or len(value) > 16:
+                await message.reply_text("واحد پول باید بین ۱ تا ۱۶ نویسه باشد:")
+                return
+            with db() as con:
+                cur = con.execute("UPDATE products SET currency=? WHERE id=?", (value, pid))
+        elif action == "edit_old_price":
+            try:
+                number = int(normalize_ascii_digits(value.replace(",", "").replace("٬", "").replace(" ", "")))
+                if number < 0 or number > 2_000_000_000:
+                    raise ValueError
+            except ValueError:
+                await message.reply_text("قیمت قبلی باید عدد صحیح بین ۰ تا ۲٬۰۰۰٬۰۰۰٬۰۰۰ باشد:")
+                return
+            with db() as con:
+                cur = con.execute("UPDATE products SET old_price=? WHERE id=?", (number, pid))
+        else:
+            cur = None
+
+        if action in {"edit_button_text", "edit_icon", "edit_sort_order", "edit_description", "edit_star_amount", "edit_currency", "edit_old_price"}:
+            context.user_data.pop("product_admin_state", None)
+            await message.reply_text("✅ تنظیم محصول ذخیره شد و در منوی مربوطه از اطلاعات جدید خوانده می‌شود." if cur and cur.rowcount else "محصول پیدا نشد.")
             return
 
     if message and message.text and context.user_data.get("editor_wait_key"):
@@ -6224,9 +6976,14 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     coupon_discount = int(validation["discount"])
                     order_price = int(validation["final_price"])
 
+                order_currency = str(product["currency"] or "تومان")
+                card_number = str(bot_text("payment_card_number") or "").strip()
+                payment_ready = bool(card_number and card_number.casefold() not in {"هنوز تنظیم نشده", "تنظیم نشده", "ثبت نشده"})
+                order_status = "در انتظار ارسال رسید" if order_price > 0 and payment_ready else "در انتظار بررسی مدیر"
+                payment_method = "کارت‌به‌کارت" if order_price > 0 and payment_ready else "نیازمند هماهنگی مدیر"
                 cur = con.execute(
-                    "INSERT INTO orders (user_id, product_id, price, status, coupon_code, coupon_discount) VALUES (?, ?, ?, ?, ?, ?)",
-                    (user.id, int(product_id), order_price, "در انتظار بررسی", coupon_code, coupon_discount),
+                    "INSERT INTO orders (user_id, product_id, price, status, coupon_code, coupon_discount, currency, order_details, payment_method) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (user.id, int(product_id), order_price, order_status, coupon_code, coupon_discount, order_currency, details, payment_method),
                 )
                 order_id = cur.lastrowid
                 if coupon_code:
@@ -6247,8 +7004,8 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.user_data.pop("pending_product_id", None)
         context.user_data.pop("pending_product_coupon", None)
         context.user_data.pop("pending_product_coupon_input", None)
-        price_text = f"{order_price:,} تومان" if original_price > 0 else "نیازمند استعلام"
-        coupon_summary = (f"\nکد تخفیف: {coupon_code}\nمیزان تخفیف: {coupon_discount:,} تومان\nقیمت اصلی: {original_price:,} تومان"
+        price_text = f"{order_price:,} {order_currency}" if original_price > 0 else "نیازمند استعلام"
+        coupon_summary = (f"\nکد تخفیف: {coupon_code}\nمیزان تخفیف: {coupon_discount:,} {order_currency}\nقیمت اصلی: {original_price:,} {order_currency}"
                           if coupon_code else "")
 
         try:
@@ -6261,22 +7018,38 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     f"محصول: {product['name']}\n"
                     f"اطلاعات سفارش: {details}\n"
                     f"قیمت نهایی: {price_text}{coupon_summary}\n"
-                    "وضعیت: در انتظار بررسی مدیر"
+                    f"روش پرداخت: {payment_method}\n"
+                    f"وضعیت: {order_status}"
                 ),
             )
         except Exception:
             logger.exception("Could not notify admin about order")
 
-        await message.reply_text(
-            f"✅ درخواست شما ثبت شد.\n\n"
-            f"📦 شماره سفارش: #{order_id}\n"
-            f"🛍 محصول: {product['name']}\n"
-            f"📨 اطلاعات ارسالی: {details}\n"
-            f"💰 مبلغ پس از تخفیف: {price_text}"
-            + (f"\n🏷️ کد: {coupon_code}\n🎁 تخفیف: {coupon_discount:,} تومان" if coupon_code else "")
-            + "\n\nمدیر سفارش را بررسی می‌کند و برای هماهنگی پرداخت اطلاع می‌دهد.",
-            reply_markup=main_menu(),
-        )
+        if order_status == "در انتظار ارسال رسید":
+            context.user_data["pending_receipt_order_id"] = int(order_id)
+            card_owner = str(bot_text("payment_card_owner") or "").strip()
+            customer_message = (
+                f"✅ سفارش شما ثبت شد. شماره سفارش: #{order_id}\n\n"
+                f"🛍 محصول: {product['name']}\n📨 اطلاعات سفارش: {details}\n"
+                f"💰 مبلغ قابل پرداخت: {price_text}"
+                + (f"\n🏷️ کد تخفیف: {coupon_code}\n🎁 میزان تخفیف: {coupon_discount:,} {order_currency}" if coupon_code else "")
+                + f"\n\n💳 شماره کارت: {bot_text('payment_card_number')}\n👤 صاحب کارت: {card_owner or 'در تنظیمات وارد نشده'}\n\n"
+                + bot_text("payment_instructions")
+                + "\n\nپس از پرداخت، عکس واضح رسید را همین‌جا ارسال کن. تا پیش از تأیید مدیر، سفارش تأییدشده محسوب نمی‌شود."
+            )
+        else:
+            customer_message = (
+                f"✅ درخواست شما ثبت شد.\n\n📦 شماره سفارش: #{order_id}\n"
+                f"🛍 محصول: {product['name']}\n📨 اطلاعات ارسالی: {details}\n💰 مبلغ: {price_text}\n\n"
+                "اطلاعات پرداخت هنوز تنظیم نشده یا قیمت نیازمند بررسی است. فعلاً پرداخت انجام نده؛ مدیر درخواست را بررسی می‌کند و اطلاع می‌دهد."
+            )
+        if order_status == "در انتظار ارسال رسید":
+            await message.reply_text(
+                customer_message,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو سفارش", callback_data=f"cancel_receipt_order_{order_id}", style="danger")]]),
+            )
+        else:
+            await message.reply_text(customer_message, reply_markup=main_menu())
         return
 
     await message.reply_text(
@@ -6332,6 +7105,7 @@ def main():
     app.add_handler(CommandHandler("cancel", cancel_coupon_creation))
     app.add_handler(CallbackQueryHandler(callbacks))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
+    app.add_handler(MessageHandler(filters.PHOTO, text_message))
 
 
 
