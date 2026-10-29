@@ -232,6 +232,7 @@ _DEFAULT_UI_MENUS = {
         {"id": "views", "text": "◎ ویـو ویدیـو", "callback": "service_views", "enabled": True, "row": 6, "button_style": "danger"},
         {"id": "instagram_followers", "text": "▣ فـالـوور ایـنـسـتـاگـرام", "callback": "service_instagram_followers", "enabled": True, "row": 7, "button_style": "primary"},
         {"id": "instagram_likes", "text": "♡ لایـک ایـنـسـتـاگـرام", "callback": "service_instagram_likes", "enabled": True, "row": 8, "button_style": "success"},
+        {"id": "main_menu", "text": "⌂ مـنـوی اصـلـی", "callback": "home", "enabled": True, "row": 9, "button_style": "danger"},
     ],
     "stars": [
         {"id": "custom_amount", "text": "✎ مقدار دلخواه", "callback": "stars_custom", "enabled": True, "row": 13, "button_style": "primary"},
@@ -462,49 +463,33 @@ def apply_main_menu_redesign_v4_once():
 
 
 def apply_services_menu_design_once():
-    """Apply the owner's approved service labels/colors without overwriting later edits."""
-    marker_key = "services_menu_design_v1"
-    styles = {
-        "stars": "success", "premium": "success", "gifts": "primary",
-        "boost": "danger", "members": "primary", "reactions": "success",
-        "views": "danger", "instagram_followers": "primary", "instagram_likes": "success",
-    }
-    labels = {
-        "stars": "✦ اسـتـارز تـلـگـرام",
-        "premium": "◇ پـریـمـیـوم تـلـگـرام",
-        "gifts": "❖ گـیـفـت تـلـگـرام",
-        "boost": "➤ بـوسـت تـلـگـرام",
-        "members": "♙ مـمـبـر تـلـگـرام",
-        "reactions": "ϟ ری‌اکـشـن تـلـگـرام",
-        "views": "◎ ویـو ویدیـو",
-        "instagram_followers": "▣ فـالـوور ایـنـسـتـاگـرام",
-        "instagram_likes": "♡ لایـک ایـنـسـتـاگـرام",
-    }
+    """One-time migration to the exact owner-approved services screen.
+
+    Only the services-menu configuration is replaced. Products, prices, orders,
+    users, receipts, wallet balances, payment settings, other menus and text edits
+    remain untouched. After the migration, the service screen is fully editable
+    from the existing admin UI.
+    """
+    marker_key = "services_menu_design_v2"
     try:
         with db() as con:
             marker = con.execute("SELECT value FROM app_settings WHERE key=?", (marker_key,)).fetchone()
         if marker and str(marker["value"] or "") == "done":
             return
+
         settings = load_bot_settings()
-        services = settings.setdefault("menus", {}).setdefault("services", deepcopy(_DEFAULT_UI_MENUS["services"]))
-        default_old = {str(item.get("id")): str(item.get("text", "")) for item in _DEFAULT_UI_MENUS["services"]}
-        for item in services:
-            if not isinstance(item, dict):
-                continue
-            item_id = str(item.get("id", ""))
-            if item_id in labels:
-                # Change only missing/default/known-old labels; respect custom text entered by the owner.
-                text_now = str(item.get("text", "")).strip()
-                if not text_now or text_now == default_old.get(item_id) or text_now == legacy_labels.get(item_id) or text_now in labels.values():
-                    item["text"] = labels[item_id]
-                item.setdefault("button_style", styles[item_id])
-                item.setdefault("row", 1 if item_id in ("stars", "premium") else
-                                {"gifts":2,"boost":3,"members":4,"reactions":5,"views":6,"instagram_followers":7,"instagram_likes":8}.get(item_id, 99))
+        # Install the exact approved order, labels, symbols, colors and row widths.
+        # Admin can subsequently change any of these items from the management UI.
+        settings.setdefault("menus", {})["services"] = deepcopy(_DEFAULT_UI_MENUS["services"])
         save_bot_settings(settings)
         with db() as con:
-            con.execute("INSERT INTO app_settings(key, value) VALUES (?, 'done') ON CONFLICT(key) DO UPDATE SET value='done'", (marker_key,))
+            con.execute(
+                "INSERT INTO app_settings(key, value) VALUES (?, 'done') "
+                "ON CONFLICT(key) DO UPDATE SET value='done'",
+                (marker_key,),
+            )
     except Exception:
-        logger.exception("Could not apply service menu design; existing settings were retained")
+        logger.exception("Could not apply approved services menu design; existing shop data was retained")
 
 
 def bot_text(key):
@@ -1235,7 +1220,8 @@ import re
 
 
 def service_menu(text_fn=None):
-    """Build the service menu from editable settings; labels/order/styles update without restart."""
+    """Build the exact approved service screen from editable central settings."""
+    all_configured = load_bot_settings().get("menus", {}).get("services", [])
     configured = configured_buttons("services")
     valid_styles = {"primary", "success", "danger"}
     if not configured:
@@ -1263,10 +1249,20 @@ def service_menu(text_fn=None):
     rows = []
     for row_no in ordered_row_numbers:
         row = grouped[row_no]
-        # Telegram supports at most 8 buttons per row; service rows are designed as 1 or 2.
+        # Row 1 contains the two green buttons; every following service and
+        # the main-menu button occupies its own full-width row.
         for offset in range(0, min(len(row), 8), 2):
             rows.append(row[offset:offset + 2])
-    rows.append([InlineKeyboardButton("⌂ مـنـوی اصـلـی", callback_data="home", style="danger")])
+
+    # Backward compatibility: if an older settings record has no main-menu item,
+    # append the approved one. When it exists in the central settings, its text,
+    # color, order and active state are all controlled by the admin panel.
+    has_home_configured = any(
+        isinstance(item, dict) and str(item.get("callback", "")).strip() == "home"
+        for item in all_configured
+    )
+    if not has_home_configured:
+        rows.append([InlineKeyboardButton("⌂ مـنـوی اصـلـی", callback_data="home", style="danger")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1830,9 +1826,9 @@ def _prepare_outgoing_markup(chat_id, markup):
                            for button in (source_row or [])):
                     rows.append([_styled_keyboard_button(home_label, "home")])
                 routes[home_label] = ("callback", "home")
-            if chat_id is not None and int(chat_id) == ADMIN_ID and "👑 مدیریت کل ربات" not in labels:
-                rows.append([_styled_keyboard_button("👑 مدیریت کل ربات", "admin")])
-                routes["👑 مدیریت کل ربات"] = ("callback", "admin")
+            # Do not append an admin-only button to approved catalog/service screens;
+            # their row count and appearance must match the owner's exact design.
+            # Admin access remains available through the dedicated /admin command/menu.
             _save_user_menu_routes(chat_id, routes, MENU_TYPE_KEYBOARD)
             return ReplyKeyboardMarkup(
                 rows,
