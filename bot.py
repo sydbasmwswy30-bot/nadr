@@ -1077,23 +1077,63 @@ import re
 
 
 def service_menu(text_fn=None):
-    """Build the services catalogue from the editable menu stored in the database."""
+    """Build the approved SEYED PREMIUM services menu, preserving existing callbacks."""
     items = configured_buttons("services")
-    preferred = ["stars", "premium", "gifts", "boost", "members", "reactions", "views", "instagram_followers", "instagram_likes"]
-    rank = {name: i for i, name in enumerate(preferred)}
-    def sort_key(item):
-        item_id = str(item.get("id", ""))
-        callback = str(item.get("callback", ""))
-        return (rank.get(item_id, rank.get(callback.replace("service_", ""), len(rank))), item_id)
-    items = sorted([x for x in items if isinstance(x, dict) and x.get("enabled", True)], key=sort_key)
-    buttons = []
+    by_id = {str(item.get("id", "")): item for item in items if isinstance(item, dict)}
+
+    # Approved Sample 2: Stars + Premium together in green, then one full-width
+    # button per row. These are Unicode text icons; Telegram keyboard buttons do
+    # not support embedding custom SVG images directly in their labels.
+    layout = [
+        (["stars", "premium"], "success"),
+        (["gifts"], "primary"),
+        (["boost"], "danger"),
+        (["members"], "primary"),
+        (["reactions"], "success"),
+        (["views"], "danger"),
+        (["instagram_followers"], "primary"),
+        (["instagram_likes"], "success"),
+    ]
+    labels = {
+        "stars": "✦ اسـتـارز تـلـگـرام",
+        "premium": "◇ پـریـمـیـوم تـلـگـرام",
+        "gifts": "❖ گـیـفـت تـلـگـرام",
+        "boost": "➤ بـوسـت تـلـگـرام",
+        "members": "♙ مـمـبـر تـلـگـرام",
+        "reactions": "ϟ ری‌اکـشـن تـلـگـرام",
+        "views": "◎ ویـو ویدیـو",
+        "instagram_followers": "▣ فـالـوور ایـنـسـتـاگـرام",
+        "instagram_likes": "♡ لایـک ایـنـسـتـاگـرام",
+    }
+    rows = []
+    included = set()
+    for ids, style in layout:
+        row = []
+        for item_id in ids:
+            item = by_id.get(item_id)
+            if not item or not item.get("enabled", True):
+                continue
+            callback = str(item.get("callback", "")).strip()
+            if not callback:
+                continue
+            row.append(InlineKeyboardButton(labels[item_id], callback_data=callback, style=style))
+            included.add(item_id)
+        if row:
+            rows.append(row)
+
+    # Preserve any additional services configured by the owner instead of hiding them.
     for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_id = str(item.get("id", ""))
+        if item_id in included or item_id in labels or not item.get("enabled", True):
+            continue
         label = str(item.get("text", "")).strip()
         callback = str(item.get("callback", "")).strip()
         if label and callback:
-            buttons.append(InlineKeyboardButton(label, callback_data=callback, style=_button_style_for(label, callback)))
-    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
-    rows.append([InlineKeyboardButton("🏠 منوی اصلی", callback_data="home", style="primary")])
+            rows.append([InlineKeyboardButton(label, callback_data=callback, style="primary")])
+
+    rows.append([InlineKeyboardButton("⌂ مـنـوی اصـلـی", callback_data="home", style="danger")])
     return InlineKeyboardMarkup(rows)
 
 
