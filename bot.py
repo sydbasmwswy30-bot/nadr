@@ -199,25 +199,22 @@ _BOT_SETTINGS_CACHE = None
 # These defaults are embedded in bot.py so the bot does not require ui_config.py,
 # service_menu.py, stars_menu.py, or a separately-created JSON settings file.
 _PREMIUM_MAIN_MENU_ITEMS = [
-    {"id": "buy_service", "text": "🛒 خدمات مجازی", "callback": "cat_stars", "enabled": True, "row": 1},
-    {"id": "numbers", "text": "⚡ شماره مجازی", "callback": "cat_numbers", "enabled": True, "row": 2},
-    {"id": "mediator_request", "text": "✓ درخواست واسطه", "callback": "mediator_request", "enabled": True, "row": 2},
-    {"id": "ton_gram", "text": "◇ تون - گرام", "callback": "ton_gram", "enabled": True, "row": 3},
-    {"id": "stars", "text": "✦ استارز", "callback": "service_stars", "enabled": True, "row": 4},
-    {"id": "premium", "text": "♙ پریمیوم", "callback": "service_premium", "enabled": True, "row": 4},
-    {"id": "gifts", "text": "♡ گیفت استارزی", "callback": "service_gifts", "enabled": True, "row": 5},
-    {"id": "reactions", "text": "◉ ری‌اکشن استارزی", "callback": "service_reactions", "enabled": True, "row": 5},
-    {"id": "account", "text": "♙ حساب کاربری", "callback": "account", "enabled": True, "row": 6},
-    {"id": "support", "text": "☎ پشتیبانی + تیکت", "callback": "support", "enabled": True, "row": 7},
-    {"id": "wallet", "text": "▣ کیف پول + شارژ", "callback": "wallet", "enabled": True, "row": 7},
-    {"id": "free_balance", "text": "♙ موجودی رایگان", "callback": "free_stars", "enabled": True, "row": 8},
-    {"id": "mini_app", "text": "▤ مینی اپ", "callback": "mini_app", "enabled": True, "row": 9},
-    {"id": "nft_market", "text": "▦ مارکت NFT", "callback": "nft_market", "enabled": True, "row": 9},
-    {"id": "orders", "text": "🔎 پیگیری سفارش", "callback": "orders", "enabled": True, "row": 10},
-    {"id": "ton_buy", "text": "🪙 خرید تون", "callback": "ton_buy", "enabled": True, "row": 10},
-    {"id": "config", "text": "🌐 خرید کانفیگ", "callback": "config_menu", "enabled": True, "row": 11},
-    {"id": "faq", "text": "❓ سؤالات متداول", "callback": "faq", "enabled": True, "row": 11},
-    {"id": "invite", "text": "👥 دعوت دوستان", "callback": "invite", "enabled": True, "row": 12},
+    # The approved 9-row luxury layout. Icons are monochrome Unicode glyphs
+    # because Telegram keyboard labels cannot embed arbitrary SVG/Lucide assets.
+    {"id": "buy_service", "text": "◈ خـریـد سـرویـس", "callback": "cat_stars", "enabled": True, "row": 1},
+    {"id": "wallet", "text": "▣ کـیـف پـول", "callback": "wallet", "enabled": True, "row": 2},
+    {"id": "topup", "text": "＋ شـارژ کـیـف پـول", "callback": "topup", "enabled": True, "row": 2},
+    {"id": "my_orders", "text": "▤ سـفـارش‌هـای مـن", "callback": "orders", "enabled": True, "row": 3},
+    {"id": "account", "text": "◉ پـروفـایـل مـن", "callback": "account", "enabled": True, "row": 4},
+    {"id": "support", "text": "☏ پـشـتـیـبـانـی", "callback": "support", "enabled": True, "row": 4},
+    {"id": "free_stars", "text": "✦ اسـتـارز رایـگـان", "callback": "free_stars", "enabled": True, "row": 5},
+    {"id": "numbers", "text": "▯ شـمـاره مـجـازی", "callback": "cat_numbers", "enabled": True, "row": 5},
+    {"id": "mediator_request", "text": "✓ درخـواسـت واسـطـه", "callback": "mediator_request", "enabled": True, "row": 6},
+    {"id": "config", "text": "⌘ خـریـد کـانـفـیـگ", "callback": "config_menu", "enabled": True, "row": 7},
+    {"id": "faq", "text": "ⓘ سـؤالات مـتـداول", "callback": "faq", "enabled": True, "row": 7},
+    {"id": "ton_buy", "text": "◇ خـریـد تـون", "callback": "ton_buy", "enabled": True, "row": 8},
+    {"id": "track_order", "text": "⌕ پـیـگـیـری سـفـارش", "callback": "orders", "enabled": True, "row": 9},
+    {"id": "ticket", "text": "▱ تـیـکـت", "callback": "support", "enabled": True, "row": 9},
 ]
 
 _DEFAULT_UI_MENUS = {
@@ -406,6 +403,55 @@ def apply_main_menu_redesign_once():
             )
     except Exception:
         logger.exception("Could not apply one-time main-menu redesign; stored data was not reset")
+
+
+
+def apply_main_menu_redesign_v3_once():
+    """Install the owner's approved 14-button menu without resetting shop data."""
+    try:
+        with db() as con:
+            marker = con.execute(
+                "SELECT value FROM app_settings WHERE key='main_menu_redesign_v3'"
+            ).fetchone()
+        if marker and str(marker["value"] or "") == "done":
+            return
+
+        settings = load_bot_settings()
+        # Replace only the main-menu definition. Other menu definitions, text edits,
+        # product prices, orders, receipts, balances and the chosen menu mode remain intact.
+        settings.setdefault("menus", {})["main"] = deepcopy(_PREMIUM_MAIN_MENU_ITEMS)
+        save_bot_settings(settings)
+        with db() as con:
+            con.execute(
+                "INSERT INTO app_settings(key, value) VALUES ('main_menu_redesign_v3', 'done') "
+                "ON CONFLICT(key) DO UPDATE SET value='done'"
+            )
+    except Exception:
+        logger.exception("Could not apply main-menu redesign v3; stored shop data was not reset")
+
+
+def apply_main_menu_redesign_v4_once():
+    """Apply the approved luxury icon labels to the main menu without touching shop data."""
+    try:
+        with db() as con:
+            marker = con.execute(
+                "SELECT value FROM app_settings WHERE key='main_menu_redesign_v4'"
+            ).fetchone()
+        if marker and str(marker["value"] or "") == "done":
+            return
+
+        settings = load_bot_settings()
+        # Only the main menu is replaced. Other menus, custom texts, the selected
+        # menu mode, prices, inventory, receipts, wallet balances and order history persist.
+        settings.setdefault("menus", {})["main"] = deepcopy(_PREMIUM_MAIN_MENU_ITEMS)
+        save_bot_settings(settings)
+        with db() as con:
+            con.execute(
+                "INSERT INTO app_settings(key, value) VALUES ('main_menu_redesign_v4', 'done') "
+                "ON CONFLICT(key) DO UPDATE SET value='done'"
+            )
+    except Exception:
+        logger.exception("Could not apply luxury icon menu v4; stored shop data was not reset")
 
 
 def bot_text(key):
@@ -1007,6 +1053,8 @@ def init_db():
             )
         """)
     apply_main_menu_redesign_once()
+    apply_main_menu_redesign_v3_once()
+    apply_main_menu_redesign_v4_once()
 
 def register_user(user):
     with db() as con:
@@ -1134,28 +1182,49 @@ def _button_style_for(label, callback=None):
     callback = str(callback or "").strip().casefold()
     joined = f"{label} {callback}"
 
-    # Exact main-menu palette from the reference image.
+    # Resolve the specific main-menu label first; some actions intentionally share
+    # a handler (for example, "سفارش‌های من" and "پیگیری سفارش").
+    label_styles = {
+        "◈ خـریـد سـرویـس": "danger",
+        "▣ کـیـف پـول": "success",
+        "＋ شـارژ کـیـف پـول": "success",
+        "▤ سـفـارش‌هـای مـن": "primary",
+        "◉ پـروفـایـل مـن": "danger",
+        "☏ پـشـتـیـبـانـی": "danger",
+        "✦ اسـتـارز رایـگـان": "success",
+        "▯ شـمـاره مـجـازی": "success",
+        "✓ درخـواسـت واسـطـه": "primary",
+        "⌘ خـریـد کـانـفـیـگ": "danger",
+        "ⓘ سـؤالات مـتـداول": "danger",
+        "◇ خـریـد تـون": "success",
+        "⌕ پـیـگـیـری سـفـارش": "primary",
+        "▱ تـیـکـت": "primary",
+    }
+    if original_label in label_styles:
+        return label_styles[original_label]
+
     main_palette = {
         "check_membership": "success",
-        "cat_stars": "danger",  # خدمات مجازی
+        "cat_stars": "danger",
         "back_to_services": "danger",
         "cat_numbers": "success",
-        "mediator_request": "success",
+        "mediator_request": "primary",
         "ton_gram": "primary",
         "service_stars": "danger",
         "service_premium": "danger",
         "service_gifts": "success",
         "service_reactions": "success",
-        "account": "primary",
-        "support": "danger",
-        "wallet": "danger",
+        "account": "danger",
+        "support": "primary",
+        "wallet": "success",
+        "topup": "success",
         "free_stars": "success",
         "mini_app": "primary",
         "nft_market": "primary",
         "orders": "primary",
         "ton_buy": "success",
-        "config_menu": "primary",
-        "faq": None,
+        "config_menu": "danger",
+        "faq": "danger",
         "invite": "primary",
     }
     if callback in main_palette:
