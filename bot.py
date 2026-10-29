@@ -1250,10 +1250,17 @@ def _button_style_for(label, callback=None):
         "cat_numbers": "success",
         "mediator_request": "primary",
         "ton_gram": "primary",
-        "service_stars": "danger",
-        "service_premium": "danger",
-        "service_gifts": "success",
+        # Approved services-menu palette: green, blue, red in the exact row order.
+        "service_stars": "success",
+        "service_premium": "success",
+        "service_gifts": "primary",
+        "service_boost": "danger",
+        "service_members": "primary",
         "service_reactions": "success",
+        "service_views": "danger",
+        "service_instagram_followers": "primary",
+        "service_instagram_likes": "success",
+        "home": "danger",
         "account": "danger",
         "support": "primary",
         "wallet": "success",
@@ -1387,9 +1394,26 @@ def _restyle_inline_button(button):
             return button
 
 
-def _premium_inline_rows(markup):
-    """Standardize inline rows: usually two per row, navigation at the bottom."""
+def _is_services_menu_markup(markup):
+    """Identify the approved services menu so its full-width rows are never auto-paired."""
     source_rows = getattr(markup, "inline_keyboard", None) or []
+    buttons = [button for row in source_rows for button in (row or [])]
+    callbacks = [str(getattr(button, "callback_data", "") or "").strip() for button in buttons]
+    service_callbacks = [value for value in callbacks if value.startswith("service_")]
+    return bool(service_callbacks) and "home" in callbacks and all(
+        value == "home" or value.startswith("service_") for value in callbacks
+    )
+
+
+def _premium_inline_rows(markup):
+    """Standardize inline rows; keep the approved services layout exactly as authored."""
+    source_rows = getattr(markup, "inline_keyboard", None) or []
+    if _is_services_menu_markup(markup):
+        # Do not pair one-button service rows; these rows and colors are user-approved.
+        return [
+            [_restyle_inline_button(button) for button in row]
+            for row in source_rows if row
+        ]
     content_rows = []
     navigation = []
     pending = []
@@ -1656,6 +1680,36 @@ def _prepare_outgoing_markup(chat_id, markup):
 
     if isinstance(markup, InlineKeyboardMarkup):
         routes = _routes_from_inline_markup(markup, keyboard_labels=True)
+        if _is_services_menu_markup(markup):
+            # The services menu has one paired row, followed by full-width rows.
+            # Preserve those exact row boundaries in reply-keyboard mode too.
+            rows = []
+            for source_row in (getattr(markup, "inline_keyboard", None) or []):
+                row = []
+                for button in (source_row or [])[:2]:
+                    label = str(getattr(button, "text", "") or "").strip()[:64]
+                    callback = getattr(button, "callback_data", None)
+                    if label and callback and not getattr(button, "url", None):
+                        row.append(_styled_keyboard_button(label, callback))
+                if row:
+                    rows.append(row)
+            labels = {str(getattr(button, "text", "") or "").strip() for row in rows for button in row}
+            home_label = "⌂ مـنـوی اصـلـی"
+            if not any(str(getattr(button, "callback_data", "") or "") == "home"
+                       for source_row in (getattr(markup, "inline_keyboard", None) or [])
+                       for button in (source_row or [])):
+                rows.append([_styled_keyboard_button(home_label, "home")])
+            routes[home_label] = ("callback", "home")
+            if chat_id is not None and int(chat_id) == ADMIN_ID and "👑 مدیریت کل ربات" not in labels:
+                rows.append([_styled_keyboard_button("👑 مدیریت کل ربات", "admin")])
+                routes["👑 مدیریت کل ربات"] = ("callback", "admin")
+            _save_user_menu_routes(chat_id, routes, MENU_TYPE_KEYBOARD)
+            return ReplyKeyboardMarkup(
+                rows,
+                resize_keyboard=True,
+                one_time_keyboard=False,
+                input_field_placeholder="پیامت رو بنویس یا از منو انتخاب کن…",
+            )
         rows = []
         for source_row in _premium_inline_rows(markup):
             pair = []
