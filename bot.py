@@ -198,19 +198,30 @@ _BOT_SETTINGS_CACHE = None
 
 # These defaults are embedded in bot.py so the bot does not require ui_config.py,
 # service_menu.py, stars_menu.py, or a separately-created JSON settings file.
+_PREMIUM_MAIN_MENU_ITEMS = [
+    {"id": "buy_service", "text": "🛒 خدمات مجازی", "callback": "cat_stars", "enabled": True, "row": 1},
+    {"id": "numbers", "text": "⚡ شماره مجازی", "callback": "cat_numbers", "enabled": True, "row": 2},
+    {"id": "mediator_request", "text": "✓ درخواست واسطه", "callback": "mediator_request", "enabled": True, "row": 2},
+    {"id": "ton_gram", "text": "◇ تون - گرام", "callback": "ton_gram", "enabled": True, "row": 3},
+    {"id": "stars", "text": "✦ استارز", "callback": "service_stars", "enabled": True, "row": 4},
+    {"id": "premium", "text": "♙ پریمیوم", "callback": "service_premium", "enabled": True, "row": 4},
+    {"id": "gifts", "text": "♡ گیفت استارزی", "callback": "service_gifts", "enabled": True, "row": 5},
+    {"id": "reactions", "text": "◉ ری‌اکشن استارزی", "callback": "service_reactions", "enabled": True, "row": 5},
+    {"id": "account", "text": "♙ حساب کاربری", "callback": "account", "enabled": True, "row": 6},
+    {"id": "support", "text": "☎ پشتیبانی + تیکت", "callback": "support", "enabled": True, "row": 7},
+    {"id": "wallet", "text": "▣ کیف پول + شارژ", "callback": "wallet", "enabled": True, "row": 7},
+    {"id": "free_balance", "text": "♙ موجودی رایگان", "callback": "free_stars", "enabled": True, "row": 8},
+    {"id": "mini_app", "text": "▤ مینی اپ", "callback": "mini_app", "enabled": True, "row": 9},
+    {"id": "nft_market", "text": "▦ مارکت NFT", "callback": "nft_market", "enabled": True, "row": 9},
+    {"id": "orders", "text": "🔎 پیگیری سفارش", "callback": "orders", "enabled": True, "row": 10},
+    {"id": "ton_buy", "text": "🪙 خرید تون", "callback": "ton_buy", "enabled": True, "row": 10},
+    {"id": "config", "text": "🌐 خرید کانفیگ", "callback": "config_menu", "enabled": True, "row": 11},
+    {"id": "faq", "text": "❓ سؤالات متداول", "callback": "faq", "enabled": True, "row": 11},
+    {"id": "invite", "text": "👥 دعوت دوستان", "callback": "invite", "enabled": True, "row": 12},
+]
+
 _DEFAULT_UI_MENUS = {
-    "main": [
-        {"id": "buy_service", "text": "🛍 خرید سرویس", "callback": "cat_stars", "enabled": True},
-        {"id": "numbers", "text": "📱 شماره مجازی", "callback": "cat_numbers", "enabled": True},
-        {"id": "wallet", "text": "👛 کیف پول", "callback": "wallet", "enabled": True},
-        {"id": "topup", "text": "💳 شارژ کیف پول", "callback": "topup", "enabled": True},
-        {"id": "orders", "text": "📚 سفارش‌های من", "callback": "orders", "enabled": True},
-        {"id": "profile", "text": "👤 پروفایل من", "callback": "account", "enabled": True},
-        {"id": "config", "text": "🌐 خرید کانفیگ", "callback": "config_menu", "enabled": True},
-        {"id": "free_stars", "text": "⭐ استارز رایگان", "callback": "free_stars", "enabled": True},
-        {"id": "support", "text": "🎧 پشتیبانی", "callback": "support", "enabled": True},
-        {"id": "faq", "text": "❓ سؤالات متداول", "callback": "faq", "enabled": True},
-    ],
+    "main": deepcopy(_PREMIUM_MAIN_MENU_ITEMS),
     "services": [
         {"id": "stars", "text": "⭐ استارز تلگرام", "callback": "service_stars", "enabled": True},
         {"id": "premium", "text": "💎 پرمیوم تلگرام", "callback": "service_premium", "enabled": True},
@@ -317,6 +328,84 @@ def configured_buttons(menu):
     items = load_bot_settings().get("menus", {}).get(str(menu), [])
     return [dict(item) for item in items
             if isinstance(item, dict) and item.get("enabled", True)]
+
+
+def apply_main_menu_redesign_once():
+    """One-time additive UI migration: preserve custom features and apply the approved menu layout."""
+    try:
+        with db() as con:
+            marker = con.execute(
+                "SELECT value FROM app_settings WHERE key='main_menu_redesign_v2'"
+            ).fetchone()
+        if marker and str(marker["value"] or "") == "done":
+            return
+
+        settings = load_bot_settings()
+        old_items = settings.get("menus", {}).get("main", [])
+        layout = deepcopy(_PREMIUM_MAIN_MENU_ITEMS)
+        target_callbacks = {str(item["callback"]) for item in layout}
+        # Preserve legacy optional buttons' customized text/enable flags.
+        optional_callbacks = {"config_menu", "faq", "invite"}
+        for old in old_items if isinstance(old_items, list) else []:
+            if not isinstance(old, dict):
+                continue
+            callback = str(old.get("callback", "")).strip()
+            if callback in optional_callbacks:
+                for item in layout:
+                    if item["callback"] == callback:
+                        if str(old.get("text", "")).strip():
+                            item["text"] = str(old["text"]).strip()
+                        item["enabled"] = bool(old.get("enabled", True))
+                        break
+
+        # Keep truly custom legacy buttons at the bottom. Standard old buttons are
+        # already represented by the new layout, and are not duplicated.
+        replaced_legacy_callbacks = {
+            "cat_stars", "cat_numbers", "wallet", "topup", "orders", "account",
+            "free_stars", "support", "buy_service", "numbers", "profile",
+            "config", "invite", "faq", "service_stars", "service_premium",
+            "service_gifts", "service_boost", "service_members", "service_reactions",
+            "service_views", "service_instagram_followers", "service_instagram_likes",
+        }
+        known_ids = {str(item.get("id", "")) for item in layout}
+        known_callbacks = {str(item.get("callback", "")) for item in layout}
+        known_texts = {str(item.get("text", "")).strip() for item in layout}
+        next_row = max(int(item.get("row", 0) or 0) for item in layout) + 1
+        for old in old_items if isinstance(old_items, list) else []:
+            if not isinstance(old, dict):
+                continue
+            callback = str(old.get("callback", "")).strip()
+            text_value = str(old.get("text", "")).strip()
+            item_id = str(old.get("id", "")).strip()
+            if not callback or not text_value:
+                continue
+            if callback in known_callbacks or callback in replaced_legacy_callbacks:
+                continue
+            if item_id in known_ids or text_value in known_texts:
+                continue
+            preserved = dict(old)
+            preserved["row"] = next_row
+            layout.append(preserved)
+            next_row += 1
+            known_callbacks.add(callback)
+            known_ids.add(item_id)
+            known_texts.add(text_value)
+
+        settings.setdefault("menus", {})["main"] = layout
+        save_bot_settings(settings)
+        with db() as con:
+            # Preserve the owner's current menu mode. The current Bot API allows
+            # native color styles for both reply and inline keyboard buttons.
+            con.execute(
+                "INSERT INTO app_settings(key, value) VALUES ('main_menu_type', 'keyboard') "
+                "ON CONFLICT(key) DO UPDATE SET value='keyboard'"
+            )
+            con.execute(
+                "INSERT INTO app_settings(key, value) VALUES ('main_menu_redesign_v2', 'done') "
+                "ON CONFLICT(key) DO UPDATE SET value='done'"
+            )
+    except Exception:
+        logger.exception("Could not apply one-time main-menu redesign; stored data was not reset")
 
 
 def bot_text(key):
@@ -893,6 +982,31 @@ def init_db():
         con.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_products_category_active ON products(category, active)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_users_referred_by ON users(referred_by)")
+        # New request flows use additive tables in the existing shop.db. Existing
+        # products, orders, balances and payment history are never rewritten here.
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS mediator_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                username TEXT,
+                full_name TEXT,
+                details TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'در انتظار بررسی مدیر',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS ton_purchase_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                username TEXT,
+                amount_ton TEXT NOT NULL,
+                wallet_address TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'در انتظار بررسی مدیر',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+    apply_main_menu_redesign_once()
 
 def register_user(user):
     with db() as con:
@@ -1014,10 +1128,38 @@ def _main_menu_items():
 
 
 def _button_style_for(label, callback=None):
-    """Assign Telegram's native blue/green/red button style by action semantics."""
-    label = str(label or "").strip().casefold()
+    """Assign Telegram's native button colors to match the approved menu design."""
+    original_label = str(label or "").strip()
+    label = original_label.casefold()
     callback = str(callback or "").strip().casefold()
     joined = f"{label} {callback}"
+
+    # Exact main-menu palette from the reference image.
+    main_palette = {
+        "check_membership": "success",
+        "cat_stars": "danger",  # خدمات مجازی
+        "back_to_services": "danger",
+        "cat_numbers": "success",
+        "mediator_request": "success",
+        "ton_gram": "primary",
+        "service_stars": "danger",
+        "service_premium": "danger",
+        "service_gifts": "success",
+        "service_reactions": "success",
+        "account": "primary",
+        "support": "danger",
+        "wallet": "danger",
+        "free_stars": "success",
+        "mini_app": "primary",
+        "nft_market": "primary",
+        "orders": "primary",
+        "ton_buy": "success",
+        "config_menu": "primary",
+        "faq": None,
+        "invite": "primary",
+    }
+    if callback in main_palette:
+        return main_palette[callback]
 
     # Destructive or cancellation actions always take priority over positive words.
     danger_terms = (
@@ -1063,6 +1205,27 @@ def _button_style_for(label, callback=None):
         return "success"
 
     return "primary"
+
+
+def _styled_keyboard_button(label, callback=None):
+    """Build a colored ReplyKeyboardButton when the installed PTB supports styles."""
+    style = _button_style_for(label, callback)
+    try:
+        if style:
+            return KeyboardButton(str(label), style=style)
+        return KeyboardButton(str(label))
+    except TypeError:
+        # Some older library releases can forward newly-added Bot API fields via api_kwargs.
+        if style:
+            try:
+                return KeyboardButton(str(label), api_kwargs={"style": style})
+            except TypeError:
+                pass
+        logger.warning(
+            "This python-telegram-bot version cannot forward KeyboardButton styles; using unstyled button for %r",
+            label,
+        )
+        return KeyboardButton(str(label))
 
 
 def _button_is_navigation(button):
@@ -1183,20 +1346,31 @@ def _premium_inline_rows(markup):
 
 
 def main_menu(user_id=None):
-    """Render one premium main-menu layout as either inline or reply keyboard."""
+    """Render the approved SEYED PREMIUM layout with colored reply or inline buttons."""
     items = _main_menu_items()
-    normal_items = [item for item in items if str(item.get("callback", "")) != "faq"]
-    faq_items = [item for item in items if str(item.get("callback", "")) == "faq"]
-    item_rows = [normal_items[i:i + 2] for i in range(0, len(normal_items), 2)]
-    if faq_items:
-        # FAQ is a distinct final row, visually highlighted in inline mode.
-        item_rows.append(faq_items)
+    item_rows = []
+    if items and all(item.get("row") is not None for item in items):
+        grouped = {}
+        row_order = []
+        for item in items:
+            row_no = int(item.get("row", 999) or 999)
+            if row_no not in grouped:
+                grouped[row_no] = []
+                row_order.append(row_no)
+            grouped[row_no].append(item)
+        item_rows = [grouped[row_no] for row_no in row_order]
+    else:
+        normal_items = [item for item in items if str(item.get("callback", "")) != "faq"]
+        faq_items = [item for item in items if str(item.get("callback", "")) == "faq"]
+        item_rows = [normal_items[i:i + 2] for i in range(0, len(normal_items), 2)]
+        if faq_items:
+            item_rows.append(faq_items)
 
     if get_main_menu_type() == MENU_TYPE_INLINE:
         rows = []
         for item_row in item_rows:
             row = []
-            for item in item_row:
+            for item in item_row[:2]:
                 label = str(item.get("text", "")).strip()
                 callback = str(item.get("callback", "")).strip()
                 if label and callback:
@@ -1206,22 +1380,22 @@ def main_menu(user_id=None):
                     ))
             if row:
                 rows.append(row)
+        if user_id is not None and int(user_id) == ADMIN_ID:
+            rows.append([InlineKeyboardButton("👑 مدیریت کل ربات", callback_data="admin", style="primary")])
         return InlineKeyboardMarkup(rows)
 
     rows = []
     for item_row in item_rows:
         row = []
-        for item in item_row:
+        for item in item_row[:2]:
             label = str(item.get("text", "")).strip()
             callback = str(item.get("callback", "")).strip()
             if label and callback:
-                row.append(KeyboardButton(label))
+                row.append(_styled_keyboard_button(label, callback))
         if row:
             rows.append(row)
-    # The main screen does not need a redundant "main menu" button.
-    # The owner-only management entry is always the last row on the owner's keyboard.
     if user_id is not None and int(user_id) == ADMIN_ID:
-        rows.append([KeyboardButton("👑 مدیریت کل ربات")])
+        rows.append([_styled_keyboard_button("👑 مدیریت کل ربات", "admin")])
     return ReplyKeyboardMarkup(
         rows,
         resize_keyboard=True,
@@ -1359,7 +1533,7 @@ def _routes_from_main_reply_keyboard(markup, user_id=None):
     return {label: ("callback", available[label]) for label in labels if label in available}
 
 def _prepare_outgoing_markup(chat_id, markup):
-    """Render every menu with the selected style, consistent color semantics and layout."""
+    """Render outgoing keyboards with semantic colors while preserving main-menu rows."""
     if isinstance(markup, ReplyKeyboardRemove):
         return markup
 
@@ -1368,13 +1542,10 @@ def _prepare_outgoing_markup(chat_id, markup):
         if isinstance(markup, InlineKeyboardMarkup):
             return InlineKeyboardMarkup(_premium_inline_rows(markup))
         if isinstance(markup, ReplyKeyboardMarkup):
-            # A reply keyboard is not a supported display in glass mode; let the
-            # caller's next screen render its inline equivalent rather than recoloring it.
             return None
         return markup
 
     if isinstance(markup, InlineKeyboardMarkup):
-        # Keep exact button-to-action routing while compacting the visible rows.
         routes = _routes_from_inline_markup(markup, keyboard_labels=True)
         rows = []
         for source_row in _premium_inline_rows(markup):
@@ -1382,10 +1553,8 @@ def _prepare_outgoing_markup(chat_id, markup):
             for button in source_row:
                 label = str(getattr(button, "text", "") or "").strip()[:64]
                 if not label or getattr(button, "url", None):
-                    # Ordinary reply keyboards cannot open URL buttons. Link targets
-                    # should be placed in message text by the screen-specific handler.
                     continue
-                pair.append(KeyboardButton(label))
+                pair.append(_styled_keyboard_button(label, getattr(button, "callback_data", None)))
                 if len(pair) == 2:
                     rows.append(pair)
                     pair = []
@@ -1393,12 +1562,12 @@ def _prepare_outgoing_markup(chat_id, markup):
                 rows.append(pair)
         labels = {str(getattr(button, "text", "") or "").strip() for row in rows for button in row}
         if "🏠 منوی اصلی" not in labels:
-            rows.append([KeyboardButton("🏠 منوی اصلی")])
+            rows.append([_styled_keyboard_button("🏠 منوی اصلی", "home")])
         try:
             routes["🏠 منوی اصلی"] = ("callback", "home")
             if chat_id is not None and int(chat_id) == ADMIN_ID:
                 if "👑 مدیریت کل ربات" not in labels:
-                    rows.append([KeyboardButton("👑 مدیریت کل ربات")])
+                    rows.append([_styled_keyboard_button("👑 مدیریت کل ربات", "admin")])
                 routes["👑 مدیریت کل ربات"] = ("callback", "admin")
             _save_user_menu_routes(chat_id, routes, MENU_TYPE_KEYBOARD)
         except Exception:
@@ -1423,7 +1592,39 @@ def _prepare_outgoing_markup(chat_id, markup):
             for label in raw_labels
         )
 
-        # Flatten old custom layouts, keeping their order, then pack 2 per row.
+        if is_main_menu:
+            # Keep every row exactly as defined in the redesign, including full-width rows.
+            rows = []
+            for source_row in original_rows:
+                row = []
+                for button in source_row[:2]:
+                    label = str(getattr(button, "text", "") or "").strip()
+                    if label:
+                        callback = _route_for_main_label(label)
+                        if label == "👑 مدیریت کل ربات":
+                            callback = "admin"
+                        row.append(_styled_keyboard_button(label, callback))
+                if row:
+                    rows.append(row)
+            labels = {str(getattr(button, "text", "") or "").strip() for row in rows for button in row}
+            if chat_id is not None and int(chat_id) == ADMIN_ID and "👑 مدیریت کل ربات" not in labels:
+                rows.append([_styled_keyboard_button("👑 مدیریت کل ربات", "admin")])
+            try:
+                routes = _routes_from_main_reply_keyboard(ReplyKeyboardMarkup(rows), user_id=chat_id)
+                routes["🏠 منوی اصلی"] = ("callback", "home")
+                if chat_id is not None and int(chat_id) == ADMIN_ID:
+                    routes["👑 مدیریت کل ربات"] = ("callback", "admin")
+                _save_user_menu_routes(chat_id, routes, MENU_TYPE_KEYBOARD)
+            except Exception:
+                logger.exception("Could not register styled main reply keyboard routes")
+            return ReplyKeyboardMarkup(
+                rows,
+                resize_keyboard=True,
+                one_time_keyboard=False,
+                input_field_placeholder="پیامت رو بنویس یا از منو انتخاب کن…",
+            )
+
+        # Keep older submenu reply keyboards compatible while applying styles where possible.
         labels = []
         for label in raw_labels:
             if label not in labels:
@@ -1432,13 +1633,13 @@ def _prepare_outgoing_markup(chat_id, markup):
         rows = []
         for offset in range(0, len(labels), 2):
             rows.append([
-                KeyboardButton(label)
+                _styled_keyboard_button(label, _route_for_main_label(label))
                 for label in labels[offset:offset + 2]
             ])
-        if not is_main_menu and "🏠 منوی اصلی" not in labels:
-            rows.append([KeyboardButton("🏠 منوی اصلی")])
+        if "🏠 منوی اصلی" not in labels:
+            rows.append([_styled_keyboard_button("🏠 منوی اصلی", "home")])
         if chat_id is not None and int(chat_id) == ADMIN_ID:
-            rows.append([KeyboardButton("👑 مدیریت کل ربات")])
+            rows.append([_styled_keyboard_button("👑 مدیریت کل ربات", "admin")])
         routes = _routes_from_main_reply_keyboard(ReplyKeyboardMarkup(rows), user_id=chat_id)
         routes["🏠 منوی اصلی"] = ("callback", "home")
         if chat_id is not None and int(chat_id) == ADMIN_ID:
@@ -1452,7 +1653,6 @@ def _prepare_outgoing_markup(chat_id, markup):
         )
 
     return markup
-
 
 def _route_for_main_label(label):
     for item in _main_menu_items():
@@ -2044,6 +2244,71 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
     data = query.data
+
+    if data == "cancel_public_request":
+        context.user_data.pop("mediator_request_state", None)
+        context.user_data.pop("ton_purchase_state", None)
+        await query.edit_message_text(
+            "درخواست لغو شد؛ هیچ پرداخت یا سفارشی ایجاد نشد.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 منوی اصلی", callback_data="home", style="primary")]]),
+        )
+        return
+
+    if data == "mediator_request":
+        context.user_data.pop("ton_purchase_state", None)
+        context.user_data["mediator_request_state"] = {"step": "details"}
+        await query.edit_message_text(
+            "🤝 درخواست واسطه | SEYED PREMIUM\n\n"
+            "در یک پیام توضیح بده معامله درباره چیست، طرف مقابل چه آیدی/راه ارتباطی دارد و چه توافقی انجام شده است.\n"
+            "اطلاعات حساس مثل رمز عبور یا کد ورود را ارسال نکن.\n\n"
+            "درخواست برای بررسی دستی مدیر ثبت می‌شود؛ ثبت آن به معنی تضمین یا تأیید معامله نیست. برای لغو دکمه زیر را بزن.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ لغو درخواست", callback_data="cancel_public_request", style="danger")],
+                [InlineKeyboardButton("🏠 منوی اصلی", callback_data="home", style="primary")],
+            ]),
+        )
+        return
+
+    if data == "ton_gram":
+        await query.edit_message_text(
+            "💎 تون (TON) | SEYED PREMIUM\n\n"
+            "از این بخش می‌توانی درخواست خرید TON ثبت کنی. در حال حاضر قیمت زنده یا پرداخت و انتقال خودکار به ربات متصل نیست.\n"
+            "درخواست ثبت‌شده فقط پس از بررسی و تأیید دستی مدیر قابل انجام است.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🪙 ثبت درخواست خرید تون", callback_data="ton_buy", style="success")],
+                [InlineKeyboardButton("🏠 منوی اصلی", callback_data="home", style="primary")],
+            ]),
+        )
+        return
+
+    if data == "ton_buy":
+        context.user_data.pop("mediator_request_state", None)
+        context.user_data["ton_purchase_state"] = {"step": "amount"}
+        await query.edit_message_text(
+            "🪙 درخواست خرید تون (TON)\n\n"
+            "مقدار TON موردنظرت را با عدد بفرست؛ مثلاً 2 یا 0.5.\n"
+            "قیمت زنده، پرداخت و انتقال خودکار فعال نیست و درخواست پیش از هر اقدامی توسط مدیر بررسی می‌شود.\n"
+            "برای لغو، دکمه زیر یا /cancel را بزن.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ لغو درخواست", callback_data="cancel_public_request", style="danger")],
+                [InlineKeyboardButton("🏠 منوی اصلی", callback_data="home", style="primary")],
+            ]),
+        )
+        return
+
+    if data == "mini_app":
+        await query.edit_message_text(
+            "▤ مینی اپ\n\nمینی‌اپ وب فعلاً به این ربات متصل نشده است؛ برای جلوگیری از نمایش قابلیت غیرواقعی، این دکمه فعلاً وضعیت را شفاف اعلام می‌کند.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 منوی اصلی", callback_data="home", style="primary")]]),
+        )
+        return
+
+    if data == "nft_market":
+        await query.edit_message_text(
+            "▦ مارکت NFT\n\nبازارچه NFT هنوز به سرویس یا کاتالوگ واقعی متصل نشده است. هیچ قیمت یا موجودی ساختگی نمایش داده نمی‌شود.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 منوی اصلی", callback_data="home", style="primary")]]),
+        )
+        return
 
     # بازگشت به صفحه قبلی
     history = context.user_data.setdefault("screen_history", [])
@@ -4727,9 +4992,19 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel_coupon_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    message = update.effective_message
+    # The shared /cancel command also exits customer-side mediator and TON forms.
+    if context.user_data.get("mediator_request_state") or context.user_data.get("ton_purchase_state"):
+        context.user_data.pop("mediator_request_state", None)
+        context.user_data.pop("ton_purchase_state", None)
+        if message:
+            await message.reply_text(
+                "درخواست لغو شد؛ هیچ پرداخت یا سفارشی ایجاد نشد.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 منوی اصلی", callback_data="home", style="primary")]]),
+            )
+        return
     if not user or user.id != ADMIN_ID:
         return
-    message = update.effective_message
 
     edit_state = context.user_data.pop("coupon_edit_state", None)
     if edit_state:
@@ -4771,11 +5046,139 @@ async def cancel_coupon_creation(update: Update, context: ContextTypes.DEFAULT_T
         await message.reply_text("عملیات در حال انجامی برای لغو وجود ندارد.")
 
 
+async def _handle_public_request_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Collect and save mediator / TON requests without automatic payment or fulfillment."""
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not message.text or not user:
+        return False
+    text_value = message.text.strip()
+
+    mediator_state = context.user_data.get("mediator_request_state")
+    ton_state = context.user_data.get("ton_purchase_state")
+    if not mediator_state and not ton_state:
+        return False
+
+    if text_value.casefold() in {"/cancel", "لغو", "❌ لغو عملیات", "❌ لغو"}:
+        context.user_data.pop("mediator_request_state", None)
+        context.user_data.pop("ton_purchase_state", None)
+        await message.reply_text(
+            "درخواست لغو شد؛ هیچ پرداخت یا سفارشی ایجاد نشد.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 منوی اصلی", callback_data="home", style="primary")]]),
+        )
+        return True
+
+    if mediator_state:
+        if len(text_value) < 5 or len(text_value) > 1800:
+            await message.reply_text("لطفاً توضیحات درخواست واسطه را بین ۵ تا ۱۸۰۰ نویسه بفرست. برای لغو /cancel را ارسال کن.")
+            return True
+        with db() as con:
+            cur = con.execute(
+                "INSERT INTO mediator_requests(user_id, username, full_name, details) VALUES (?, ?, ?, ?)",
+                (user.id, user.username or "", user.full_name or "", text_value),
+            )
+            request_id = cur.lastrowid
+        context.user_data.pop("mediator_request_state", None)
+        admin_notified = False
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    "🤝 درخواست جدید واسطه\n"
+                    f"شماره درخواست: #{request_id}\n"
+                    f"کاربر: {user.full_name or 'بدون نام'} (@{user.username or 'بدون نام کاربری'})\n"
+                    f"آیدی: {user.id}\n\n"
+                    f"توضیحات:\n{text_value}\n\n"
+                    "وضعیت: در انتظار بررسی دستی مدیر"
+                ),
+            )
+            admin_notified = True
+        except Exception:
+            logger.exception("Could not notify administrator about mediator request #%s", request_id)
+        notification_text = (
+            f"✅ درخواست واسطه با شماره #{request_id} ثبت شد و برای بررسی دستی مدیر ارسال شد.\n"
+            if admin_notified else
+            f"✅ درخواست واسطه با شماره #{request_id} در سیستم ذخیره شد، اما اعلان مدیر ارسال نشد. از پشتیبانی پیگیری کن.\n"
+        )
+        await message.reply_text(
+            notification_text + "ثبت درخواست به معنی تأیید معامله یا تضمین انجام آن نیست.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 منوی اصلی", callback_data="home", style="primary")]]),
+        )
+        return True
+
+    if ton_state and ton_state.get("step") == "amount":
+        normalized = normalize_ascii_digits(text_value).replace(",", ".")
+        if not re.fullmatch(r"\d{1,10}(?:\.\d{1,8})?", normalized):
+            await message.reply_text("مقدار تون را فقط با عدد مثبت بفرست؛ مثلاً 2 یا 0.5. برای لغو /cancel را بزن.")
+            return True
+        try:
+            amount = float(normalized)
+        except ValueError:
+            amount = 0
+        if amount <= 0:
+            await message.reply_text("مقدار باید بیشتر از صفر باشد. دوباره بفرست:")
+            return True
+        ton_state["amount_ton"] = normalized
+        ton_state["step"] = "wallet"
+        context.user_data["ton_purchase_state"] = ton_state
+        await message.reply_text(
+            "✅ مقدار ثبت شد. حالا آدرس کیف پول TON مقصد را بفرست.\n\n"
+            "⚠️ آدرس را با دقت بررسی کن. این فقط درخواست خرید است؛ قیمت زنده، پرداخت و ارسال خودکار فعال نیست. برای لغو /cancel را بفرست."
+        )
+        return True
+
+    if ton_state and ton_state.get("step") == "wallet":
+        if len(text_value) < 10 or len(text_value) > 200 or any(ch.isspace() for ch in text_value):
+            await message.reply_text("آدرس کیف پول باید بین ۱۰ تا ۲۰۰ نویسه و بدون فاصله باشد. دوباره بفرست یا /cancel را بزن.")
+            return True
+        amount = str(ton_state.get("amount_ton", ""))
+        with db() as con:
+            cur = con.execute(
+                "INSERT INTO ton_purchase_requests(user_id, username, amount_ton, wallet_address) VALUES (?, ?, ?, ?)",
+                (user.id, user.username or "", amount, text_value),
+            )
+            request_id = cur.lastrowid
+        context.user_data.pop("ton_purchase_state", None)
+        admin_notified = False
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    "🪙 درخواست جدید خرید تون (TON)\n"
+                    f"شماره درخواست: #{request_id}\n"
+                    f"کاربر: {user.full_name or 'بدون نام'} (@{user.username or 'بدون نام کاربری'})\n"
+                    f"آیدی: {user.id}\n"
+                    f"مقدار درخواستی: {amount} TON\n"
+                    f"آدرس مقصد: {text_value}\n"
+                    "وضعیت: در انتظار بررسی دستی؛ قیمت یا پرداخت خودکار انجام نشده است."
+                ),
+            )
+            admin_notified = True
+        except Exception:
+            logger.exception("Could not notify administrator about TON request #%s", request_id)
+        notification_text = (
+            f"✅ درخواست خرید تون با شماره #{request_id} ثبت شد و برای بررسی مدیر ارسال شد.\n"
+            if admin_notified else
+            f"✅ درخواست خرید تون با شماره #{request_id} ذخیره شد، اما اعلان مدیر ارسال نشد. از پشتیبانی پیگیری کن.\n"
+        )
+        await message.reply_text(
+            notification_text +
+            "قیمت نهایی، روش پرداخت و امکان انجام درخواست باید توسط مدیر تأیید شود؛ هیچ پرداخت یا انتقالی خودکار انجام نشده است.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 منوی اصلی", callback_data="home", style="primary")]]),
+        )
+        return True
+
+    return False
+
+
 async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     message = update.effective_message
     if user:
         register_user(user)
+
+    if await _handle_public_request_input(update, context):
+        return
 
     # Route exact menu taps before membership/input workflows consume the text.
     # Protected callbacks still enforce channel membership, and this lets non-members
