@@ -1,7 +1,5 @@
-from ui_config import buttons as configured_buttons
-from service_menu import service_menu
-
 import logging
+from copy import deepcopy
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
@@ -163,8 +161,6 @@ def gregorian_to_jalali(gy, gm, gd):
 # EDITOR_PANEL_INSTALLED
 import json
 import hashlib
-SETTINGS_FILE = Path(__file__).with_name("bot_settings.json")
-
 EDITABLE_TEXTS = {
     "welcome": ("متن خوشامدگویی", "💎 SEYED PREMIUM 👑\n\nبه دنیای خدمات پریمیوم خوش آمدید. ✨\n\n━━━━━━━━━━━━━━\n\n💎 خدمات ویژه | ⚡ خرید آسان\n🛡️ پشتیبانی و پیگیری سفارش\n\n━━━━━━━━━━━━━━\n\n👑 خاص انتخاب کنید. متفاوت تجربه کنید.\n\nبرای شروع از منوی زیر انتخاب کنید. 👇"),
     "main_menu": ("متن منوی اصلی", "💎 منوی اصلی SEYED PREMIUM\n\nیک گزینه انتخاب کن:"),
@@ -200,25 +196,127 @@ EDITABLE_TEXTS = {
 
 _BOT_SETTINGS_CACHE = None
 
+# These defaults are embedded in bot.py so the bot does not require ui_config.py,
+# service_menu.py, stars_menu.py, or a separately-created JSON settings file.
+_DEFAULT_UI_MENUS = {
+    "main": [
+        {"id": "buy_service", "text": "🛍 خرید سرویس", "callback": "cat_stars", "enabled": True},
+        {"id": "numbers", "text": "📱 شماره مجازی", "callback": "cat_numbers", "enabled": True},
+        {"id": "wallet", "text": "👛 کیف پول", "callback": "wallet", "enabled": True},
+        {"id": "topup", "text": "💳 شارژ کیف پول", "callback": "topup", "enabled": True},
+        {"id": "orders", "text": "📚 سفارش‌های من", "callback": "orders", "enabled": True},
+        {"id": "profile", "text": "👤 پروفایل من", "callback": "account", "enabled": True},
+        {"id": "config", "text": "🌐 خرید کانفیگ", "callback": "config_menu", "enabled": True},
+        {"id": "free_stars", "text": "⭐ استارز رایگان", "callback": "free_stars", "enabled": True},
+        {"id": "support", "text": "🎧 پشتیبانی", "callback": "support", "enabled": True},
+        {"id": "faq", "text": "❓ سؤالات متداول", "callback": "faq", "enabled": True},
+    ],
+    "services": [
+        {"id": "stars", "text": "⭐ استارز تلگرام", "callback": "service_stars", "enabled": True},
+        {"id": "premium", "text": "💎 پرمیوم تلگرام", "callback": "service_premium", "enabled": True},
+        {"id": "gifts", "text": "🎁 گیفت تلگرام", "callback": "service_gifts", "enabled": True},
+        {"id": "boost", "text": "🚀 بوست تلگرام", "callback": "service_boost", "enabled": True},
+        {"id": "members", "text": "👥 ممبر تلگرام", "callback": "service_members", "enabled": True},
+        {"id": "reactions", "text": "💙 ری‌اکشن تلگرام", "callback": "service_reactions", "enabled": True},
+        {"id": "views", "text": "👁️ بازدید تلگرام", "callback": "service_views", "enabled": True},
+        {"id": "instagram_followers", "text": "📸 فالوور اینستاگرام", "callback": "service_instagram_followers", "enabled": True},
+        {"id": "instagram_likes", "text": "💙 لایک اینستاگرام", "callback": "service_instagram_likes", "enabled": True},
+    ],
+}
+_LEGACY_SETTINGS_FILE = Path(__file__).with_name("bot_settings.json")  # read-only migration source
+_SETTINGS_DB_KEY = "bot_settings_json"
+
+
+def _normalize_bot_settings(data):
+    if not isinstance(data, dict):
+        data = {}
+    menus = data.get("menus")
+    if not isinstance(menus, dict):
+        menus = {}
+    for name, defaults in _DEFAULT_UI_MENUS.items():
+        # Initialize missing menus only; do not silently restore buttons the owner
+        # intentionally removed or reordered in the management panel.
+        if not isinstance(menus.get(name), list):
+            menus[name] = deepcopy(defaults)
+    data["menus"] = menus
+    if not isinstance(data.get("texts"), dict):
+        data["texts"] = {}
+    return data
+
+
 def load_bot_settings():
+    """Load editable text/menu settings from SQLite; import legacy JSON once if present."""
     global _BOT_SETTINGS_CACHE
     if _BOT_SETTINGS_CACHE is not None:
         return _BOT_SETTINGS_CACHE
+
+    data = None
     try:
-        data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-        _BOT_SETTINGS_CACHE = data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        _BOT_SETTINGS_CACHE = {}
+        with db() as con:
+            row = con.execute("SELECT value FROM app_settings WHERE key=?", (_SETTINGS_DB_KEY,)).fetchone()
+        if row:
+            data = json.loads(row["value"])
+    except (sqlite3.Error, ValueError, TypeError, KeyError):
+        logger.debug("Could not read persistent UI settings from database", exc_info=True)
+
+    if data is None:
+        # Existing settings are imported, not overwritten or deleted. No JSON file is created.
+        try:
+            if _LEGACY_SETTINGS_FILE.exists():
+                candidate = json.loads(_LEGACY_SETTINGS_FILE.read_text(encoding="utf-8"))
+                if isinstance(candidate, dict):
+                    data = candidate
+        except (OSError, ValueError):
+            logger.warning("Legacy UI settings could not be imported; defaults will be used.")
+
+    data = _normalize_bot_settings(data or {})
+    try:
+        with db() as con:
+            con.execute(
+                "INSERT INTO app_settings(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO NOTHING",
+                (_SETTINGS_DB_KEY, json.dumps(data, ensure_ascii=False)),
+            )
+            # If another process initialized the key first, use its persisted value.
+            row = con.execute("SELECT value FROM app_settings WHERE key=?", (_SETTINGS_DB_KEY,)).fetchone()
+            if row:
+                data = _normalize_bot_settings(json.loads(row["value"]))
+    except (sqlite3.Error, ValueError, TypeError):
+        logger.debug("UI settings could not be initialized in SQLite", exc_info=True)
+
+    _BOT_SETTINGS_CACHE = data
     return _BOT_SETTINGS_CACHE
 
 
 def save_bot_settings(data):
+    """Persist editable UI texts and menus inside the existing shop database."""
     global _BOT_SETTINGS_CACHE
-    SETTINGS_FILE.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
-    _BOT_SETTINGS_CACHE = data if isinstance(data, dict) else {}
+    normalized = _normalize_bot_settings(data)
+    try:
+        with db() as con:
+            con.execute(
+                "INSERT INTO app_settings(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (_SETTINGS_DB_KEY, json.dumps(normalized, ensure_ascii=False)),
+            )
+        _BOT_SETTINGS_CACHE = normalized
+    except sqlite3.Error:
+        logger.exception("Could not save persistent UI settings")
+        raise
+
+
+def ui_load():
+    return load_bot_settings()
+
+
+def ui_save(data):
+    save_bot_settings(data)
+
+
+def configured_buttons(menu):
+    items = load_bot_settings().get("menus", {}).get(str(menu), [])
+    return [dict(item) for item in items
+            if isinstance(item, dict) and item.get("enabled", True)]
 
 
 def bot_text(key):
@@ -226,7 +324,8 @@ def bot_text(key):
     item = defaults.get(key)
     if not item:
         return key
-    return load_bot_settings().get(key, item[1])
+    settings = load_bot_settings()
+    return settings.get(key, settings.get("texts", {}).get(key, item[1]))
 
 
 logging.basicConfig(
@@ -812,8 +911,63 @@ def register_user(user):
 # منوها
 # ==========================================
 
-from stars_menu import stars_menu, stars_text, stars_detail_menu
 import re
+
+
+def service_menu(text_fn=None):
+    """Build the services catalogue from the editable menu stored in the database."""
+    items = configured_buttons("services")
+    preferred = ["stars", "premium", "gifts", "boost", "members", "reactions", "views", "instagram_followers", "instagram_likes"]
+    rank = {name: i for i, name in enumerate(preferred)}
+    def sort_key(item):
+        item_id = str(item.get("id", ""))
+        callback = str(item.get("callback", ""))
+        return (rank.get(item_id, rank.get(callback.replace("service_", ""), len(rank))), item_id)
+    items = sorted([x for x in items if isinstance(x, dict) and x.get("enabled", True)], key=sort_key)
+    buttons = []
+    for item in items:
+        label = str(item.get("text", "")).strip()
+        callback = str(item.get("callback", "")).strip()
+        if label and callback:
+            buttons.append(InlineKeyboardButton(label, callback_data=callback, style=_button_style_for(label, callback)))
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    rows.append([InlineKeyboardButton("🏠 منوی اصلی", callback_data="home", style="primary")])
+    return InlineKeyboardMarkup(rows)
+
+
+def stars_menu():
+    packages = [
+        (50, "۵۰"), (75, "۷۵"), (100, "۱۰۰"), (150, "۱۵۰"),
+        (250, "۲۵۰"), (350, "۳۵۰"), (500, "۵۰۰"), (1000, "۱۰۰۰"),
+        (2500, "۲۵۰۰"), (5000, "۵۰۰۰"), (10000, "۱۰ هزار"), (50000, "۵۰ هزار"),
+    ]
+    rows = [[InlineKeyboardButton(f"🎁 {label} استارز", callback_data=f"stars_pack_{amount}", style="success")]
+            for amount, label in packages]
+    rows.append([InlineKeyboardButton("✏️ استارز به مقدار دلخواه", callback_data="stars_custom", style="success")])
+    rows.append([InlineKeyboardButton("↩️ بازگشت", callback_data="back_to_services", style="danger")])
+    return InlineKeyboardMarkup(rows)
+
+
+def stars_detail_menu(amount):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💎 برای خودم", callback_data=f"stars_recipient_self_{amount}", style="primary")],
+        [InlineKeyboardButton("🎁 برای شخص دیگر", callback_data=f"stars_recipient_other_{amount}", style="primary")],
+        [InlineKeyboardButton("🏷️ وارد کردن کد تخفیف", callback_data=f"stars_discount_{amount}", style="primary")],
+        [InlineKeyboardButton("💰 شارژ کیف پول", callback_data="wallet", style="success")],
+        [InlineKeyboardButton("↩️ بازگشت", callback_data="stars_detail_back", style="danger")],
+    ])
+
+
+def stars_text():
+    return (
+        "🎁 استارز - انتخاب بسته\n\n"
+        "بسته موردنظرت رو انتخاب کن 👇\n\n"
+        "🔐 بدون نیاز به ورود به اکانت\n"
+        "⚡️ تحویل سریع و طبق روند ثبت سفارش\n"
+        "🍦 امکان سفارش با مقدار دلخواه\n"
+        "🔘 دارای کش‌بک\n"
+        "💬 پشتیبانی در تمام مراحل"
+    )
 
 
 MENU_TYPE_DEFAULT = "keyboard"
@@ -847,55 +1001,233 @@ def set_main_menu_type(value=MENU_TYPE_KEYBOARD):
 
 
 def _main_menu_items():
-    return [
+    """Return enabled main-menu items in a consistent, premium order."""
+    items = [
         item for item in configured_buttons("main")
         if isinstance(item, dict) and item.get("enabled", True)
         and str(item.get("text", "")).strip()
         and str(item.get("callback", "")).strip()
     ]
+    # Keep the configured order authoritative so the owner's move-up/move-down
+    # controls actually change the visible order instead of being silently undone.
+    return items
+
+
+def _button_style_for(label, callback=None):
+    """Assign Telegram's native blue/green/red button style by action semantics."""
+    label = str(label or "").strip().casefold()
+    callback = str(callback or "").strip().casefold()
+    joined = f"{label} {callback}"
+
+    # Destructive or cancellation actions always take priority over positive words.
+    danger_terms = (
+        "حذف", "پاک کردن", "لغو", "رد سفارش", "رد پرداخت", "رد رسید",
+        "مسدود", "غیرفعال", "delete", "remove", "cancel", "reject",
+        "decline", "ban", "disable", "danger",
+    )
+    if any(term in joined for term in danger_terms):
+        return "danger"
+
+    # FAQ and explanatory screens are neutral, using Telegram's default style.
+    if callback == "faq" or "سؤالات متداول" in label or "سوالات متداول" in label:
+        return None
+
+    if callback in {"admin_menu_set_keyboard", "admin_menu_set_inline"}:
+        return "success" if "✅" in label else "primary"
+
+    # Informational/neutral options use Telegram's default background.
+    neutral_terms = (
+        "مشاهده", "جزئیات", "اطلاعات", "راهنما", "وضعیت فعلی", "نمایش اطلاعات",
+        "view", "details", "information", "help", "status",
+    )
+    if any(term in joined for term in neutral_terms):
+        return None
+
+    # Positive/commit actions are green; ordinary navigation and choices stay blue.
+    success_terms = (
+        "تأیید", "تایید", "ثبت نهایی", "پرداخت", "شارژ کیف پول", "خرید نهایی",
+        "خرید سرویس", "شماره مجازی", "افزودن به سبد", "ثبت سفارش", "استارز رایگان",
+        "ذخیره", "افزودن", "فعال‌سازی", "تکمیل سفارش", "approve", "confirm",
+        "submit", "activate", "save", "pay", "topup", "buy_", "purchase",
+    )
+    if any(term in joined for term in success_terms):
+        return "success"
+
+    # Product/service selection is a positive step and must use the same green
+    # styling across the catalogue, product cards and nested service screens.
+    positive_callbacks = (
+        "service_", "stars_pack_", "buy_", "vip_plan_", "config_plan_",
+        "premium_plan_", "gift_plan_", "boost_plan_",
+    )
+    if any(callback.startswith(prefix) for prefix in positive_callbacks):
+        return "success"
+
+    return "primary"
+
+
+def _button_is_navigation(button):
+    label = str(getattr(button, "text", "") or "").strip()
+    callback = str(getattr(button, "callback_data", "") or "").strip().lower()
+    return (
+        callback in {"home", "nav_back", "back_to_services", "admin_menu_settings"}
+        or "بازگشت" in label
+        or "منوی اصلی" in label
+        or label in {"خانه", "🏠 خانه"}
+    )
+
+
+def _button_is_sensitive(button):
+    label = str(getattr(button, "text", "") or "").strip().casefold()
+    callback = str(getattr(button, "callback_data", "") or "").strip().casefold()
+    markers = ("حذف", "لغو", "رد ", "مسدود", "delete", "cancel", "reject", "ban", "danger")
+    return any(marker in f"{label} {callback}" for marker in markers)
+
+
+def _restyle_inline_button(button):
+    """Return a copy of an ordinary inline button with a semantic Telegram style."""
+    label = str(getattr(button, "text", "") or "")
+    callback = getattr(button, "callback_data", None)
+    style = _button_style_for(label, callback)
+    try:
+        data = button.to_dict()
+        data["style"] = style
+        # de_json retains Telegram object fields while applying the supported style.
+        return InlineKeyboardButton.de_json(data, bot=None)
+    except Exception:
+        # All common project buttons are callback or URL buttons. Keep a safe fallback
+        # if a future Telegram button type cannot be reconstructed on this library.
+        try:
+            kwargs = {"text": label, "style": style}
+            for attr in (
+                "url", "callback_data", "switch_inline_query",
+                "switch_inline_query_current_chat", "callback_game", "pay",
+                "login_url", "web_app", "switch_inline_query_chosen_chat", "copy_text",
+            ):
+                value = getattr(button, attr, None)
+                if value is not None:
+                    kwargs[attr] = value
+            api_kwargs = getattr(button, "api_kwargs", None)
+            if api_kwargs:
+                kwargs["api_kwargs"] = api_kwargs
+            return InlineKeyboardButton(**kwargs)
+        except Exception:
+            logger.debug("Could not apply button style for %r", label, exc_info=True)
+            return button
+
+
+def _premium_inline_rows(markup):
+    """Standardize inline rows: usually two per row, navigation at the bottom."""
+    source_rows = getattr(markup, "inline_keyboard", None) or []
+    content_rows = []
+    navigation = []
+    pending = []
+
+    def flush_pending():
+        nonlocal pending
+        if pending:
+            content_rows.append(pending[:])
+            pending = []
+
+    for source_row in source_rows:
+        row = list(source_row or [])
+        if not row:
+            continue
+        # Preserve rows that intentionally contain multiple related buttons, while
+        # reducing any row wider than two buttons to a mobile-friendly width.
+        if len(row) >= 2:
+            flush_pending()
+            for offset in range(0, len(row), 2):
+                chunk = row[offset:offset + 2]
+                kept = []
+                for button in chunk:
+                    if _button_is_navigation(button):
+                        navigation.append(button)
+                    else:
+                        kept.append(button)
+                if len(kept) == 2:
+                    content_rows.append(kept)
+                elif len(kept) == 1:
+                    if _button_is_sensitive(kept[0]):
+                        content_rows.append(kept)
+                    else:
+                        pending.append(kept[0])
+                        if len(pending) == 2:
+                            content_rows.append(pending)
+                            pending = []
+            continue
+
+        button = row[0]
+        if _button_is_navigation(button):
+            flush_pending()
+            navigation.append(button)
+        elif _button_is_sensitive(button):
+            flush_pending()
+            content_rows.append([button])
+        else:
+            pending.append(button)
+            if len(pending) == 2:
+                content_rows.append(pending)
+                pending = []
+
+    flush_pending()
+
+    styled_rows = []
+    for row in content_rows:
+        styled_rows.append([_restyle_inline_button(button) for button in row[:2]])
+    # Navigation stays at the end; pair a matching back/home pair where possible.
+    styled_navigation = [_restyle_inline_button(button) for button in navigation]
+    if styled_navigation:
+        for offset in range(0, len(styled_navigation), 2):
+            styled_rows.append(styled_navigation[offset:offset + 2])
+    return styled_rows
 
 
 def main_menu(user_id=None):
-    """Build the main menu; expose management entry only to the bot owner."""
+    """Render one premium main-menu layout as either inline or reply keyboard."""
     items = _main_menu_items()
+    normal_items = [item for item in items if str(item.get("callback", "")) != "faq"]
+    faq_items = [item for item in items if str(item.get("callback", "")) == "faq"]
+    item_rows = [normal_items[i:i + 2] for i in range(0, len(normal_items), 2)]
+    if faq_items:
+        # FAQ is a distinct final row, visually highlighted in inline mode.
+        item_rows.append(faq_items)
+
     if get_main_menu_type() == MENU_TYPE_INLINE:
         rows = []
-        for item in items:
+        for item_row in item_rows:
+            row = []
+            for item in item_row:
+                label = str(item.get("text", "")).strip()
+                callback = str(item.get("callback", "")).strip()
+                if label and callback:
+                    row.append(InlineKeyboardButton(
+                        label, callback_data=callback,
+                        style=_button_style_for(label, callback),
+                    ))
+            if row:
+                rows.append(row)
+        return InlineKeyboardMarkup(rows)
+
+    rows = []
+    for item_row in item_rows:
+        row = []
+        for item in item_row:
             label = str(item.get("text", "")).strip()
             callback = str(item.get("callback", "")).strip()
             if label and callback:
-                rows.append([InlineKeyboardButton(label, callback_data=callback)])
-        return InlineKeyboardMarkup(rows)
-    rows = []
-    pair = []
-    for item in items:
-        label = str(item.get("text", "")).strip()
-        if not label:
-            continue
-        if "سؤالات متداول" in label or "سوالات متداول" in label or "خرید کانفیگ" in label:
-            if pair:
-                rows.append(pair)
-                pair = []
-            rows.append([KeyboardButton(label)])
-        else:
-            pair.append(KeyboardButton(label))
-            if len(pair) == 2:
-                rows.append(pair)
-                pair = []
-    if pair:
-        rows.append(pair)
-    if not any(str(getattr(button, "text", "")).strip() == "🏠 منوی اصلی"
-               for row in rows for button in row):
-        rows.append([KeyboardButton("🏠 منوی اصلی")])
-    # Owner-only entry at the bottom of the reply keyboard. Never show it to users.
+                row.append(KeyboardButton(label))
+        if row:
+            rows.append(row)
+    # The main screen does not need a redundant "main menu" button.
+    # The owner-only management entry is always the last row on the owner's keyboard.
     if user_id is not None and int(user_id) == ADMIN_ID:
         rows.append([KeyboardButton("👑 مدیریت کل ربات")])
     return ReplyKeyboardMarkup(
         rows,
         resize_keyboard=True,
+        one_time_keyboard=False,
         input_field_placeholder="پیامت رو بنویس یا از منو انتخاب کن…",
     )
-
 
 def menu_settings_keyboard():
     mode = get_main_menu_type()
@@ -1015,6 +1347,7 @@ def _routes_from_inline_markup(markup, keyboard_labels=False):
 def _routes_from_main_reply_keyboard(markup, user_id=None):
     available = {str(item["text"]).strip(): str(item["callback"]) for item in _main_menu_items()}
     available["🏠 منوی اصلی"] = "home"
+    available["🔄 بررسی عضویت"] = "check_membership"
     if user_id is not None and int(user_id) == ADMIN_ID:
         available["👑 مدیریت کل ربات"] = "admin"
     labels = []
@@ -1026,17 +1359,31 @@ def _routes_from_main_reply_keyboard(markup, user_id=None):
     return {label: ("callback", available[label]) for label in labels if label in available}
 
 def _prepare_outgoing_markup(chat_id, markup):
-    """Apply the selected global style while preserving existing callback actions."""
-    if get_main_menu_type() == MENU_TYPE_INLINE:
+    """Render every menu with the selected style, consistent color semantics and layout."""
+    if isinstance(markup, ReplyKeyboardRemove):
         return markup
+
+    mode = get_main_menu_type()
+    if mode == MENU_TYPE_INLINE:
+        if isinstance(markup, InlineKeyboardMarkup):
+            return InlineKeyboardMarkup(_premium_inline_rows(markup))
+        if isinstance(markup, ReplyKeyboardMarkup):
+            # A reply keyboard is not a supported display in glass mode; let the
+            # caller's next screen render its inline equivalent rather than recoloring it.
+            return None
+        return markup
+
     if isinstance(markup, InlineKeyboardMarkup):
+        # Keep exact button-to-action routing while compacting the visible rows.
         routes = _routes_from_inline_markup(markup, keyboard_labels=True)
         rows = []
-        for source_row in getattr(markup, "inline_keyboard", None) or []:
+        for source_row in _premium_inline_rows(markup):
             pair = []
             for button in source_row:
                 label = str(getattr(button, "text", "") or "").strip()[:64]
-                if not label:
+                if not label or getattr(button, "url", None):
+                    # Ordinary reply keyboards cannot open URL buttons. Link targets
+                    # should be placed in message text by the screen-specific handler.
                     continue
                 pair.append(KeyboardButton(label))
                 if len(pair) == 2:
@@ -1044,59 +1391,80 @@ def _prepare_outgoing_markup(chat_id, markup):
                     pair = []
             if pair:
                 rows.append(pair)
-
-        # A stable way back is available even when an old screen did not define one.
-        has_home_label = any(
-            str(getattr(button, "text", "")).strip() == "🏠 منوی اصلی"
-            for row in rows for button in row
-        )
-        if not has_home_label:
+        labels = {str(getattr(button, "text", "") or "").strip() for row in rows for button in row}
+        if "🏠 منوی اصلی" not in labels:
             rows.append([KeyboardButton("🏠 منوی اصلی")])
-        routes["🏠 منوی اصلی"] = ("callback", "home")
-
         try:
+            routes["🏠 منوی اصلی"] = ("callback", "home")
+            if chat_id is not None and int(chat_id) == ADMIN_ID:
+                if "👑 مدیریت کل ربات" not in labels:
+                    rows.append([KeyboardButton("👑 مدیریت کل ربات")])
+                routes["👑 مدیریت کل ربات"] = ("callback", "admin")
             _save_user_menu_routes(chat_id, routes, MENU_TYPE_KEYBOARD)
         except Exception:
             logger.exception("Could not register converted keyboard routes")
         return ReplyKeyboardMarkup(
             rows,
             resize_keyboard=True,
+            one_time_keyboard=False,
             input_field_placeholder="پیامت رو بنویس یا از منو انتخاب کن…",
         )
 
     if isinstance(markup, ReplyKeyboardMarkup):
-        # Direct reply keyboards are currently used by the main menu. Keep them compact.
         original_rows = getattr(markup, "keyboard", None) or []
-        rows = []
-        for source_row in original_rows:
-            pair = []
-            for button in source_row:
-                label = str(getattr(button, "text", "") or "").strip()
-                if not label:
-                    continue
-                pair.append(KeyboardButton(label))
-                if len(pair) == 2:
-                    rows.append(pair)
-                    pair = []
-            if pair:
-                rows.append(pair)
-        if not any(str(getattr(button, "text", "")).strip() == "🏠 منوی اصلی"
-                   for row in rows for button in row):
-            rows.append([KeyboardButton("🏠 منوی اصلی")])
-        routes = _routes_from_main_reply_keyboard(
-            ReplyKeyboardMarkup(rows, resize_keyboard=True), user_id=chat_id
+        raw_labels = [
+            str(getattr(button, "text", "") or "").strip()
+            for row in original_rows for button in row
+            if str(getattr(button, "text", "") or "").strip()
+        ]
+        main_labels = {str(item["text"]).strip() for item in _main_menu_items()}
+        is_main_menu = bool(raw_labels) and all(
+            label in main_labels or label in {"🏠 منوی اصلی", "👑 مدیریت کل ربات"}
+            for label in raw_labels
         )
+
+        # Flatten old custom layouts, keeping their order, then pack 2 per row.
+        labels = []
+        for label in raw_labels:
+            if label not in labels:
+                labels.append(label)
+        labels = [label for label in labels if label != "👑 مدیریت کل ربات"]
+        rows = []
+        for offset in range(0, len(labels), 2):
+            rows.append([
+                KeyboardButton(label)
+                for label in labels[offset:offset + 2]
+            ])
+        if not is_main_menu and "🏠 منوی اصلی" not in labels:
+            rows.append([KeyboardButton("🏠 منوی اصلی")])
+        if chat_id is not None and int(chat_id) == ADMIN_ID:
+            rows.append([KeyboardButton("👑 مدیریت کل ربات")])
+        routes = _routes_from_main_reply_keyboard(ReplyKeyboardMarkup(rows), user_id=chat_id)
         routes["🏠 منوی اصلی"] = ("callback", "home")
+        if chat_id is not None and int(chat_id) == ADMIN_ID:
+            routes["👑 مدیریت کل ربات"] = ("callback", "admin")
         _save_user_menu_routes(chat_id, routes, MENU_TYPE_KEYBOARD)
         return ReplyKeyboardMarkup(
             rows,
             resize_keyboard=True,
+            one_time_keyboard=False,
             input_field_placeholder="پیامت رو بنویس یا از منو انتخاب کن…",
         )
 
-    # ReplyKeyboardRemove is respected only when an input step explicitly asks for it.
     return markup
 
+
+def _route_for_main_label(label):
+    for item in _main_menu_items():
+        if str(item.get("text", "")).strip() == str(label).strip():
+            return str(item.get("callback", ""))
+    if label == "🏠 منوی اصلی":
+        return "home"
+    if label == "👑 مدیریت کل ربات":
+        return "admin"
+    if label == "🔄 بررسی عضویت":
+        return "check_membership"
+    return None
 
 def _bot_argument(args, kwargs, name, positional_index, default=None):
     if name in kwargs:
@@ -1364,9 +1732,16 @@ def back_menu():
 CHANNEL_USERNAME = '@SeyedPro_FQA'
 
 def membership_keyboard():
+    if get_main_menu_type() == MENU_TYPE_KEYBOARD:
+        return ReplyKeyboardMarkup(
+            [[KeyboardButton("🔄 بررسی عضویت")]],
+            resize_keyboard=True,
+            one_time_keyboard=False,
+            input_field_placeholder="برای بررسی عضویت، دکمه را بزن…",
+        )
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 عضویت در کانال", url="https://t.me/SeyedPro_FQA")],
-        [InlineKeyboardButton("🔄 بررسی عضویت", callback_data="check_membership")],
+        [InlineKeyboardButton("📢 عضویت در کانال", url="https://t.me/SeyedPro_FQA", style="primary")],
+        [InlineKeyboardButton("🔄 بررسی عضویت", callback_data="check_membership", style="success")],
     ])
 
 _MEMBERSHIP_CACHE = {}
@@ -1421,7 +1796,7 @@ async def require_channel_membership(update, context):
             )
         else:
             await message.reply_text(
-                "🔒 برای استفاده از خدمات ربات تلگرام، ابتدا عضو کانال زیر شو و سپس «بررسی عضویت» را بزن.",
+                "🔒 برای استفاده از خدمات ربات، ابتدا عضو کانال شو:\nhttps://t.me/SeyedPro_FQA\n\nپس از عضویت، «بررسی عضویت» را بزن.",
                 reply_markup=membership_keyboard(),
             )
     return False
@@ -1449,7 +1824,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(user)
     _start_mark("register_user")
 
-    current_menu_type = MENU_TYPE_KEYBOARD
+    current_menu_type = get_main_menu_type()
     _set_user_seen_mode(user.id, current_menu_type)
 
     # ثبت معرف فقط یک بار؛ دعوت کردن خود کاربر مجاز نیست.
@@ -1494,12 +1869,12 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_mode = get_main_menu_type()
     mode_label = "⌨️ کیبورد معمولی" if current_mode == MENU_TYPE_KEYBOARD else "💎 دکمه‌های شیشه‌ای"
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 آمار فروشگاه", callback_data="admin_stats", style="primary")],
-        [InlineKeyboardButton("🛍 محصولات و قیمت‌ها", callback_data="admin_products", style="primary")],
-        [InlineKeyboardButton("📦 آخرین سفارش‌ها", callback_data="admin_orders", style="primary")],
-        [InlineKeyboardButton("🏷️ مدیریت کدهای تخفیف", callback_data="admin_coupons", style="primary")],
-        [InlineKeyboardButton(f"⌨️ تغییر به کیبورد معمولی{' ✅' if current_mode == MENU_TYPE_KEYBOARD else ''}", callback_data="admin_menu_set_keyboard", style="primary")],
-        [InlineKeyboardButton(f"💎 تغییر به شیشه‌ای{' ✅' if current_mode == MENU_TYPE_INLINE else ''}", callback_data="admin_menu_set_inline", style="primary")],
+        [InlineKeyboardButton("📊 آمار فروشگاه", callback_data="admin_stats", style="primary"),
+         InlineKeyboardButton("🛍 محصولات و قیمت‌ها", callback_data="admin_products", style="primary")],
+        [InlineKeyboardButton("📦 آخرین سفارش‌ها", callback_data="admin_orders", style="primary"),
+         InlineKeyboardButton("🏷️ مدیریت کدهای تخفیف", callback_data="admin_coupons", style="primary")],
+        [InlineKeyboardButton(f"⌨️ تغییر به کیبورد معمولی{' ✅' if current_mode == MENU_TYPE_KEYBOARD else ''}", callback_data="admin_menu_set_keyboard", style="success"),
+         InlineKeyboardButton(f"💎 تغییر به شیشه‌ای{' ✅' if current_mode == MENU_TYPE_INLINE else ''}", callback_data="admin_menu_set_inline", style="success")],
         [InlineKeyboardButton("📝 ویرایش متن‌ها و دکمه‌ها", callback_data="uiadm_home", style="primary")],
         [InlineKeyboardButton("🏠 منوی اصلی", callback_data="home", style="primary")],
     ])
@@ -1537,7 +1912,7 @@ def build_stars_menu():
         buttons.append([InlineKeyboardButton(
             f"🎁 {persian_digits(amount)} استارز",
             callback_data=f"stars_pack_{amount}",
-            style="primary" if len(buttons) % 2 == 0 else "success",
+            style="success",
         )])
     buttons.append([InlineKeyboardButton(
         "✏️ استارز به مقدار دلخواه", callback_data="stars_custom", style="success"
@@ -1654,7 +2029,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         elif result is False:
             await query.edit_message_text(
-                "🔒 برای استفاده از خدمات ربات تلگرام، ابتدا عضو کانال زیر شو و سپس «بررسی عضویت» را بزن.",
+                "🔒 برای استفاده از خدمات ربات، ابتدا عضو کانال شو:\nhttps://t.me/SeyedPro_FQA\n\nپس از عضویت، «بررسی عضویت» را بزن.",
                 reply_markup=membership_keyboard(),
             )
         else:
@@ -1731,7 +2106,6 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("دسترسی مجاز نیست.", show_alert=True)
             return
 
-        from ui_config import load as ui_load, save as ui_save
         state = context.user_data
         parts = data.split("_")
         action = data
@@ -3222,12 +3596,12 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             current_mode = get_main_menu_type()
             mode_label = "⌨️ کیبورد معمولی" if current_mode == MENU_TYPE_KEYBOARD else "💎 دکمه‌های شیشه‌ای"
             keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("📊 آمار فروشگاه", callback_data="admin_stats")],
-                [InlineKeyboardButton("🛍 محصولات و قیمت‌ها", callback_data="admin_products")],
-                [InlineKeyboardButton("📦 آخرین سفارش‌ها", callback_data="admin_orders")],
-                [InlineKeyboardButton("🏷️ مدیریت کدهای تخفیف", callback_data="admin_coupons")],
-                [InlineKeyboardButton(f"⌨️ تغییر به کیبورد معمولی{' ✅' if current_mode == MENU_TYPE_KEYBOARD else ''}", callback_data="admin_menu_set_keyboard")],
-                [InlineKeyboardButton(f"💎 تغییر به شیشه‌ای{' ✅' if current_mode == MENU_TYPE_INLINE else ''}", callback_data="admin_menu_set_inline")],
+                [InlineKeyboardButton("📊 آمار فروشگاه", callback_data="admin_stats"),
+                 InlineKeyboardButton("🛍 محصولات و قیمت‌ها", callback_data="admin_products")],
+                [InlineKeyboardButton("📦 آخرین سفارش‌ها", callback_data="admin_orders"),
+                 InlineKeyboardButton("🏷️ مدیریت کدهای تخفیف", callback_data="admin_coupons")],
+                [InlineKeyboardButton(f"⌨️ تغییر به کیبورد معمولی{' ✅' if current_mode == MENU_TYPE_KEYBOARD else ''}", callback_data="admin_menu_set_keyboard"),
+                 InlineKeyboardButton(f"💎 تغییر به شیشه‌ای{' ✅' if current_mode == MENU_TYPE_INLINE else ''}", callback_data="admin_menu_set_inline")],
                 [InlineKeyboardButton("📝 ویرایش متن‌ها و دکمه‌ها", callback_data="uiadm_home")],
                 [InlineKeyboardButton("🏠 منوی اصلی", callback_data="home")],
             ])
@@ -4941,7 +5315,6 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             context.user_data.pop("uiadm_state", None)
             await message.reply_text("عملیات لغو شد.")
             return
-        from ui_config import load as ui_load, save as ui_save
         kind = ui_st.get("kind")
         if kind == "text":
             key = ui_st["key"]
