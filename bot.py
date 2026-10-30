@@ -19,6 +19,18 @@ from telegram import (
     KeyboardButton,
     BotCommand,
 )
+try:
+    from telegram import LabeledPrice
+except ImportError:
+    LabeledPrice = None
+try:
+    from telegram import CopyTextButton
+except ImportError:
+    CopyTextButton = None
+try:
+    from telegram.ext import PreCheckoutQueryHandler
+except ImportError:
+    PreCheckoutQueryHandler = None
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -717,8 +729,16 @@ def product_details_prompt(product):
     category = str(product["category"] or "").lower()
     if category == "boost":
         return "🚀 لطفاً لینک گروه یا کانالی را که می‌خواهید بوست شود ارسال کنید.\n\nلینک عمومی یا لینک دعوت خصوصی قابل قبول است."
-    if category in ("premium", "stars", "gifts"):
-        title = {"premium": "پرمیوم", "stars": "استارز", "gifts": "گیفت"}[category]
+    if category == "gifts":
+        return (
+            "🎁 اطلاعات گیرندهٔ گیفت را در یک پیام بفرست:\n\n"
+            "ID عددی گیرنده: 123456789\n"
+            "آیدی تلگرام گیرنده: @username یا ندارم\n\n"
+            "اگر برای خودت خرید می‌کنی، ID عددی و آیدی خودت را در قسمت گیرنده هم وارد کن.\n"
+            "ID عددی برای بررسی و ارسال رسمی لازم است؛ آیدی @ اختیاری است."
+        )
+    if category in ("premium", "stars"):
+        title = {"premium": "پرمیوم", "stars": "استارز"}[category]
         return f"👈 لطفاً آیدی اکانتی که می‌خواهید {title} برای آن تهیه کنید را ارسال کنید.\n• مثال: @SeyedPro_AIA"
     return "لطفاً اطلاعات موردنیاز سفارش را برای پشتیبانی ارسال کنید."
 
@@ -1187,6 +1207,7 @@ def init_db():
             con.execute("INSERT INTO app_settings(key, value) VALUES ('product_sort_order_backfill_v1', 'done') ON CONFLICT(key) DO UPDATE SET value='done'")
 
     with db() as con:
+        ensure_gift_support_schema(con)
         con.execute("CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_products_category_active ON products(category, active)")
@@ -1219,6 +1240,1043 @@ def init_db():
     apply_main_menu_redesign_v3_once()
     apply_main_menu_redesign_v4_once()
     apply_services_menu_design_once()
+
+
+# ==========================================
+# Gift catalog, gift orders and persistent support tickets
+# Additive module embedded in bot.py (keeps the existing shop.db intact).
+# ==========================================
+
+GIFT_SETTINGS_KEY = "gift_management_settings_v1"
+GIFT_DEFAULT_SETTINGS = {
+    "base_star_rate_toman": 1000,
+    "profit_percent": 20,
+    "auto_rate_enabled": False,
+    "usd_per_star_override": "",
+    "usd_toman_manual": 0,
+    "manual_delivery_all": False,
+    "customer_delivery_choice": False,
+    "support_first": False,
+    "support_text": "📩 برای هماهنگی تحویل سفارش، لطفاً یک پیام کوتاه برای پشتیبانی بفرست. این پیام به‌تنهایی تأیید پرداخت یا تحویل سفارش نیست.",
+    "catalog_last_sync": "",
+    "catalog_last_error": "",
+}
+
+
+def ensure_gift_support_schema(con):
+    """Safe, additive schema migrations; never drop or recreate existing shop data."""
+    product_columns = {r[1] for r in con.execute("PRAGMA table_info(products)").fetchall()}
+    product_migrations = {
+        "source_type": "TEXT NOT NULL DEFAULT 'manual'",
+        "telegram_gift_id": "TEXT NOT NULL DEFAULT ''",
+        "star_count": "INTEGER",
+        "catalog_available": "INTEGER NOT NULL DEFAULT 0",
+        "custom_link": "TEXT NOT NULL DEFAULT ''",
+        "delivery_mode": "TEXT NOT NULL DEFAULT 'manual'",
+    }
+    for name, ddl in product_migrations.items():
+        if name not in product_columns:
+            con.execute(f"ALTER TABLE products ADD COLUMN {name} {ddl}")
+
+    order_columns = {r[1] for r in con.execute("PRAGMA table_info(orders)").fetchall()}
+    order_migrations = {
+        "buyer_username": "TEXT NOT NULL DEFAULT ''",
+        "buyer_full_name": "TEXT NOT NULL DEFAULT ''",
+        "recipient_user_id": "INTEGER",
+        "recipient_username": "TEXT NOT NULL DEFAULT ''",
+        "product_name_snapshot": "TEXT NOT NULL DEFAULT ''",
+        "gift_id": "TEXT NOT NULL DEFAULT ''",
+        "delivery_mode": "TEXT NOT NULL DEFAULT 'manual'",
+        "order_code": "TEXT NOT NULL DEFAULT ''",
+        "payment_verified_at": "TEXT",
+        "delivered_at": "TEXT",
+        "delivery_error": "TEXT NOT NULL DEFAULT ''",
+    }
+    for name, ddl in order_migrations.items():
+        if name not in order_columns:
+            con.execute(f"ALTER TABLE orders ADD COLUMN {name} {ddl}")
+
+    con.execute("CREATE INDEX IF NOT EXISTS idx_orders_recipient_id ON orders(recipient_user_id)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_orders_order_code ON orders(order_code)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_products_gift_id ON products(telegram_gift_id)")
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS support_tickets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticket_code TEXT NOT NULL UNIQUE,
+            sender_user_id INTEGER NOT NULL,
+            sender_username TEXT NOT NULL DEFAULT '',
+            sender_full_name TEXT NOT NULL DEFAULT '',
+            buyer_user_id INTEGER NOT NULL,
+            buyer_username TEXT NOT NULL DEFAULT '',
+            recipient_user_id INTEGER,
+            recipient_username TEXT NOT NULL DEFAULT '',
+            product_name TEXT NOT NULL DEFAULT '',
+            order_code TEXT NOT NULL DEFAULT '',
+            order_id INTEGER,
+            message_text TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'جدید',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            admin_replied_at TEXT,
+            last_admin_id INTEGER,
+            FOREIGN KEY(order_id) REFERENCES orders(id)
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS support_ticket_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticket_id INTEGER NOT NULL,
+            sender_user_id INTEGER NOT NULL,
+            sender_role TEXT NOT NULL,
+            message_text TEXT NOT NULL DEFAULT '',
+            telegram_file_id TEXT NOT NULL DEFAULT '',
+            media_type TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(ticket_id) REFERENCES support_tickets(id)
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS support_form_sessions (
+            user_id INTEGER PRIMARY KEY,
+            started_at TEXT NOT NULL
+        )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_support_tickets_sender ON support_tickets(sender_user_id)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_support_tickets_buyer ON support_tickets(buyer_user_id)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_support_tickets_recipient ON support_tickets(recipient_user_id)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_support_tickets_status ON support_tickets(status)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_support_messages_ticket ON support_ticket_messages(ticket_id, id)")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS support_active_tickets (
+            user_id INTEGER PRIMARY KEY,
+            ticket_id INTEGER NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(ticket_id) REFERENCES support_tickets(id)
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS order_status_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER NOT NULL,
+            actor_user_id INTEGER,
+            event_key TEXT NOT NULL,
+            status_text TEXT NOT NULL,
+            details TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(order_id) REFERENCES orders(id)
+        )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_order_history_order ON order_status_history(order_id,id)")
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS gift_star_topups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            payload TEXT NOT NULL UNIQUE,
+            admin_user_id INTEGER NOT NULL,
+            amount INTEGER NOT NULL,
+            currency TEXT NOT NULL DEFAULT 'XTR',
+            status TEXT NOT NULL DEFAULT 'pending',
+            telegram_charge_id TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            paid_at TEXT
+        )
+    """)
+    con.execute("INSERT OR IGNORE INTO app_settings(key, value) VALUES (?, ?)",
+                (GIFT_SETTINGS_KEY, json.dumps(GIFT_DEFAULT_SETTINGS, ensure_ascii=False)))
+
+
+def load_gift_settings():
+    cfg = dict(GIFT_DEFAULT_SETTINGS)
+    try:
+        with db() as con:
+            row = con.execute("SELECT value FROM app_settings WHERE key=?", (GIFT_SETTINGS_KEY,)).fetchone()
+        if row:
+            saved = json.loads(row["value"] or "{}")
+            if isinstance(saved, dict):
+                cfg.update(saved)
+    except Exception:
+        logger.exception("Could not load gift management settings")
+    try:
+        cfg["base_star_rate_toman"] = max(1, int(cfg.get("base_star_rate_toman", 1000)))
+    except (TypeError, ValueError):
+        cfg["base_star_rate_toman"] = 1000
+    try:
+        cfg["profit_percent"] = max(0, min(1000, int(cfg.get("profit_percent", 20))))
+    except (TypeError, ValueError):
+        cfg["profit_percent"] = 20
+    try:
+        cfg["usd_toman_manual"] = max(0, int(cfg.get("usd_toman_manual", 0)))
+    except (TypeError, ValueError):
+        cfg["usd_toman_manual"] = 0
+    for key in ("auto_rate_enabled", "manual_delivery_all", "customer_delivery_choice", "support_first"):
+        cfg[key] = bool(cfg.get(key))
+    cfg["usd_per_star_override"] = str(cfg.get("usd_per_star_override") or "").strip()
+    cfg["support_text"] = str(cfg.get("support_text") or GIFT_DEFAULT_SETTINGS["support_text"])
+    return cfg
+
+
+def save_gift_settings(cfg):
+    current = load_gift_settings()
+    current.update(cfg or {})
+    with db() as con:
+        con.execute(
+            "INSERT INTO app_settings(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (GIFT_SETTINGS_KEY, json.dumps(current, ensure_ascii=False)),
+        )
+    return load_gift_settings()
+
+
+def iran_timestamp_now():
+    return utc_now().isoformat(timespec="seconds")
+
+
+def log_order_event(con, order_id, event_key, status_text, details="", actor_user_id=None):
+    con.execute(
+        "INSERT INTO order_status_history(order_id,actor_user_id,event_key,status_text,details,created_at) VALUES(?,?,?,?,?,?)",
+        (int(order_id), actor_user_id, str(event_key), str(status_text), str(details or ""), iran_timestamp_now()),
+    )
+
+
+def format_iran_jalali_datetime(value):
+    """Display stored UTC/ISO or SQLite timestamps in Jalali date + Asia/Tehran clock."""
+    if not value:
+        return "ثبت نشده"
+    try:
+        raw = str(value).strip().replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(raw)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        local = parsed.astimezone(IRAN_TZ)
+        jy, jm, jd = gregorian_to_jalali(local.year, local.month, local.day)
+        return f"{persian_digits(f'{jy:04d}/{jm:02d}/{jd:02d}')} | {persian_digits(local.strftime('%H:%M:%S'))} ایران"
+    except Exception:
+        logger.warning("Could not format stored timestamp: %r", value, exc_info=True)
+        return "زمان نامشخص"
+
+
+def normalize_optional_username(value):
+    value = str(value or "").strip()
+    if value.lower() in {"ندارم", "ندارد", "ثبت نشده", "خالی", "-", "none", "no", "ندارم."}:
+        return ""
+    if value.startswith("https://t.me/"):
+        value = "@" + value.rsplit("/", 1)[-1]
+    if value and not value.startswith("@"):
+        value = "@" + value
+    if value and not re.fullmatch(r"@[A-Za-z0-9_]{5,32}", value):
+        return None
+    return value
+
+
+def gift_base_unit_price(settings=None):
+    settings = settings or load_gift_settings()
+    if not settings.get("auto_rate_enabled"):
+        return Decimal(int(settings.get("base_star_rate_toman") or 1000))
+    auto_cfg = load_auto_pricing_config()
+    usd_value = settings.get("usd_per_star_override") or (auto_cfg.get("catalog_prices") or {}).get("stars_price_per_star_usd")
+    fx_value = settings.get("usd_toman_manual") or (auto_cfg.get("fx_rate_toman") if auto_cfg.get("fx_valid") and _pricing_timestamp_fresh(auto_cfg.get("fx_source_updated_at")) else "")
+    usd = _pricing_decimal(usd_value)
+    fx = _pricing_decimal(fx_value)
+    if usd is None or fx is None or usd <= 0 or fx <= 0:
+        return None
+    # A public quote is usable only while the catalog is valid and fresh.
+    if not settings.get("usd_per_star_override"):
+        if not (auto_cfg.get("catalog_valid") and _pricing_timestamp_fresh(auto_cfg.get("catalog_updated_at"))):
+            return None
+    if not settings.get("usd_toman_manual"):
+        if not (auto_cfg.get("fx_valid") and _pricing_timestamp_fresh(auto_cfg.get("fx_source_updated_at"))):
+            return None
+    return usd * fx
+
+
+def gift_unit_sale_price(settings=None):
+    settings = settings or load_gift_settings()
+    unit = gift_base_unit_price(settings)
+    if unit is None:
+        return None
+    return (unit * (Decimal(100 + int(settings.get("profit_percent", 20))) / Decimal(100))).quantize(Decimal("1"), rounding=ROUND_CEILING)
+
+
+def gift_price_for_stars(star_count, settings=None):
+    unit = gift_unit_sale_price(settings)
+    if unit is None:
+        return None
+    try:
+        amount = int(star_count)
+    except (TypeError, ValueError):
+        return None
+    if amount <= 0:
+        return None
+    return int((unit * amount).quantize(Decimal("1"), rounding=ROUND_CEILING))
+
+
+def sync_gift_prices_in_db():
+    settings = load_gift_settings()
+    unit_price = gift_unit_sale_price(settings)
+    if unit_price is None:
+        return 0
+    changed = 0
+    with db() as con:
+        rows = con.execute("SELECT id, star_count FROM products WHERE lower(category)='gifts' AND source_type='official' AND star_count>0").fetchall()
+        for row in rows:
+            price = gift_price_for_stars(row["star_count"], settings)
+            if price is not None:
+                con.execute("UPDATE products SET price=?, currency='تومان' WHERE id=?", (price, row["id"]))
+                changed += 1
+    return changed
+
+
+def _extract_api_object_value(obj, key, default=None):
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+async def telegram_bot_api_call(bot, method_name, **params):
+    """Prefer PTB's typed methods; use its authenticated API transport as fallback."""
+    method_map = {
+        "getAvailableGifts": "get_available_gifts",
+        "getMyStarBalance": "get_my_star_balance",
+        "sendGift": "send_gift",
+    }
+    method = getattr(bot, method_map.get(method_name, ""), None)
+    if callable(method):
+        return await method(**params)
+    post = getattr(bot, "_post", None)
+    if callable(post):
+        return await post(method_name, data=params or {})
+    raise RuntimeError(f"روش {method_name} در نسخهٔ کتابخانهٔ تلگرام در دسترس نیست.")
+
+
+async def get_real_bot_star_balance(bot):
+    result = await telegram_bot_api_call(bot, "getMyStarBalance")
+    amount = _extract_api_object_value(result, "amount")
+    if amount is None and isinstance(result, dict):
+        amount = result.get("amount")
+    if amount is None:
+        raise RuntimeError("پاسخ تلگرام فیلد موجودی Stars ندارد.")
+    return int(amount)
+
+
+def gift_admin_home_text(catalog_count, active_count, balance_text, note=""):
+    settings = load_gift_settings()
+    unit = gift_unit_sale_price(settings)
+    unit_text = f"{toman(unit)} تومان" if unit is not None else "در دسترس نیست؛ منبع خودکار را بررسی کن"
+    auto_text = "روشن" if settings["auto_rate_enabled"] else "خاموش"
+    manual_text = "روشن" if settings["manual_delivery_all"] else "خاموش"
+    customer_text = "روشن" if settings["customer_delivery_choice"] else "خاموش"
+    support_text = "روشن" if settings["support_first"] else "خاموش"
+    updated = format_iran_jalali_datetime(settings.get("catalog_last_sync")) if settings.get("catalog_last_sync") else "هنوز همگام‌سازی نشده"
+    lines = [
+        "🎁 مدیریت گیفت تلگرام | SEYED PREMIUM",
+        "━━━━━━━━━━━━━━━━━━",
+        f"📚 تعداد گیفت‌های شناسایی‌شده: {catalog_count}",
+        f"✅ گیفت‌های فعال برای فروش: {active_count}",
+        f"💰 نرخ پایه هر ⭐: {toman(settings['base_star_rate_toman'])} تومان",
+        f"📈 درصد سود: {settings['profit_percent']}٪",
+        f"💵 قیمت نهایی هر ⭐: {unit_text}",
+        f"🔄 نرخ خودکار: {auto_text}",
+        f"✋ تحویل دستی همه: {manual_text}",
+        f"🧑‍💻 انتخاب روش ارسال توسط مشتری: {customer_text}",
+        f"📩 پیام به پشتیبانی قبل از تحویل: {support_text}",
+        f"⭐ موجودی واقعی Stars ربات: {balance_text}",
+        f"🕒 آخرین همگام‌سازی کاتالوگ: {updated}",
+        "",
+        "قیمت‌ها و موجودی فقط پس از دریافت پاسخ واقعی از منبع مربوط نمایش داده می‌شوند.",
+    ]
+    if settings.get("catalog_last_error"):
+        lines.extend(["", "⚠️ آخرین خطای کاتالوگ: " + str(settings["catalog_last_error"])[:250]])
+    if note:
+        lines.extend(["", note])
+    return "\n".join(lines)
+
+
+def gift_admin_home_keyboard():
+    settings = load_gift_settings()
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 به‌روزرسانی فهرست از تلگرام", callback_data="gift_sync", style="success")],
+        [InlineKeyboardButton("⚙️ مدیریت گیفت‌ها (فعال/غیرفعال)", callback_data="gift_catalog_page_1", style="primary")],
+        [InlineKeyboardButton(f"🔵 حالت تحویل دستی همه: {'روشن' if settings['manual_delivery_all'] else 'خاموش'}", callback_data="gift_global_manual", style="primary")],
+        [InlineKeyboardButton("🟢 افزودن گیفت سفارشی (با لینک)", callback_data="gift_custom_add", style="success")],
+        [InlineKeyboardButton("🟢 افزایش موجودی استارز ربات (مشترک خدمات)", callback_data="gift_star_topup", style="success")],
+        [InlineKeyboardButton("🔵 انتخاب روش ارسال توسط مشتری: " + ("روشن" if settings['customer_delivery_choice'] else "خاموش"), callback_data="gift_customer_choice", style="primary")],
+        [InlineKeyboardButton("✋ مدیریت روش تحویل تک‌تک گیفت‌ها", callback_data="gift_delivery_page_1", style="primary")],
+        [InlineKeyboardButton(f"💰 نرخ پایه (هر ⭐ = {toman(settings['base_star_rate_toman'])} تومان)", callback_data="gift_base_rate", style="primary")],
+        [InlineKeyboardButton("🔵 نرخ خودکار: " + ("روشن" if settings['auto_rate_enabled'] else "خاموش"), callback_data="gift_auto_rate", style="primary")],
+        [InlineKeyboardButton(f"📈 درصد سود ({settings['profit_percent']}٪)", callback_data="gift_profit", style="primary")],
+        [InlineKeyboardButton("⚙️ قیمت پایه / نرخ دلار", callback_data="gift_usd_settings", style="primary")],
+        [InlineKeyboardButton("📩 «اول به پشتیبانی پیام بده»: " + ("روشن" if settings['support_first'] else "خاموش"), callback_data="gift_support_first", style="primary")],
+        [InlineKeyboardButton("📝 متن پیام «اول به پشتیبانی پیام بده»", callback_data="gift_support_text", style="primary")],
+        [InlineKeyboardButton("📋 سفارش‌های گیفت", callback_data="gift_orders", style="primary")],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data="admin", style="danger")],
+    ])
+
+
+def _gift_list_query(con):
+    return con.execute(
+        "SELECT id, name, price, active, currency, telegram_gift_id, star_count, source_type, delivery_mode, custom_link, catalog_available "
+        "FROM products WHERE lower(category)='gifts' AND (source_type='custom' OR catalog_available=1 OR telegram_gift_id!='' OR star_count IS NOT NULL OR (source_type='manual' AND name NOT IN ('🎁 گیفت تلگرام','گیفت تلگرام'))) ORDER BY COALESCE(sort_order,0), id"
+    ).fetchall()
+
+
+def gift_catalog_page_text_and_markup(page=1, delivery=False):
+    page = max(1, int(page))
+    with db() as con:
+        rows = _gift_list_query(con)
+    per_page = 8
+    total_pages = max(1, (len(rows) + per_page - 1) // per_page)
+    page = min(page, total_pages)
+    visible = rows[(page - 1) * per_page: page * per_page]
+    title = "✋ روش تحویل هر گیفت" if delivery else "⚙️ مدیریت گیفت‌ها"
+    lines = [f"{title} | صفحه {page} از {total_pages}", "━━━━━━━━━━━━━━━━━━"]
+    buttons = []
+    for row in visible:
+        stars = int(row["star_count"] or 0)
+        price = int(row["price"] or 0)
+        state = "✅ فعال" if int(row["active"] or 0) else "❌ غیرفعال"
+        name = str(row["name"] or "گیفت")
+        delivery_mode = str(row["delivery_mode"] or "manual")
+        delivery_label = "✋ دستی" if delivery_mode != "auto" else "⚡ خودکار"
+        source = "NFT/سفارشی" if row["source_type"] == "custom" else ("کاتالوگ تلگرام" if row["source_type"] == "official" else "محصول دستی")
+        lines.append(f"\n{state} | {name}\n⭐ {stars if stars else '—'} | 💰 {toman(price)} {row['currency'] or 'تومان'}\nمنبع: {source} | روش تحویل: {delivery_label}")
+        if delivery:
+            allow_auto = row["source_type"] == "official" and bool(row["telegram_gift_id"])
+            if allow_auto:
+                buttons.append([InlineKeyboardButton(f"{name[:28]} | {'⚡ خودکار' if delivery_mode != 'auto' else '✋ دستی'}", callback_data=f"gift_delivery_toggle_{row['id']}")])
+            else:
+                buttons.append([InlineKeyboardButton(f"{name[:28]} | فقط تحویل دستی", callback_data=f"gift_delivery_manual_{row['id']}")])
+        else:
+            buttons.append([InlineKeyboardButton(f"{name[:30]} | {'فعال ✅' if row['active'] else 'فعال‌سازی 🟢'}", callback_data=f"gift_toggle_{row['id']}")])
+    if not rows:
+        lines.append("\nهنوز گیفتی در کاتالوگ ثبت نشده است. ابتدا فهرست را از تلگرام به‌روزرسانی کن.")
+    nav = []
+    if page > 1:
+        nav.append(InlineKeyboardButton("⬅️ قبلی", callback_data=f"{'gift_delivery_page' if delivery else 'gift_catalog_page'}_{page-1}"))
+    if page < total_pages:
+        nav.append(InlineKeyboardButton("بعدی ➡️", callback_data=f"{'gift_delivery_page' if delivery else 'gift_catalog_page'}_{page+1}"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton("🔙 بازگشت به مدیریت گیفت", callback_data="gift_admin_home")])
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
+async def sync_official_gift_catalog(bot):
+    """Pull the official Telegram catalogue; preserve admin settings for existing gift rows."""
+    result = await telegram_bot_api_call(bot, "getAvailableGifts")
+    gifts = _extract_api_object_value(result, "gifts", []) or []
+    if not isinstance(gifts, (list, tuple)):
+        raise RuntimeError("ساختار کاتالوگ تلگرام معتبر نیست.")
+    parsed = []
+    for gift in gifts:
+        gift_id = str(_extract_api_object_value(gift, "id", "") or "").strip()
+        star_count = _extract_api_object_value(gift, "star_count")
+        sticker = _extract_api_object_value(gift, "sticker")
+        emoji = str(_extract_api_object_value(sticker, "emoji", "🎁") or "🎁")
+        if not gift_id or not str(star_count or "").isdigit() or int(star_count) <= 0:
+            continue
+        name = f"{emoji} گیفت رسمی تلگرام — {int(star_count)} ⭐"
+        parsed.append((gift_id, int(star_count), emoji, name))
+    if not parsed:
+        raise RuntimeError("تلگرام کاتالوگ خالی یا فاقد شناسه/قیمت معتبر برگرداند؛ فهرست قبلی حفظ شد.")
+    settings = load_gift_settings()
+    with db() as con:
+        existing_ids = set(str(r[0]) for r in con.execute("SELECT telegram_gift_id FROM products WHERE category='gifts' AND telegram_gift_id!=''").fetchall())
+        for gift_id, star_count, emoji, name in parsed:
+            old = con.execute("SELECT id FROM products WHERE category='gifts' AND telegram_gift_id=? LIMIT 1", (gift_id,)).fetchone()
+            price = gift_price_for_stars(star_count, settings) or 0
+            if old:
+                # Name and Star count track Telegram; admin activation, delivery mode and ordering survive refresh.
+                con.execute("UPDATE products SET name=?, star_count=?, price=?, currency='تومان', catalog_available=1, source_type='official', icon=? WHERE id=?",
+                            (name, star_count, price, emoji, old["id"]))
+            else:
+                next_sort = con.execute("SELECT COALESCE(MAX(sort_order),0)+10 FROM products WHERE category='gifts'").fetchone()[0]
+                con.execute(
+                    "INSERT INTO products(category,name,price,active,button_text,icon,button_style,sort_order,description,currency,source_type,telegram_gift_id,star_count,catalog_available,delivery_mode) "
+                    "VALUES('gifts',?,?,0,?,?,?,?,?,'تومان','official',?,?,1,'manual')",
+                    (name, price, name, emoji, "success", next_sort, f"گیفت رسمی تلگرام؛ هزینهٔ ارسال {star_count} Stars.", gift_id, star_count),
+                )
+        current_ids = [item[0] for item in parsed]
+        if current_ids:
+            placeholders = ",".join("?" for _ in current_ids)
+            con.execute(f"UPDATE products SET catalog_available=0 WHERE category='gifts' AND source_type='official' AND telegram_gift_id NOT IN ({placeholders})", current_ids)
+    settings["catalog_last_sync"] = iran_timestamp_now()
+    settings["catalog_last_error"] = ""
+    save_gift_settings(settings)
+    return len(parsed)
+
+
+def parse_support_form(text_value):
+    """Parse the one-click copied Persian support template, tolerating Persian digits."""
+    raw = str(text_value or "").strip()
+    norm = normalize_ascii_digits(raw)
+    def field(*labels):
+        for line in norm.splitlines():
+            line_clean = line.strip()
+            for label in labels:
+                if line_clean.lower().startswith(label.lower()):
+                    return line_clean[len(label):].lstrip(" :：\t").strip()
+        return ""
+    buyer_id = field("ID عددی خریدار", "آیدی عددی خریدار", "ID خریدار")
+    recipient_id = field("ID عددی گیرنده", "آیدی عددی گیرنده", "ID گیرنده")
+    buyer_username = field("آیدی تلگرام خریدار", "آیدی خریدار")
+    recipient_username = field("آیدی تلگرام گیرنده", "آیدی گیرنده")
+    product_name = field("نام کامل محصول", "نام محصول", "محصول")
+    order_code = field("کد سفارش", "شماره سفارش")
+    message_lines = []
+    active = False
+    for line in norm.splitlines():
+        clean = line.strip()
+        if ("متن پیام شما به پشتیبانی" in clean) or ("پیام شما به پشتیبانی" in clean) or clean.startswith("پیام شما"):
+            active = True
+            tail = clean.split(":", 1)[1].strip() if ":" in clean else ""
+            if tail and tail.lower() not in {"وارد کنید", "اینجا بنویسید", "سلام"}:
+                message_lines.append(tail)
+            continue
+        if active:
+            if clean.startswith("👇 پیام خودت را در خط بعد بنویس"):
+                continue
+            message_lines.append(line.rstrip())
+    message_text = "\n".join(message_lines).strip()
+    placeholders = {"وارد کنید", "نام دقیق محصول، نوع و مقدار", "نام دقیق محصول، نوع و مقدار را بنویس", "@username", "@username یا ندارم", "@username/ندارم", "سلام، متن پیام خود را اینجا بنویسید.", "سلام، متن پیام را اینجا بنویس", "متن پیام خود را اینجا بنویسید", "ندارم"}
+    if buyer_username in placeholders:
+        buyer_username = ""
+    if recipient_username in placeholders:
+        recipient_username = ""
+    if product_name in placeholders:
+        product_name = ""
+    if order_code in {"وارد کنید", "وارد کنید / ندارم", "ندارم", ""} or order_code.startswith("وارد کنید"):
+        order_code = ""
+    return {
+        "buyer_id_entered": buyer_id,
+        "buyer_username_entered": buyer_username,
+        "recipient_id": recipient_id,
+        "recipient_username": recipient_username,
+        "product_name": product_name,
+        "order_code": order_code,
+        "message_text": message_text,
+    }
+
+
+def support_form_text(user):
+    username = f"@{user.username}" if getattr(user, "username", None) else "ندارم"
+    return (
+        "💎 پشتیبانی SEYED PREMIUM\n\n"
+        "برای بررسی سریع‌تر، متن زیر را کپی کن، قسمت‌های خالی را تکمیل کن و همین‌جا بفرست.\n\n"
+        "👤 اطلاعات خریدار\n"
+        f"ID عددی خریدار {user.id}\n"
+        f"آیدی تلگرام خریدار {username}\n\n"
+        "🎁 اطلاعات گیرنده\n"
+        "ID عددی گیرنده وارد کنید\n"
+        "آیدی تلگرام گیرنده @username یا ندارم\n\n"
+        "📦 اطلاعات سفارش\n"
+        "نام کامل محصول نام دقیق محصول، نوع و مقدار را بنویس\n"
+        "کد سفارش وارد کنید / ندارم\n\n"
+        "💬 پیام شما به پشتیبانی\n"
+        "👇 پیام خودت را در خط بعد بنویس\n"
+        "سلام، متن پیام خود را اینجا بنویس\n\n"
+        "نکته: اگر خریدار و گیرنده یک نفر هستند، ID و آیدی همان حساب را در بخش گیرنده هم وارد کن."
+    )
+
+
+def support_form_copy_text(user):
+    username = f"@{user.username}" if getattr(user, "username", None) else "ندارم"
+    return (
+        f"ID عددی خریدار {user.id}\n"
+        f"آیدی تلگرام خریدار {username}\n"
+        "ID عددی گیرنده وارد کنید\n"
+        "آیدی تلگرام گیرنده @username/ندارم\n"
+        "نام کامل محصول وارد کنید\n"
+        "کد سفارش وارد کنید / ندارم\n"
+        "متن پیام شما به پشتیبانی\n"
+        "سلام، متن پیام را اینجا بنویس"
+    )
+
+
+def support_form_markup(copy_text):
+    buttons = []
+    try:
+        if CopyTextButton is not None and len(copy_text) <= 256:
+            buttons.append([InlineKeyboardButton("📋 کپی سریع فرم", copy_text=CopyTextButton(text=copy_text))])
+    except Exception:
+        logger.warning("Copy-text button not available in this PTB version", exc_info=True)
+    buttons.append([InlineKeyboardButton("❌ لغو عملیات", callback_data="support_cancel", style="danger")])
+    buttons.append([InlineKeyboardButton("🏠 منوی اصلی", callback_data="home", style="primary")])
+    return InlineKeyboardMarkup(buttons)
+
+
+async def create_support_ticket(update, context, parsed):
+    user = update.effective_user
+    message = update.effective_message
+    if not user or not message:
+        return False
+    buyer_entered = normalize_ascii_digits(parsed.get("buyer_id_entered", ""))
+    # The actual Telegram sender ID is authoritative and cannot be overwritten by copied text.
+    recipient_id_raw = normalize_ascii_digits(parsed.get("recipient_id", "")).strip()
+    recipient_id = int(recipient_id_raw) if re.fullmatch(r"\d{5,20}", recipient_id_raw) else None
+    recipient_username = normalize_optional_username(parsed.get("recipient_username", ""))
+    if recipient_username is None:
+        await message.reply_text("❌ آیدی تلگرام گیرنده معتبر نیست. آن را به شکل @username وارد کن یا بنویس ندارم.")
+        return True
+    product_name = str(parsed.get("product_name") or "").strip()
+    order_code = str(parsed.get("order_code") or "").strip()
+    message_text = str(parsed.get("message_text") or "").strip()
+    if not re.fullmatch(r"\d{5,20}", buyer_entered):
+        await message.reply_text("❌ ID عددی خریدار باید عددی باشد. برای شروع دوباره دکمه پشتیبانی را بزن.")
+        return True
+    if int(buyer_entered) != int(user.id):
+        await message.reply_text("⚠️ ID خریدار باید همان ID عددی حسابی باشد که اکنون با آن به ربات پیام می‌دهی. فرم را با ID واقعی خودت تکمیل کن.")
+        return True
+    if not recipient_id:
+        await message.reply_text("❌ ID عددی گیرنده را درست وارد کن. اگر خرید برای خودت است، ID عددی خودت را در بخش گیرنده هم وارد کن.")
+        return True
+    if not product_name or len(product_name) < 2 or product_name.lower() in {"وارد کنید", "نام دقیق محصول، نوع و مقدار"}:
+        await message.reply_text("❌ نام کامل محصول را وارد کن؛ مثلاً «گیفت رسمی تلگرام — 25 Stars».")
+        return True
+    if (not message_text or len(message_text) < 2
+            or "متن پیام خود را اینجا بنویسید" in message_text
+            or "متن پیام را اینجا بنویسید" in message_text):
+        await message.reply_text("❌ متن پیام خودت را در قسمت «پیام شما به پشتیبانی» بنویس و فرم را دوباره بفرست.")
+        return True
+    if len(order_code) > 64:
+        await message.reply_text("❌ کد سفارش بیش از حد طولانی است.")
+        return True
+
+    order_id = None
+    order_row = None
+    with db() as con:
+        if order_code:
+            clean_code = order_code.strip().upper().replace("#", "")
+            order_row = con.execute(
+                "SELECT o.*, p.name AS joined_product_name FROM orders o LEFT JOIN products p ON p.id=o.product_id "
+                "WHERE UPPER(o.order_code)=? OR CAST(o.id AS TEXT)=? ORDER BY o.id DESC LIMIT 1",
+                (clean_code, clean_code),
+            ).fetchone()
+            if order_row and int(order_row["user_id"]) != int(user.id):
+                order_row = None
+        if not order_row:
+            order_row = con.execute(
+                "SELECT o.*, p.name AS joined_product_name FROM orders o LEFT JOIN products p ON p.id=o.product_id "
+                "WHERE (o.user_id=? OR o.recipient_user_id=?) AND (lower(COALESCE(p.name,'')) LIKE lower(?) OR lower(COALESCE(o.product_name_snapshot,'')) LIKE lower(?)) "
+                "ORDER BY o.id DESC LIMIT 1",
+                (user.id, user.id, f"%{product_name[:40]}%", f"%{product_name[:40]}%"),
+            ).fetchone()
+        if order_row:
+            order_id = int(order_row["id"])
+            if not order_code:
+                order_code = str(order_row["order_code"] or f"#{order_id}")
+        created = iran_timestamp_now()
+        cur = con.execute(
+            "INSERT INTO support_tickets(ticket_code,sender_user_id,sender_username,sender_full_name,buyer_user_id,buyer_username,recipient_user_id,recipient_username,product_name,order_code,order_id,message_text,status,created_at,updated_at) "
+            "VALUES('PENDING',?,?,?,?,?,?,?,?,?,?,?,'جدید',?,?)",
+            (user.id, user.username or "", user.full_name or "", user.id, user.username or "", recipient_id,
+             recipient_username or "", product_name, order_code, order_id, message_text, created, created),
+        )
+        ticket_id = int(cur.lastrowid)
+        ticket_code = f"SP-T{ticket_id:06d}"
+        con.execute("UPDATE support_tickets SET ticket_code=? WHERE id=?", (ticket_code, ticket_id))
+        con.execute(
+            "INSERT INTO support_ticket_messages(ticket_id,sender_user_id,sender_role,message_text,created_at) VALUES(?,?, 'customer', ?, ?)",
+            (ticket_id, user.id, message_text, created),
+        )
+        con.execute(
+            "INSERT INTO support_active_tickets(user_id,ticket_id,updated_at) VALUES(?,?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET ticket_id=excluded.ticket_id,updated_at=excluded.updated_at",
+            (user.id, ticket_id, created),
+        )
+    order_info = "سفارش مرتبط پیدا نشد؛ مدیر می‌تواند با ID یا کد سفارش جست‌وجو کند."
+    if order_row:
+        order_info = (
+            f"کد سفارش: {order_row['order_code'] or ('#' + str(order_id))}\n"
+            f"نام محصول ثبت‌شده: {order_row['joined_product_name'] or order_row['product_name_snapshot'] or 'ثبت نشده'}\n"
+            f"زمان واقعی سفارش: {format_iran_jalali_datetime(order_row['created_at'])}\n"
+            f"وضعیت سفارش: {order_row['status']}\n"
+            f"مبلغ ثبت‌شده: {toman(order_row['price'])} {order_row['currency'] or 'تومان'}"
+        )
+    admin_text = (
+        f"📩 تیکت جدید پشتیبانی | {ticket_code}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"👤 فرستندهٔ واقعی (تلگرام): {user.full_name}\n"
+        f"ID عددی فرستنده: {user.id}\n"
+        f"آیدی تلگرام فرستنده: {'@' + user.username if user.username else 'تنظیم نشده'}\n\n"
+        "👤 خریدار\n"
+        f"ID عددی خریدار: {user.id}\n"
+        f"آیدی تلگرام خریدار: {'@' + user.username if user.username else 'تنظیم نشده'}\n\n"
+        "🎁 گیرنده\n"
+        f"ID عددی گیرنده: {recipient_id}\n"
+        f"آیدی تلگرام گیرنده: {recipient_username or 'ثبت نشده'}\n\n"
+        "📦 سفارش\n"
+        f"نام کامل محصول اعلام‌شده: {product_name}\n"
+        f"کد سفارش اعلام‌شده: {order_code or 'ندارد'}\n"
+        f"زمان دریافت تیکت: {format_iran_jalali_datetime(created)}\n"
+        f"{order_info}\n\n"
+        "💬 پیام مشتری\n" + message_text
+    )
+    admin_keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔎 مشاهده پرونده تیکت", callback_data=f"admin_ticket_view_{ticket_id}")],
+        [InlineKeyboardButton("↩️ پاسخ به مشتری", callback_data=f"admin_ticket_reply_{ticket_id}")],
+        [InlineKeyboardButton("📦 بررسی سفارش", callback_data=f"admin_ticket_order_{ticket_id}")],
+    ])
+    try:
+        await context.bot.send_message(chat_id=ADMIN_ID, text=admin_text[:3900], reply_markup=admin_keyboard)
+    except Exception:
+        logger.exception("Support ticket %s saved but admin notification failed", ticket_code)
+        context.user_data.pop("support_form_active", None)
+        with db() as con:
+            con.execute("DELETE FROM support_form_sessions WHERE user_id=?", (user.id,))
+        await message.reply_text(f"⚠️ تیکت {ticket_code} ذخیره شد، اما ارسال اعلان به مدیریت ناموفق بود. مدیر می‌تواند از پنل تیکت‌ها آن را ببیند.")
+        return True
+    await message.reply_text(
+        f"✅ پیام شما با موفقیت ثبت و برای مدیریت ارسال شد.\nشماره پیگیری: {ticket_code}\nوضعیت: در انتظار بررسی",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("💬 ادامه ارسال پیام در همین تیکت", callback_data=f"support_ticket_continue_{ticket_id}")],
+            [InlineKeyboardButton("✅ پایان گفت‌وگو", callback_data="support_ticket_close")],
+            [InlineKeyboardButton("🏠 منوی اصلی", callback_data="home")],
+        ])
+    )
+    context.user_data.pop("support_form_active", None)
+    with db() as con:
+        con.execute("DELETE FROM support_form_sessions WHERE user_id=?", (user.id,))
+    return True
+
+
+def support_message_attachment(message):
+    """Return a Telegram file id and Bot API media type for supported support attachments."""
+    if getattr(message, "photo", None):
+        return message.photo[-1].file_id, "photo"
+    for attr, kind in (("document", "document"), ("video", "video"), ("animation", "animation"),
+                       ("audio", "audio"), ("voice", "voice"), ("video_note", "video_note"),
+                       ("sticker", "sticker")):
+        obj = getattr(message, attr, None)
+        if obj is not None:
+            return obj.file_id, kind
+    return "", ""
+
+
+async def deliver_support_attachment_to_admin(bot, file_id, media_type, caption):
+    """Send a stored customer attachment to the admin chat using its real Telegram file_id."""
+    method = getattr(bot, f"send_{media_type}", None)
+    if not callable(method):
+        raise RuntimeError(f"ارسال نوع پیوست {media_type} در این نسخه در دسترس نیست.")
+    argument_name = {"photo":"photo", "document":"document", "video":"video", "animation":"animation",
+                     "audio":"audio", "voice":"voice", "video_note":"video_note", "sticker":"sticker"}.get(media_type)
+    if not argument_name:
+        raise RuntimeError("نوع پیوست پشتیبانی نمی‌شود.")
+    kwargs = {"chat_id": ADMIN_ID, argument_name: file_id}
+    if media_type not in {"video_note", "sticker"} and caption:
+        kwargs["caption"] = caption[:1000]
+    await method(**kwargs)
+    if media_type in {"video_note", "sticker"} and caption:
+        await bot.send_message(chat_id=ADMIN_ID, text=caption[:3500])
+
+
+async def append_support_customer_message(update, context, ticket_id):
+    """Persist and route a follow-up text/media message to the open customer ticket."""
+    user = update.effective_user
+    message = update.effective_message
+    if not user or not message:
+        return False
+    attachment_id, media_type = support_message_attachment(message)
+    text_value = (message.text or message.caption or "").strip()
+    if not attachment_id and not text_value:
+        await message.reply_text("این نوع پیام در تیکت پشتیبانی پشتیبانی نمی‌شود. متن، عکس، ویدئو یا فایل بفرست.")
+        return True
+    now = iran_timestamp_now()
+    with db() as con:
+        ticket = con.execute("SELECT ticket_code,status FROM support_tickets WHERE id=? AND sender_user_id=?", (ticket_id, user.id)).fetchone()
+        if not ticket or ticket["status"] == "بسته‌شده":
+            con.execute("DELETE FROM support_active_tickets WHERE user_id=?", (user.id,))
+            await message.reply_text("این تیکت بسته شده است. برای درخواست تازه، دوباره دکمه پشتیبانی را بزن.")
+            return True
+        con.execute(
+            "INSERT INTO support_ticket_messages(ticket_id,sender_user_id,sender_role,message_text,telegram_file_id,media_type,created_at) VALUES(?,?,'customer',?,?,?,?)",
+            (ticket_id, user.id, text_value, attachment_id, media_type, now),
+        )
+        con.execute("UPDATE support_tickets SET updated_at=? WHERE id=?", (now, ticket_id))
+    admin_caption = (
+        f"💬 پیام تازه مشتری | {ticket['ticket_code']}\n"
+        f"نام: {user.full_name}\nID فرستنده: {user.id}\n"
+        f"آیدی: {'@'+user.username if user.username else 'تنظیم نشده'}\n"
+        f"زمان ایران: {format_iran_jalali_datetime(now)}\n\n"
+        + (text_value or ("📎 پیوست مشتری" if attachment_id else "پیام بدون متن"))
+    )
+    try:
+        if attachment_id:
+            await deliver_support_attachment_to_admin(context.bot, attachment_id, media_type, admin_caption)
+        else:
+            await context.bot.send_message(chat_id=ADMIN_ID, text=admin_caption[:3900])
+        await message.reply_text(f"✅ پیام به تیکت {ticket['ticket_code']} اضافه و برای مدیریت ارسال شد.")
+    except Exception as exc:
+        logger.exception("Support follow-up saved but admin delivery failed: ticket=%s", ticket["ticket_code"])
+        await message.reply_text("⚠️ پیام در سوابق تیکت ذخیره شد، اما ارسال اعلان به مدیریت ناموفق بود. مدیر می‌تواند از داخل تیکت، پیوست‌ها را دوباره دریافت کند.\n" + str(exc)[:150])
+    return True
+
+
+def support_ticket_detail(con, ticket_id):
+    ticket = con.execute("SELECT * FROM support_tickets WHERE id=?", (ticket_id,)).fetchone()
+    if not ticket:
+        return None
+    order = None
+    if ticket["order_id"]:
+        order = con.execute(
+            "SELECT o.*, p.name AS product_name FROM orders o LEFT JOIN products p ON p.id=o.product_id WHERE o.id=?",
+            (ticket["order_id"],),
+        ).fetchone()
+    messages = con.execute("SELECT * FROM support_ticket_messages WHERE ticket_id=? ORDER BY id", (ticket_id,)).fetchall()
+    lines = [
+        f"📩 پرونده پشتیبانی {ticket['ticket_code']}",
+        f"وضعیت تیکت: {ticket['status']}",
+        f"تاریخ و ساعت دریافت: {format_iran_jalali_datetime(ticket['created_at'])}",
+        "━━━━━━━━━━━━━━━━━━",
+        "👤 خریدار",
+        f"نام نمایشی: {ticket['sender_full_name'] or 'ثبت نشده'}",
+        f"ID عددی: {ticket['buyer_user_id']}",
+        f"آیدی تلگرام: @{ticket['buyer_username']}" if ticket['buyer_username'] else "آیدی تلگرام: تنظیم نشده",
+        "🎁 گیرنده",
+        f"ID عددی: {ticket['recipient_user_id'] or 'ثبت نشده'}",
+        f"آیدی تلگرام: {ticket['recipient_username'] or 'ثبت نشده'}",
+        "📦 سفارش اعلام‌شده",
+        f"نام کامل محصول: {ticket['product_name'] or 'ثبت نشده'}",
+        f"کد سفارش: {ticket['order_code'] or 'ثبت نشده'}",
+    ]
+    if order:
+        lines.extend([
+            "", "📄 سفارش واقعی مرتبط",
+            f"کد سفارش: {order['order_code'] or ('#' + str(order['id']))}",
+            f"نام محصول ثبت‌شده: {order['product_name'] or 'ثبت نشده'}",
+            f"مبلغ: {toman(order['price'])} {order['currency'] or 'تومان'}",
+            f"وضعیت: {order['status']}",
+            f"زمان ثبت واقعی: {format_iran_jalali_datetime(order['created_at'])}",
+            f"زمان ثبت رسید: {format_iran_jalali_datetime(order['receipt_submitted_at'])}",
+            f"زمان تأیید پرداخت: {format_iran_jalali_datetime(order['payment_verified_at'])}",
+            f"زمان تحویل: {format_iran_jalali_datetime(order['delivered_at'])}",
+        ])
+    lines.extend(["", "💬 تاریخچه گفتگو"])
+    for msg in messages[-12:]:
+        role = "مشتری" if msg["sender_role"] == "customer" else "مدیریت"
+        lines.append(f"\n{role} | {format_iran_jalali_datetime(msg['created_at'])}")
+        lines.append(str(msg["message_text"] or ("رسانه پیوست شده" if msg["telegram_file_id"] else "پیام بدون متن"))[:700])
+        if msg["telegram_file_id"]:
+            lines.append("📎 پیوست: " + str(msg["media_type"] or "رسانه"))
+    return "\n".join(lines)
+
+
+def create_support_ticket_keyboard(ticket_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("↩️ پاسخ به مشتری", callback_data=f"admin_ticket_reply_{ticket_id}"),
+         InlineKeyboardButton("📦 سفارش", callback_data=f"admin_ticket_order_{ticket_id}")],
+        [InlineKeyboardButton("🟡 در حال بررسی", callback_data=f"admin_ticket_status_review_{ticket_id}")],
+        [InlineKeyboardButton("✅ پاسخ داده شد", callback_data=f"admin_ticket_status_replied_{ticket_id}"),
+         InlineKeyboardButton("📁 بستن تیکت", callback_data=f"admin_ticket_status_closed_{ticket_id}")],
+        [InlineKeyboardButton("📎 ارسال دوباره پیوست‌ها به مدیریت", callback_data=f"admin_ticket_attachments_{ticket_id}")],
+        [InlineKeyboardButton("🔙 فهرست تیکت‌ها", callback_data="admin_support_tickets")],
+    ])
+
+
+async def _show_gift_admin_home(query, bot, note=""):
+    with db() as con:
+        catalog_count = int(con.execute("SELECT COUNT(*) FROM products WHERE category='gifts' AND source_type='official' AND catalog_available=1").fetchone()[0])
+        active_count = int(con.execute("SELECT COUNT(*) FROM products WHERE category='gifts' AND active=1 AND (source_type='custom' OR catalog_available=1 OR telegram_gift_id!='')").fetchone()[0])
+    try:
+        balance_text = f"⭐ {toman(await get_real_bot_star_balance(bot))}"
+    except Exception as exc:
+        logger.warning("Could not query real bot Stars balance", exc_info=True)
+        balance_text = "دریافت نشد (" + str(exc)[:90] + ")"
+    await query.edit_message_text(gift_admin_home_text(catalog_count, active_count, balance_text, note), reply_markup=gift_admin_home_keyboard())
+
+
+async def _create_owner_star_invoice(update_or_query, context, amount):
+    """Owner-only XTR invoice. Stars are recorded only after Telegram's successful_payment update."""
+    actor = update_or_query.effective_user if hasattr(update_or_query, "effective_user") else update_or_query.from_user
+    message = update_or_query.effective_message if hasattr(update_or_query, "effective_message") else update_or_query.message
+    if not actor or actor.id != ADMIN_ID:
+        if hasattr(update_or_query, "answer"):
+            await update_or_query.answer("فقط مدیر اصلی می‌تواند موجودی Stars ربات را شارژ کند.", show_alert=True)
+        return
+    if not isinstance(amount, int) or not 1 <= amount <= 100000:
+        await message.reply_text("تعداد Stars باید بین ۱ تا ۱۰۰٬۰۰۰ باشد.")
+        return
+    payload = f"SP-GIFT-TOPUP-{actor.id}-{int(time.time())}-{amount}"
+    created = iran_timestamp_now()
+    with db() as con:
+        con.execute("INSERT INTO gift_star_topups(payload,admin_user_id,amount,status,created_at) VALUES(?,?,?,'pending',?)",
+                    (payload, actor.id, amount, created))
+    if LabeledPrice is None or PreCheckoutQueryHandler is None:
+        await message.reply_text("❌ نسخهٔ کتابخانهٔ تلگرام برای پرداخت امن Stars آماده نیست. ابتدا python-telegram-bot را به نسخهٔ سازگار با Bot API به‌روزرسانی کن.")
+        with db() as con:
+            con.execute("UPDATE gift_star_topups SET status='unsupported' WHERE payload=?", (payload,))
+        return
+    await context.bot.send_invoice(
+        chat_id=actor.id,
+        title="شارژ موجودی استارز ربات",
+        description=f"افزودن {amount} ⭐ به موجودی ربات برای ارسال گیفت‌های رسمی و خدمات پشتیبانی‌شده.",
+        payload=payload,
+        provider_token="",
+        currency="XTR",
+        prices=[LabeledPrice(label=f"{amount} Telegram Stars", amount=amount)],
+    )
+
+
+async def handle_owner_star_precheckout(update, context):
+    query = update.pre_checkout_query
+    try:
+        with db() as con:
+            row = con.execute("SELECT admin_user_id,amount,status FROM gift_star_topups WHERE payload=?", (query.invoice_payload,)).fetchone()
+        valid = bool(row and int(row["admin_user_id"]) == int(query.from_user.id) == int(ADMIN_ID)
+                     and int(row["amount"]) == int(query.total_amount) and query.currency == "XTR"
+                     and row["status"] == "pending")
+        await query.answer(ok=valid, error_message=None if valid else "این فاکتور معتبر یا قابل استفاده نیست. دوباره از پنل مدیریت شروع کن.")
+    except Exception:
+        logger.exception("Owner Stars top-up pre-checkout validation failed")
+        await query.answer(ok=False, error_message="بررسی فاکتور با خطا روبه‌رو شد؛ لطفاً دوباره تلاش کن.")
+
+
+async def handle_owner_star_success(update, context):
+    message = update.effective_message
+    user = update.effective_user
+    payment = getattr(message, "successful_payment", None) if message else None
+    if not payment or not user:
+        return
+    payload = str(payment.invoice_payload or "")
+    with db() as con:
+        row = con.execute("SELECT * FROM gift_star_topups WHERE payload=?", (payload,)).fetchone()
+        if not row or int(row["admin_user_id"]) != int(user.id) or int(user.id) != int(ADMIN_ID):
+            await message.reply_text("⚠️ پرداخت دریافت شد اما فاکتور شارژ موجودی در سیستم پیدا نشد؛ لطفاً با مدیریت بررسی کن.")
+            return
+        if payment.currency != "XTR" or int(payment.total_amount) != int(row["amount"]):
+            con.execute("UPDATE gift_star_topups SET status='mismatch' WHERE payload=?", (payload,))
+            await message.reply_text("⚠️ مبلغ یا واحد پرداخت با فاکتور مطابقت ندارد؛ موجودی محلی تغییر نکرد.")
+            return
+        if row["status"] == "paid":
+            await message.reply_text("این پرداخت قبلاً ثبت شده است؛ دوباره محاسبه نشد.")
+            return
+        con.execute("UPDATE gift_star_topups SET status='paid',telegram_charge_id=?,paid_at=? WHERE payload=?",
+                    (payment.telegram_payment_charge_id or "", iran_timestamp_now(), payload))
+    try:
+        balance = await get_real_bot_star_balance(context.bot)
+        balance_text = f"⭐ {toman(balance)}"
+    except Exception as exc:
+        balance_text = "پرداخت با موفقیت ثبت شد؛ دریافت موجودی فعلی از API ناموفق بود: " + str(exc)[:100]
+    await message.reply_text(
+        f"✅ پرداخت {int(payment.total_amount)} ⭐ با تأیید تلگرام ثبت شد.\n{balance_text}\n\nاین موجودی برای روش‌های رسمی ارسال پشتیبانی‌شده استفاده می‌شود؛ پرداخت Stars به‌تنهایی به معنی موجودی قابل‌خرج برای هر نوع محصول نیست."
+    )
+
+
+async def try_deliver_official_gift(context, order_id):
+    """Attempt only an actual official sendGift call; keep order pending on every failure."""
+    with db() as con:
+        order = con.execute(
+            "SELECT o.*,p.name AS product_name,p.category,p.source_type,p.telegram_gift_id,p.delivery_mode AS product_delivery_mode,p.custom_link "
+            "FROM orders o LEFT JOIN products p ON p.id=o.product_id WHERE o.id=?",
+            (order_id,),
+        ).fetchone()
+    if not order:
+        return {"ok": False, "manual": True, "reason": "سفارش پیدا نشد."}
+    if not order or str(order["category"] or "").lower() != "gifts":
+        return {"ok": False, "manual": True, "reason": "محصول از نوع گیفت نیست."}
+    if order["delivered_at"]:
+        return {"ok": True, "manual": False, "already_delivered": True, "delivered_at": order["delivered_at"]}
+    if not order["payment_verified_at"]:
+        return {"ok": False, "manual": True, "reason": "پرداخت این سفارش هنوز تأیید نشده است."}
+    settings = load_gift_settings()
+    mode = str(order["delivery_mode"] or order["product_delivery_mode"] or "manual")
+    if settings["manual_delivery_all"] or mode != "auto":
+        return {"ok": False, "manual": True, "reason": "روش تحویل این سفارش دستی است."}
+    if order["source_type"] != "official" or not order["telegram_gift_id"]:
+        return {"ok": False, "manual": True, "reason": "این محصول گیفت رسمی قابل ارسال خودکار نیست."}
+    recipient_id = order["recipient_user_id"]
+    if not recipient_id:
+        return {"ok": False, "manual": True, "reason": "ID عددی گیرنده ثبت نشده است."}
+    try:
+        await telegram_bot_api_call(context.bot, "sendGift", user_id=int(recipient_id), gift_id=str(order["telegram_gift_id"]))
+    except Exception as exc:
+        logger.exception("Official Telegram gift delivery failed for order #%s", order_id)
+        reason = str(exc)[:400]
+        with db() as con:
+            con.execute("UPDATE orders SET status='پرداخت تأیید شد - در انتظار تحویل',delivery_error=? WHERE id=?", (reason, order_id))
+        return {"ok": False, "manual": False, "reason": reason}
+    delivered_at = iran_timestamp_now()
+    with db() as con:
+        con.execute("UPDATE orders SET status='تحویل‌شده',delivered_at=?,delivery_error='' WHERE id=?", (delivered_at, order_id))
+    return {"ok": True, "manual": False, "delivered_at": delivered_at}
+
+
+def gift_orders_page(page=1):
+    page = max(1, int(page))
+    with db() as con:
+        total = int(con.execute("SELECT COUNT(*) FROM orders o JOIN products p ON p.id=o.product_id WHERE lower(p.category)='gifts'").fetchone()[0])
+        if total == 0:
+            return "🧾 سفارش‌هایِ گیفت\n\nهنوز سفارشی ثبت نشده.", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="gift_admin_home", style="danger")]])
+        per_page = 5
+        total_pages = max(1, (total + per_page - 1) // per_page)
+        page = min(page, total_pages)
+        rows = con.execute(
+            "SELECT o.*,p.name AS product_name FROM orders o JOIN products p ON p.id=o.product_id WHERE lower(p.category)='gifts' ORDER BY o.id DESC LIMIT ? OFFSET ?",
+            (per_page, (page-1)*per_page),
+        ).fetchall()
+    lines = [f"🧾 سفارش‌هایِ گیفت | صفحه {page} از {total_pages}", "━━━━━━━━━━━━━━━━━━"]
+    buttons = []
+    for row in rows:
+        buyer_at = "@" + row["buyer_username"] if row["buyer_username"] else "تنظیم نشده"
+        recipient_at = row["recipient_username"] or "ثبت نشده"
+        code = row["order_code"] or f"#{row['id']}"
+        lines.extend([
+            f"\n🧾 کد سفارش: {code}",
+            f"🎁 نام کامل محصول: {row['product_name_snapshot'] or row['product_name']}",
+            f"💰 مبلغ: {toman(row['price'])} {row['currency'] or 'تومان'}",
+            f"👤 خریدار — ID: {row['user_id']} | {buyer_at}",
+            f"🎯 گیرنده — ID: {row['recipient_user_id'] or 'ثبت نشده'} | {recipient_at}",
+            f"📅 زمان ثبت سفارش: {format_iran_jalali_datetime(row['created_at'])}",
+            f"📌 وضعیت: {row['status']}",
+        ])
+        buttons.append([InlineKeyboardButton(f"🔎 جزئیات {code}", callback_data=f"gift_order_view_{row['id']}")])
+    nav=[]
+    if page > 1: nav.append(InlineKeyboardButton("⬅️ قبلی", callback_data=f"gift_orders_page_{page-1}"))
+    if page < total_pages: nav.append(InlineKeyboardButton("بعدی ➡️", callback_data=f"gift_orders_page_{page+1}"))
+    if nav: buttons.append(nav)
+    buttons.extend([[InlineKeyboardButton("🔎 جست‌وجوی سفارش", callback_data="gift_order_search")],
+                    [InlineKeyboardButton("🔙 بازگشت", callback_data="gift_admin_home", style="danger")]])
+    return "\n".join(lines)[:3900], InlineKeyboardMarkup(buttons)
+
+
+def gift_order_detail_text(row):
+    buyer_at = "@" + row["buyer_username"] if row["buyer_username"] else "تنظیم نشده"
+    recipient_at = row["recipient_username"] or "ثبت نشده"
+    with db() as con:
+        history = con.execute(
+            "SELECT event_key,status_text,details,created_at FROM order_status_history WHERE order_id=? ORDER BY id DESC LIMIT 12",
+            (int(row["id"]),),
+        ).fetchall()
+    history_lines = []
+    for event in reversed(history):
+        detail = (" — " + str(event["details"])[:120]) if event["details"] else ""
+        history_lines.append(
+            f"• {format_iran_jalali_datetime(event['created_at'])}: {event['status_text']}{detail}"
+        )
+    history_text = "\n".join(history_lines) if history_lines else "هنوز رویداد دیگری ثبت نشده است."
+    text_value = (
+        f"🎁 جزئیات سفارش گیفت {row['order_code'] or ('#'+str(row['id']))}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"نام کامل محصول: {row['product_name_snapshot'] or row['product_name'] or 'ثبت نشده'}\n"
+        f"مبلغ ثبت‌شده: {toman(row['price'])} {row['currency'] or 'تومان'}\n"
+        f"وضعیت پرداخت/سفارش: {row['status']}\n"
+        f"روش تحویل سفارش: {'خودکار' if row['delivery_mode']=='auto' else 'دستی'}\n"
+        f"تاریخ و ساعت سفارش: {format_iran_jalali_datetime(row['created_at'])}\n"
+        f"زمان ارسال رسید: {format_iran_jalali_datetime(row['receipt_submitted_at'])}\n"
+        f"زمان تأیید پرداخت: {format_iran_jalali_datetime(row['payment_verified_at'])}\n"
+        f"زمان تحویل واقعی: {format_iran_jalali_datetime(row['delivered_at'])}\n\n"
+        "👤 اطلاعات خریدار\n"
+        f"ID عددی خریدار: {row['user_id']}\n"
+        f"آیدی تلگرام خریدار: {buyer_at}\n\n"
+        "🎯 اطلاعات گیرنده\n"
+        f"ID عددی گیرنده: {row['recipient_user_id'] or 'ثبت نشده'}\n"
+        f"آیدی تلگرام گیرنده: {recipient_at}\n\n"
+        f"📝 جزئیات واردشده: {row['order_details'] or 'ثبت نشده'}\n"
+        f"🧾 رسید: {'ثبت شده' if row['receipt_file_id'] else 'ثبت نشده'}\n"
+        f"⚠️ خطای تحویل: {row['delivery_error'] or 'ندارد'}\n\n"
+        "🕒 تاریخچه رویدادهای سفارش\n" + history_text
+    )
+    return text_value[:3900]
+
 
 def register_user(user):
     with db() as con:
@@ -1593,6 +2651,7 @@ def pricing_panel_keyboard(cfg=None):
     enabled_label = "⏸ توقف قیمت‌گذاری" if cfg.get("enabled") else "▶️ فعال‌کردن قیمت‌گذاری"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 دریافت/اعتبارسنجی قیمت‌ها", callback_data="admin_pricing_refresh", style="success")],
+        [InlineKeyboardButton("⭐ شارژ موجودی واقعی Stars ربات (مشترک خدمات پشتیبانی‌شده)", callback_data="gift_star_topup", style="success")],
         [InlineKeyboardButton("📈 تنظیم درصد سود", callback_data="admin_pricing_margin", style="primary"),
          InlineKeyboardButton("🧾 تنظیم کارمزد", callback_data="admin_pricing_fee", style="primary")],
         [InlineKeyboardButton("🔑 ثبت/تغییر کلید API", callback_data="admin_pricing_api_key", style="primary"),
@@ -1768,6 +2827,7 @@ async def auto_pricing_refresh_loop(application):
     while True:
         try:
             await refresh_auto_pricing(force=False)
+            sync_gift_prices_in_db()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -2020,6 +3080,26 @@ def _button_style_for(label, callback=None):
         return "success"
 
     return "primary"
+
+
+def customer_order_cancel_keyboard():
+    """Reply-keyboard-only cancellation button for customer order input steps."""
+    return ReplyKeyboardMarkup(
+        [[_styled_keyboard_button("❌ لغو سفارش", style_override="danger")]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+        input_field_placeholder="برای لغو سفارش، دکمهٔ لغو سفارش را بزن…",
+    )
+
+
+def _is_customer_cancel_text(value):
+    text = str(value or "").strip().casefold()
+    compact = re.sub(r"[\s‌]+", "", text)
+    return (
+        text in {"لغو", "cancel", "/cancel", "لغو الان", "❌ لغو", "❌ لغو سفارش", "🏠 لغو سفارش"}
+        or compact.startswith("لغو")
+        or "لغوسفارش" in compact
+    )
 
 
 def _styled_keyboard_button(label, callback=None, style_override=None):
@@ -2959,6 +4039,8 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("🛍 محصولات و قیمت‌ها", callback_data="admin_products", style="primary")],
         [InlineKeyboardButton("📦 آخرین سفارش‌ها", callback_data="admin_orders", style="primary"),
          InlineKeyboardButton("🏷️ مدیریت کدهای تخفیف", callback_data="admin_coupons", style="primary")],
+        [InlineKeyboardButton("🎁 مدیریت گیفت تلگرام", callback_data="gift_admin_home", style="primary"),
+         InlineKeyboardButton("💬 پیام‌های پشتیبانی", callback_data="admin_support_tickets", style="success")],
         [InlineKeyboardButton(f"⌨️ تغییر به کیبورد معمولی{' ✅' if current_mode == MENU_TYPE_KEYBOARD else ''}", callback_data="admin_menu_set_keyboard", style="success"),
          InlineKeyboardButton(f"💎 تغییر به شیشه‌ای{' ✅' if current_mode == MENU_TYPE_INLINE else ''}", callback_data="admin_menu_set_inline", style="success")],
         [InlineKeyboardButton("💹 قیمت‌گذاری خودکار استارز/پرمیوم", callback_data="admin_auto_pricing", style="primary")],
@@ -3243,6 +4325,585 @@ async def _show_product_category(query, category, user_id):
     )
 
 
+
+async def handle_gift_support_callback(query, context):
+    """Return True when a gift/support management callback has been handled."""
+    data = str(query.data or "")
+    user_id = int(query.from_user.id)
+
+    if data == "support":
+        # Save the active form state so a customer can finish after a restart.
+        with db() as con:
+            con.execute(
+                "INSERT INTO support_form_sessions(user_id,started_at) VALUES(?,?) "
+                "ON CONFLICT(user_id) DO UPDATE SET started_at=excluded.started_at",
+                (user_id, iran_timestamp_now()),
+            )
+        context.user_data["support_form_active"] = True
+        form = support_form_text(query.from_user)
+        copy_form = support_form_copy_text(query.from_user)
+        await query.edit_message_text(
+            form + "\n\n📋 روی دکمه کپی بزن، فرم کوتاه را تکمیل کن و همین‌جا برای ربات بفرست.",
+            reply_markup=support_form_markup(copy_form),
+        )
+        return True
+
+    if data == "support_cancel":
+        context.user_data.pop("support_form_active", None)
+        with db() as con:
+            con.execute("DELETE FROM support_form_sessions WHERE user_id=?", (user_id,))
+        await query.edit_message_text("❌ فرم پشتیبانی لغو شد؛ هیچ تیکتی ثبت نشد.", reply_markup=back_menu())
+        return True
+
+    if data.startswith("support_ticket_continue_"):
+        ticket_id = int(data.rsplit("_", 1)[1])
+        with db() as con:
+            con.execute("INSERT INTO support_active_tickets(user_id,ticket_id,updated_at) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET ticket_id=excluded.ticket_id,updated_at=excluded.updated_at", (user_id, ticket_id, iran_timestamp_now()))
+        await query.edit_message_text("💬 گفت‌وگوی پشتیبانی فعال است. پیام متنی، عکس، ویدئو یا فایل خود را همین‌جا بفرست. برای پایان، دکمه زیر یا /cancel را بزن.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ پایان گفت‌وگو", callback_data="support_ticket_close")]]))
+        return True
+
+    if data == "support_ticket_close":
+        with db() as con:
+            con.execute("DELETE FROM support_active_tickets WHERE user_id=?", (user_id,))
+        await query.edit_message_text("✅ گفت‌وگوی ارسال پیام پایان یافت. تیکت و سوابق آن برای پیگیری مدیر محفوظ است.", reply_markup=back_menu())
+        return True
+
+    # Customer chooses only between a supported automatic send or manual handling.
+    if data.startswith("gift_customer_delivery_"):
+        if data == "gift_customer_delivery_cancel":
+            for key in ("pending_product_id", "pending_gift_delivery_product_id", "pending_gift_delivery_mode", "pending_dynamic_quote"):
+                context.user_data.pop(key, None)
+            await query.edit_message_text("❌ سفارش لغو شد؛ سفارشی ثبت نشد.", reply_markup=back_menu())
+            return True
+        try:
+            product_id = int(data.rsplit("_", 1)[1])
+        except (ValueError, IndexError):
+            await query.answer("شناسه محصول نامعتبر است.", show_alert=True)
+            return True
+        if context.user_data.get("pending_gift_delivery_product_id") != product_id or context.user_data.get("pending_product_id") != product_id:
+            await query.answer("این انتخاب منقضی شده است؛ محصول را دوباره انتخاب کن.", show_alert=True)
+            return True
+        with db() as con:
+            product = con.execute("SELECT * FROM products WHERE id=? AND category='gifts' AND active=1", (product_id,)).fetchone()
+        cfg = load_gift_settings()
+        if not product:
+            await query.answer("محصول دیگر فعال نیست.", show_alert=True)
+            return True
+        if data.startswith("gift_customer_delivery_auto_"):
+            if cfg["manual_delivery_all"] or product["source_type"] != "official" or not product["telegram_gift_id"] or product["delivery_mode"] != "auto":
+                await query.answer("ارسال خودکار برای این محصول در حال حاضر در دسترس نیست.", show_alert=True)
+                return True
+            mode = "auto"
+        else:
+            mode = "manual"
+        context.user_data["pending_gift_delivery_mode"] = mode
+        context.user_data.pop("pending_gift_delivery_product_id", None)
+        prompt = product_details_prompt(product)
+        await query.edit_message_text(
+            f"✅ روش تحویل انتخاب شد: {'ارسال خودکار توسط ربات' if mode == 'auto' else 'تحویل دستی توسط پشتیبانی'}\n\n"
+            f"🛍 محصول: {product['name']}\n\n{prompt}\n\nبرای لغو، دکمهٔ لغو سفارش را بزن.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو سفارش", callback_data="gift_customer_delivery_cancel", style="danger")]])
+        )
+        return True
+
+    # Admin-only routes below this point.
+    admin_prefixes = (
+        "gift_", "admin_support_tickets", "admin_ticket_", "admin_support_search",
+        "admin_ticket_search", "gift_order_search", "gift_order_view_",
+    )
+    if not (data == "gift_admin_home" or data.startswith(admin_prefixes)):
+        return False
+    if user_id != ADMIN_ID:
+        await query.answer("دسترسی فقط برای مدیر اصلی است.", show_alert=True)
+        return True
+
+    if data == "gift_admin_home":
+        await _show_gift_admin_home(query, context.bot)
+        return True
+
+    if data == "gift_sync":
+        await query.edit_message_text("🔄 در حال دریافت فهرست رسمی گیفت‌ها از تلگرام...")
+        try:
+            count = await sync_official_gift_catalog(context.bot)
+            await _show_gift_admin_home(query, context.bot, f"✅ فهرست رسمی با موفقیت به‌روزرسانی شد. تعداد گیفت‌های دریافت‌شده: {count}")
+        except Exception as exc:
+            logger.exception("Official Telegram gift catalogue sync failed")
+            settings = load_gift_settings()
+            settings["catalog_last_error"] = str(exc)[:500]
+            save_gift_settings(settings)
+            await _show_gift_admin_home(query, context.bot, "❌ دریافت فهرست رسمی ناموفق بود. فهرست قبلی حفظ شد.\n" + str(exc)[:350])
+        return True
+
+    if data.startswith("gift_catalog_page_"):
+        page = int(data.rsplit("_", 1)[1])
+        text_value, markup = gift_catalog_page_text_and_markup(page, delivery=False)
+        await query.edit_message_text(text_value, reply_markup=markup)
+        return True
+
+    if data.startswith("gift_delivery_page_"):
+        page = int(data.rsplit("_", 1)[1])
+        text_value, markup = gift_catalog_page_text_and_markup(page, delivery=True)
+        await query.edit_message_text(text_value, reply_markup=markup)
+        return True
+
+    if data.startswith("gift_toggle_"):
+        product_id = int(data.rsplit("_", 1)[1])
+        with db() as con:
+            row = con.execute("SELECT id,active,price,star_count,source_type FROM products WHERE id=? AND category='gifts'", (product_id,)).fetchone()
+            if not row:
+                await query.answer("این گیفت پیدا نشد.", show_alert=True)
+                return True
+            new_active = 0 if int(row["active"] or 0) else 1
+            if new_active and int(row["price"] or 0) <= 0:
+                await query.answer("قیمت معتبر ندارد؛ ابتدا نرخ پایه یا منبع قیمت خودکار را تنظیم کن.", show_alert=True)
+                return True
+            con.execute("UPDATE products SET active=? WHERE id=?", (new_active, product_id))
+        text_value, markup = gift_catalog_page_text_and_markup(int(context.user_data.get("gift_catalog_page", 1)), delivery=False)
+        await query.answer("گیفت فعال شد." if new_active else "گیفت غیرفعال شد.")
+        await query.edit_message_text(text_value, reply_markup=markup)
+        return True
+
+    if data == "gift_global_manual":
+        cfg = load_gift_settings()
+        cfg["manual_delivery_all"] = not cfg["manual_delivery_all"]
+        save_gift_settings(cfg)
+        await query.answer("تحویل دستی همه روشن شد." if cfg["manual_delivery_all"] else "تحویل دستی همه خاموش شد.")
+        await _show_gift_admin_home(query, context.bot)
+        return True
+
+    if data == "gift_customer_choice":
+        cfg = load_gift_settings()
+        cfg["customer_delivery_choice"] = not cfg["customer_delivery_choice"]
+        save_gift_settings(cfg)
+        await query.answer("انتخاب روش ارسال توسط مشتری روشن شد." if cfg["customer_delivery_choice"] else "انتخاب روش ارسال توسط مشتری خاموش شد.")
+        await _show_gift_admin_home(query, context.bot)
+        return True
+
+    if data == "gift_delivery_page_1":
+        text_value, markup = gift_catalog_page_text_and_markup(1, delivery=True)
+        await query.edit_message_text(text_value, reply_markup=markup)
+        return True
+
+    if data.startswith("gift_delivery_manual_"):
+        await query.answer("این گیفت فقط به‌صورت دستی تحویل داده می‌شود.", show_alert=True)
+        return True
+
+    if data.startswith("gift_delivery_toggle_"):
+        product_id = int(data.rsplit("_", 1)[1])
+        with db() as con:
+            row = con.execute("SELECT source_type,telegram_gift_id,delivery_mode FROM products WHERE id=? AND category='gifts'", (product_id,)).fetchone()
+            if not row:
+                await query.answer("گیفت پیدا نشد.", show_alert=True)
+                return True
+            if row["source_type"] != "official" or not row["telegram_gift_id"]:
+                await query.answer("تحویل خودکار فقط برای گیفت رسمیِ دارای شناسه تلگرام فعال می‌شود.", show_alert=True)
+                return True
+            new_mode = "manual" if str(row["delivery_mode"] or "manual") == "auto" else "auto"
+            con.execute("UPDATE products SET delivery_mode=? WHERE id=?", (new_mode, product_id))
+        text_value, markup = gift_catalog_page_text_and_markup(1, delivery=True)
+        await query.answer("تحویل خودکار انتخاب شد؛ ارسال فقط پس از تأیید پرداخت و موفقیت API انجام می‌شود." if new_mode == "auto" else "تحویل دستی انتخاب شد.")
+        await query.edit_message_text(text_value, reply_markup=markup)
+        return True
+
+    if data == "gift_base_rate":
+        context.user_data["gift_admin_input"] = {"field": "base_star_rate"}
+        await query.edit_message_text(
+            "💰 نرخ پایه هر ⭐ چند تومان باشد؟\nمثلاً 1000\n\nعدد مثبت بفرست. برای لغو /cancel را بزن.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو عملیات", callback_data="gift_input_cancel", style="danger")], [InlineKeyboardButton("🔙 بازگشت", callback_data="gift_admin_home")]])
+        )
+        return True
+
+    if data == "gift_profit":
+        context.user_data["gift_admin_input"] = {"field": "profit_percent"}
+        await query.edit_message_text(
+            "📈 چند درصد سود روی قیمت استارزی اضافه شود؟\nمثلاً 20\n\nعدد بین ۰ تا ۱۰۰۰ بفرست. برای لغو /cancel را بزن.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو عملیات", callback_data="gift_input_cancel", style="danger")], [InlineKeyboardButton("🔙 بازگشت", callback_data="gift_admin_home")]])
+        )
+        return True
+
+    if data == "gift_auto_rate":
+        cfg = load_gift_settings()
+        if not cfg["auto_rate_enabled"]:
+            await query.edit_message_text("🔄 در حال بررسی کاتالوگ قیمت و نرخ ارز...")
+            try:
+                await refresh_auto_pricing(force=True)
+            except Exception:
+                logger.exception("Gift automatic pricing refresh failed")
+            cfg = load_gift_settings()
+            auto_cfg = load_auto_pricing_config()
+            ready = bool(auto_cfg.get("catalog_valid") and _pricing_timestamp_fresh(auto_cfg.get("catalog_updated_at"))
+                         and auto_cfg.get("fx_valid") and _pricing_timestamp_fresh(auto_cfg.get("fx_source_updated_at")))
+            if not ready and not (cfg.get("usd_per_star_override") and cfg.get("usd_toman_manual")):
+                await _show_gift_admin_home(query, context.bot, "⚠️ منبع قیمت تازه و معتبر در دسترس نیست. نرخ خودکار روشن نشد تا قیمت ساختگی نمایش داده نشود.")
+                return True
+            cfg["auto_rate_enabled"] = True
+        else:
+            cfg["auto_rate_enabled"] = False
+        save_gift_settings(cfg)
+        sync_gift_prices_in_db()
+        await _show_gift_admin_home(query, context.bot, "✅ تنظیم نرخ خودکار ذخیره شد.")
+        return True
+
+    if data == "gift_usd_settings":
+        cfg = load_gift_settings()
+        auto_cfg = load_auto_pricing_config()
+        usd = cfg.get("usd_per_star_override") or (auto_cfg.get("catalog_prices") or {}).get("stars_price_per_star_usd") or "دریافت نشده"
+        fx = cfg.get("usd_toman_manual") or (auto_cfg.get("fx_rate_toman") if auto_cfg.get("fx_valid") else "خودکار/نامشخص")
+        context.user_data["gift_admin_input"] = {"field": "usd_settings"}
+        await query.edit_message_text(
+            "⚙️ تنظیم قیمت پایه و نرخ دلار\n\n"
+            f"قیمت پایه هر ⭐ به دلار: {usd}\n"
+            f"نرخ دلار: {fx}\n\n"
+            "یکی از این دستورها را بفرست:\n"
+            "قیمت 0.0155  ← قیمت هر ⭐ به دلار\n"
+            "دلار 165000  ← نرخ دستی دلار به تومان\n"
+            "دلار 0  ← استفاده از نرخ خودکار دلار\n\n"
+            "برای لغو /cancel را بزن.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو عملیات", callback_data="gift_input_cancel", style="danger")], [InlineKeyboardButton("🔙 بازگشت", callback_data="gift_admin_home")]])
+        )
+        return True
+
+    if data == "gift_support_first":
+        cfg = load_gift_settings()
+        cfg["support_first"] = not cfg["support_first"]
+        save_gift_settings(cfg)
+        await query.answer("پیام پشتیبانی قبل از تحویل روشن شد." if cfg["support_first"] else "پیام پشتیبانی قبل از تحویل خاموش شد.")
+        await _show_gift_admin_home(query, context.bot)
+        return True
+
+    if data == "gift_support_text":
+        context.user_data["gift_admin_input"] = {"field": "support_text"}
+        await query.edit_message_text(
+            "📝 متن پیام پشتیبانی را بفرست. این متن فقط در صورت نیاز به هماهنگی تحویل برای مشتری ارسال می‌شود.\n\nمتن فعلی:\n" + load_gift_settings()["support_text"],
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو عملیات", callback_data="gift_input_cancel", style="danger")], [InlineKeyboardButton("🔙 بازگشت", callback_data="gift_admin_home")]])
+        )
+        return True
+
+    if data == "gift_input_cancel":
+        context.user_data.pop("gift_admin_input", None)
+        await query.edit_message_text("❌ عملیات لغو شد؛ تنظیمی ذخیره نشد.", reply_markup=gift_admin_home_keyboard())
+        return True
+
+    if data == "gift_custom_add":
+        context.user_data["gift_custom_state"] = {"step": "link"}
+        await query.edit_message_text(
+            "🔗 افزودن گیفت سفارشی\n\n"
+            "این بخش برای گیفت یا NFT سفارشی است که ربات آن را از کاتالوگ رسمی ارسال نمی‌کند؛ تحویل آن دستی خواهد بود.\n\n"
+            "ابتدا لینک کامل گیفت را بفرست؛ نمونه: https://t.me/nft/MoodPack-134232\n\nبرای لغو /cancel را بزن.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو عملیات", callback_data="gift_custom_cancel", style="danger")]])
+        )
+        return True
+
+    if data == "gift_custom_cancel":
+        context.user_data.pop("gift_custom_state", None)
+        await query.edit_message_text("❌ افزودن گیفت سفارشی لغو شد؛ چیزی ذخیره نشد.", reply_markup=gift_admin_home_keyboard())
+        return True
+
+    if data == "gift_star_topup":
+        try:
+            balance = await get_real_bot_star_balance(context.bot)
+            balance_text = f"⭐ {toman(balance)}"
+        except Exception as exc:
+            balance_text = "دریافت موجودی ناموفق: " + str(exc)[:120]
+        await query.edit_message_text(
+            "⭐ شارژ موجودی واقعی Stars ربات\n\n"
+            f"موجودی فعلی ربات: {balance_text}\n\n"
+            "پرداخت فقط با Stars و از طریق فاکتور رسمی تلگرام انجام می‌شود. پس از پرداخت موفق، نتیجه از پیام پرداخت تلگرام ثبت می‌شود.\n\n"
+            "این موجودی برای روش‌های رسمی ارسال پشتیبانی‌شده استفاده می‌شود؛ ارسال مستقیم Stars به کاربر با ارسال گیفت یکی نیست.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("100 ⭐", callback_data="gift_topup_100"), InlineKeyboardButton("250 ⭐", callback_data="gift_topup_250"), InlineKeyboardButton("500 ⭐", callback_data="gift_topup_500")],
+                [InlineKeyboardButton("1,000 ⭐", callback_data="gift_topup_1000"), InlineKeyboardButton("2,500 ⭐", callback_data="gift_topup_2500"), InlineKeyboardButton("5,000 ⭐", callback_data="gift_topup_5000")],
+                [InlineKeyboardButton("✍️ تعداد دلخواه", callback_data="gift_topup_custom")],
+                [InlineKeyboardButton("🔙 بازگشت", callback_data="gift_admin_home")],
+            ])
+        )
+        return True
+
+    if data.startswith("gift_topup_") and data != "gift_topup_custom":
+        amount_raw = data.rsplit("_", 1)[1]
+        if amount_raw.isdigit():
+            await _create_owner_star_invoice(query, context, int(amount_raw))
+        return True
+
+    if data == "gift_topup_custom":
+        context.user_data["gift_admin_input"] = {"field": "topup_amount"}
+        await query.edit_message_text("✍️ تعداد Stars موردنظر را فقط با عدد بفرست (۱ تا ۱۰۰٬۰۰۰). برای لغو /cancel را بزن.",
+                                      reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو عملیات", callback_data="gift_input_cancel")]]))
+        return True
+
+    if data == "gift_orders":
+        text_value, markup = gift_orders_page(1)
+        await query.edit_message_text(text_value, reply_markup=markup)
+        return True
+
+    if data.startswith("gift_orders_page_"):
+        text_value, markup = gift_orders_page(int(data.rsplit("_", 1)[1]))
+        await query.edit_message_text(text_value, reply_markup=markup)
+        return True
+
+    if data.startswith("gift_order_view_"):
+        order_id = int(data.rsplit("_", 1)[1])
+        with db() as con:
+            row = con.execute(
+                "SELECT o.*,p.name AS product_name FROM orders o JOIN products p ON p.id=o.product_id WHERE o.id=? AND lower(p.category)='gifts'",
+                (order_id,),
+            ).fetchone()
+        if not row:
+            await query.edit_message_text("سفارش گیفت پیدا نشد.", reply_markup=gift_admin_home_keyboard())
+            return True
+        buttons = [
+            [InlineKeyboardButton("👤 پرونده خریدار / سفارش‌ها", callback_data=f"admin_support_search_id_{row['user_id']}")],
+            [InlineKeyboardButton("🎯 جست‌وجو با ID گیرنده", callback_data=f"admin_support_search_id_{row['recipient_user_id'] or 0}")],
+        ]
+        if row["receipt_file_id"]:
+            buttons.append([InlineKeyboardButton("🧾 مشاهده رسید", callback_data=f"gift_order_receipt_{order_id}")])
+        if row["status"] in {"پرداخت تأیید شد - در انتظار تحویل", "تأیید شده"} and row["delivered_at"] is None:
+            buttons.append([InlineKeyboardButton("✅ ثبت تحویل دستی انجام‌شده", callback_data=f"gift_manual_delivered_{order_id}", style="success")])
+        buttons.append([InlineKeyboardButton("🔙 بازگشت به سفارش‌های گیفت", callback_data="gift_orders")])
+        await query.edit_message_text(gift_order_detail_text(row), reply_markup=InlineKeyboardMarkup(buttons))
+        return True
+
+    if data.startswith("gift_order_receipt_"):
+        order_id = int(data.rsplit("_", 1)[1])
+        with db() as con:
+            row = con.execute("SELECT receipt_file_id FROM orders WHERE id=?", (order_id,)).fetchone()
+        if row and row["receipt_file_id"]:
+            try:
+                await context.bot.send_photo(chat_id=ADMIN_ID, photo=row["receipt_file_id"], caption=f"🧾 رسید سفارش گیفت #{order_id}")
+                await query.answer("رسید به گفت‌وگوی مدیریت ارسال شد.")
+            except Exception as exc:
+                await query.answer("نمایش رسید ناموفق بود: " + str(exc)[:150], show_alert=True)
+        else:
+            await query.answer("برای این سفارش رسیدی ثبت نشده است.", show_alert=True)
+        return True
+
+    if data.startswith("gift_manual_delivered_yes_"):
+        order_id = int(data.rsplit("_", 1)[1])
+        now = iran_timestamp_now()
+        with db() as con:
+            row = con.execute("SELECT user_id,status,delivered_at,payment_verified_at,order_code FROM orders WHERE id=?", (order_id,)).fetchone()
+            if not row:
+                await query.answer("سفارش پیدا نشد.", show_alert=True)
+                return True
+            if row["delivered_at"]:
+                await query.answer("این سفارش قبلاً تحویل‌شده ثبت شده است.", show_alert=True)
+                return True
+            if row["status"] not in {"پرداخت تأیید شد - در انتظار تحویل", "تأیید شده"}:
+                await query.answer("ابتدا باید پرداخت سفارش تأیید شده باشد.", show_alert=True)
+                return True
+            updated = con.execute("UPDATE orders SET status='تحویل‌شده',delivered_at=?,delivery_error='' WHERE id=? AND delivered_at IS NULL", (now, order_id))
+            if updated.rowcount != 1:
+                await query.answer("وضعیت سفارش هم‌زمان تغییر کرده؛ دوباره جزئیات را باز کن.", show_alert=True)
+                return True
+            log_order_event(con, order_id, "gift_delivered_manual", "تحویل‌شده", "مدیر تحویل دستی را تأیید کرد.", ADMIN_ID)
+            customer_id = int(row["user_id"])
+            order_code = row["order_code"] or f"#{order_id}"
+        try:
+            await context.bot.send_message(
+                chat_id=customer_id,
+                text=f"✅ تحویل سفارش گیفت شما توسط مدیریت ثبت شد.\nکد سفارش: {order_code}\nزمان تحویل: {format_iran_jalali_datetime(now)}",
+            )
+            notify = "وضعیت تحویل ثبت و مشتری مطلع شد."
+        except Exception as exc:
+            logger.exception("Manual delivery confirmation saved but customer notification failed")
+            notify = "تحویل در دیتابیس ثبت شد، اما اطلاع‌رسانی به مشتری ناموفق بود: " + str(exc)[:120]
+        await query.edit_message_text(f"✅ سفارش {order_code} به‌عنوان تحویل‌شده ثبت شد.\n{notify}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 سفارش‌های گیفت", callback_data="gift_orders")]]))
+        return True
+
+    if data.startswith("gift_manual_delivered_"):
+        order_id = int(data.rsplit("_", 1)[1])
+        with db() as con:
+            row = con.execute("SELECT status,delivered_at,order_code FROM orders WHERE id=?", (order_id,)).fetchone()
+        if not row:
+            await query.answer("سفارش پیدا نشد.", show_alert=True)
+            return True
+        if row["delivered_at"]:
+            await query.answer("این سفارش قبلاً تحویل‌شده ثبت شده است.", show_alert=True)
+            return True
+        if row["status"] not in {"پرداخت تأیید شد - در انتظار تحویل", "تأیید شده"}:
+            await query.answer("ابتدا باید پرداخت سفارش تأیید شده باشد.", show_alert=True)
+            return True
+        await query.edit_message_text(
+            f"⚠️ تأیید تحویل دستی\n\nآیا واقعاً گیفت سفارش {row['order_code'] or ('#'+str(order_id))} را خارج از ربات برای گیرنده ارسال کرده‌ای؟\n\nفقط پس از ارسال واقعی، تأیید کن. این کار زمان تحویل را ثبت می‌کند و به مشتری اطلاع می‌دهد.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ بله، واقعاً تحویل داده‌ام", callback_data=f"gift_manual_delivered_yes_{order_id}", style="success")],
+                [InlineKeyboardButton("❌ نه، بازگشت", callback_data=f"gift_order_view_{order_id}", style="danger")],
+            ]),
+        )
+        return True
+
+    if data == "gift_order_search":
+        context.user_data["gift_order_search_state"] = True
+        await query.edit_message_text("🔎 کد سفارش، ID عددی خریدار/گیرنده یا آیدی تلگرام (@username) را بفرست.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو جست‌وجو", callback_data="gift_search_cancel")]]))
+        return True
+
+    if data == "gift_search_cancel":
+        context.user_data.pop("gift_order_search_state", None)
+        await query.edit_message_text("جست‌وجوی سفارش لغو شد.", reply_markup=gift_admin_home_keyboard())
+        return True
+
+    if data.startswith("admin_support_search_id_"):
+        search_value = data.rsplit("_", 1)[1]
+        rows = find_orders_for_support(search_value)
+        await query.edit_message_text(render_order_search_results(rows, search_value), reply_markup=order_search_results_keyboard(rows))
+        return True
+
+    if data == "admin_support_tickets":
+        with db() as con:
+            rows = con.execute("SELECT id,ticket_code,status,buyer_user_id,product_name,created_at FROM support_tickets ORDER BY id DESC LIMIT 12").fetchall()
+            total = int(con.execute("SELECT COUNT(*) FROM support_tickets").fetchone()[0])
+        lines = [f"💬 مدیریت پیام‌های پشتیبانی | کل تیکت‌ها: {total}", "━━━━━━━━━━━━━━━━━━"]
+        buttons=[]
+        for row in rows:
+            lines.append(f"\n{row['ticket_code']} | {row['status']}\nID خریدار: {row['buyer_user_id']} | {row['product_name']}\n{format_iran_jalali_datetime(row['created_at'])}")
+            buttons.append([InlineKeyboardButton(f"📩 {row['ticket_code']} | {row['status']}", callback_data=f"admin_ticket_view_{row['id']}")])
+        if not rows:
+            lines.append("\nهنوز تیکتی ثبت نشده است.")
+        buttons.extend([[InlineKeyboardButton("🔎 جست‌وجو با ID / @ / کد سفارش", callback_data="admin_support_search")],
+                        [InlineKeyboardButton("🔙 بازگشت به مدیریت", callback_data="admin")]])
+        await query.edit_message_text("\n".join(lines)[:3900], reply_markup=InlineKeyboardMarkup(buttons))
+        return True
+
+    if data == "admin_support_search":
+        context.user_data["support_admin_search_state"] = True
+        await query.edit_message_text("🔎 ID عددی خریدار، ID گیرنده، @username، کد سفارش یا شماره تیکت را بفرست.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو جست‌وجو", callback_data="admin_support_search_cancel")]]))
+        return True
+
+    if data == "admin_support_search_cancel":
+        context.user_data.pop("support_admin_search_state", None)
+        await query.edit_message_text("جست‌وجو لغو شد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 مدیریت تیکت‌ها", callback_data="admin_support_tickets")]]))
+        return True
+
+    if data.startswith("admin_ticket_view_"):
+        ticket_id = int(data.rsplit("_", 1)[1])
+        with db() as con:
+            detail = support_ticket_detail(con, ticket_id)
+        if not detail:
+            await query.edit_message_text("تیکت پیدا نشد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 تیکت‌ها", callback_data="admin_support_tickets")]]))
+        else:
+            await query.edit_message_text(detail[:3900], reply_markup=create_support_ticket_keyboard(ticket_id))
+        return True
+
+    if data.startswith("admin_ticket_attachments_"):
+        ticket_id = int(data.rsplit("_", 1)[1])
+        with db() as con:
+            ticket = con.execute("SELECT ticket_code FROM support_tickets WHERE id=?", (ticket_id,)).fetchone()
+            files = con.execute("SELECT telegram_file_id,media_type,message_text,created_at FROM support_ticket_messages WHERE ticket_id=? AND telegram_file_id!='' ORDER BY id", (ticket_id,)).fetchall()
+        if not ticket:
+            await query.answer("تیکت پیدا نشد.", show_alert=True)
+            return True
+        sent = 0
+        for item in files:
+            caption = f"📎 پیوست تیکت {ticket['ticket_code']}\nزمان: {format_iran_jalali_datetime(item['created_at'])}\n{str(item['message_text'] or '')}"
+            try:
+                await deliver_support_attachment_to_admin(context.bot, item["telegram_file_id"], item["media_type"], caption)
+                sent += 1
+            except Exception:
+                logger.exception("Could not resend support attachment for ticket=%s", ticket["ticket_code"])
+        await query.answer(f"{sent} پیوست از {len(files)} پیوست دوباره ارسال شد.", show_alert=True)
+        return True
+
+    if data == "admin_ticket_reply_cancel":
+        context.user_data.pop("support_admin_reply_state", None)
+        await query.edit_message_text("❌ پاسخ‌گویی لغو شد؛ پیامی برای مشتری ارسال نشد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 تیکت‌ها", callback_data="admin_support_tickets")]]))
+        return True
+
+    if data.startswith("admin_ticket_reply_"):
+        ticket_id = int(data.rsplit("_", 1)[1])
+        with db() as con:
+            row = con.execute("SELECT ticket_code,sender_user_id FROM support_tickets WHERE id=?", (ticket_id,)).fetchone()
+        if not row:
+            await query.answer("تیکت پیدا نشد.", show_alert=True)
+            return True
+        context.user_data["support_admin_reply_state"] = {"ticket_id": ticket_id, "chat_id": query.message.chat_id, "message_id": query.message.message_id}
+        await query.edit_message_text(f"↩️ پاسخ به مشتری | {row['ticket_code']}\n\nمتن پاسخ خود را بفرست. پاسخ از طریق ربات برای مشتری ارسال می‌شود.\nبرای لغو /cancel را بزن.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو پاسخ", callback_data="admin_ticket_reply_cancel")]]))
+        return True
+
+    if data.startswith("admin_ticket_status_"):
+        parts = data.split("_")
+        new_status = {"review": "در حال بررسی", "replied": "پاسخ داده‌شده", "closed": "بسته‌شده"}.get(parts[-2])
+        ticket_id = int(parts[-1])
+        if not new_status:
+            await query.answer("وضعیت نامعتبر است.", show_alert=True)
+            return True
+        with db() as con:
+            con.execute("UPDATE support_tickets SET status=?,updated_at=? WHERE id=?", (new_status, iran_timestamp_now(), ticket_id))
+            if new_status == "بسته‌شده":
+                con.execute("DELETE FROM support_active_tickets WHERE ticket_id=?", (ticket_id,))
+        with db() as con:
+            detail = support_ticket_detail(con, ticket_id)
+        await query.edit_message_text(detail[:3900] if detail else "تیکت پیدا نشد.", reply_markup=create_support_ticket_keyboard(ticket_id))
+        return True
+
+    if data.startswith("admin_ticket_order_"):
+        ticket_id = int(data.rsplit("_", 1)[1])
+        with db() as con:
+            ticket = con.execute("SELECT order_id,order_code,buyer_user_id,recipient_user_id FROM support_tickets WHERE id=?", (ticket_id,)).fetchone()
+        if not ticket:
+            await query.answer("تیکت پیدا نشد.", show_alert=True)
+            return True
+        if ticket["order_id"]:
+            # Re-use the existing order detail screen.
+            from types import SimpleNamespace
+            q = query
+            q.data = f"admin_order_view_{ticket['order_id']}"
+            await _callbacks_impl(update_from_query(query), context)
+        else:
+            rows = find_orders_for_support(str(ticket["buyer_user_id"]))
+            await query.edit_message_text("سفارش دقیق به تیکت متصل نبود. سفارش‌های این ID:", reply_markup=order_search_results_keyboard(rows))
+        return True
+
+    return False
+
+
+def update_from_query(query):
+    """Build a minimal Update wrapper for the existing order-detail callback route."""
+    from types import SimpleNamespace
+    return SimpleNamespace(callback_query=query, effective_user=query.from_user, effective_chat=query.message.chat, effective_message=query.message)
+
+
+def find_orders_for_support(search_value):
+    value = str(search_value or "").strip()
+    normalized = normalize_ascii_digits(value)
+    with db() as con:
+        if normalized.upper().startswith("SP-T"):
+            ticket = con.execute("SELECT order_id FROM support_tickets WHERE upper(ticket_code)=?", (normalized.upper(),)).fetchone()
+            if ticket and ticket["order_id"]:
+                return con.execute("SELECT o.id,o.user_id,o.product_id,o.price,o.status,o.order_code,p.name AS product_name FROM orders o LEFT JOIN products p ON p.id=o.product_id WHERE o.id=?", (ticket["order_id"],)).fetchall()
+        if normalized.upper().startswith("SP-"):
+            return con.execute("SELECT o.id,o.user_id,o.product_id,o.price,o.status,o.order_code,p.name AS product_name FROM orders o LEFT JOIN products p ON p.id=o.product_id WHERE upper(o.order_code)=?", (normalized.upper(),)).fetchall()
+        if normalized.startswith("#"):
+            normalized = normalized[1:]
+        if normalized.isdigit():
+            return con.execute(
+                "SELECT o.id,o.user_id,o.product_id,o.price,o.status,o.order_code,p.name AS product_name FROM orders o LEFT JOIN products p ON p.id=o.product_id WHERE o.id=? OR o.user_id=? OR o.recipient_user_id=? ORDER BY o.id DESC LIMIT 20",
+                (int(normalized), int(normalized), int(normalized)),
+            ).fetchall()
+        username = normalized if normalized.startswith("@") else "@" + normalized
+        username = username.lstrip("@").lower()
+        return con.execute(
+            "SELECT o.id,o.user_id,o.product_id,o.price,o.status,o.order_code,p.name AS product_name FROM orders o LEFT JOIN products p ON p.id=o.product_id WHERE lower(o.buyer_username)=? OR lower(o.recipient_username)=? ORDER BY o.id DESC LIMIT 20",
+            (username, "@" + username),
+        ).fetchall()
+
+
+def render_order_search_results(rows, query_value):
+    if not rows:
+        return f"🔎 نتیجه‌ای برای «{query_value}» پیدا نشد.\n\nمی‌توانی ID عددی، @username یا کد سفارش را دوباره بررسی کنی."
+    lines = [f"🔎 نتایج جست‌وجو: {query_value}", "━━━━━━━━━━━━━━━━━━"]
+    for row in rows:
+        lines.append(f"\n🧾 {row['order_code'] or ('#'+str(row['id']))}\nمحصول: {row['product_name'] or 'ثبت نشده'}\nID خریدار: {row['user_id']}\nمبلغ: {toman(row['price'])}\nوضعیت: {row['status']}")
+    return "\n".join(lines)[:3900]
+
+
+def order_search_results_keyboard(rows):
+    buttons=[]
+    for row in rows[:10]:
+        buttons.append([InlineKeyboardButton(f"🔎 سفارش {row['order_code'] or ('#'+str(row['id']))}", callback_data=f"admin_order_view_{row['id']}")])
+    buttons.append([InlineKeyboardButton("🔙 بازگشت به تیکت‌ها", callback_data="admin_support_tickets")])
+    return InlineKeyboardMarkup(buttons)
+
+
 async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query.data == "check_membership":
@@ -3272,6 +4933,9 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
     data = query.data
+
+    if await handle_gift_support_callback(query, context):
+        return
 
     if data == "cancel_public_request":
         context.user_data.pop("mediator_request_state", None)
@@ -3766,10 +5430,12 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "🎁 استارز برای شخص دیگر\n\n"
                 "لطفاً آیدی عمومی دریافت‌کننده را با @ ارسال کن؛ مثال: @SeyedPro_AIA\n"
                 "🔐 رمز عبور یا کد ورود را ارسال نکن.\n\n"
-                "پس از ثبت آیدی، قیمت دوباره بررسی می‌شود.",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("‹ بازگشت به بسته‌ها", callback_data="stars_detail_back", style="danger")
-                ]]),
+                "پس از ثبت آیدی، قیمت دوباره بررسی می‌شود."
+            )
+            await context.bot.send_message(
+                chat_id=int(query.message.chat_id),
+                text="برای لغو این سفارش، فقط دکمهٔ «❌ لغو سفارش» در کیبورد پایین را بزن.",
+                reply_markup=customer_order_cancel_keyboard(),
             )
             return
 
@@ -4291,8 +5957,12 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["stars_custom_wait_recipient"] = {"role": "self"}
             await query.edit_message_text(
                 "برای این سفارش، آیدی عمومی تلگرام را ارسال کن؛ مثلاً @SeyedPro_AIA.\n"
-                "حساب شما نام کاربری عمومی ندارد، بنابراین برای تحویل باید آیدی دریافت‌کننده ثبت شود.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ بازگشت", callback_data="customstars_back", style="danger")]]),
+                "حساب شما نام کاربری عمومی ندارد، بنابراین برای تحویل باید آیدی دریافت‌کننده ثبت شود."
+            )
+            await context.bot.send_message(
+                chat_id=int(query.message.chat_id),
+                text="برای لغو این سفارش، فقط دکمهٔ «❌ لغو سفارش» در کیبورد پایین را بزن.",
+                reply_markup=customer_order_cancel_keyboard(),
             )
             return
         order["recipient"] = "@" + username.lstrip("@")
@@ -4310,8 +5980,12 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["stars_custom_wait_recipient"] = {"role": "other"}
         await query.edit_message_text(
             "آیدی عمومی دریافت‌کننده را با @ ارسال کن؛ مثال: @SeyedPro_AIA\n"
-            "اطلاعات ورود یا کد تأیید را ارسال نکن.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ بازگشت", callback_data="customstars_back", style="danger")]]),
+            "اطلاعات ورود یا کد تأیید را ارسال نکن."
+        )
+        await context.bot.send_message(
+            chat_id=int(query.message.chat_id),
+            text="برای لغو این سفارش، فقط دکمهٔ «❌ لغو سفارش» در کیبورد پایین را بزن.",
+            reply_markup=customer_order_cancel_keyboard(),
         )
         return
 
@@ -5091,41 +6765,29 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         buttons = []
         if category == "gifts":
-            gift_order = ["💝", "🧸", "🎁", "🌹", "🎂", "💐", "🚀", "🍾", "🏆", "💎", "💍"]
-            gift_products = {}
-            for product in rows:
-                for emoji in gift_order:
-                    if emoji in product["name"]:
-                        gift_products[emoji] = product
-                        break
-
-            for i in range(0, len(gift_order), 3):
-                row_buttons = []
-                for emoji in gift_order[i:i + 3]:
-                    product = gift_products.get(emoji)
-                    if product:
-                        button_text = f"{emoji} {product['price']:,}"
-                        row_buttons.append(
-                            InlineKeyboardButton(
-                                button_text,
-                                callback_data=f"buy_{product['id']}",
-                                style={
-                                    "💝": "danger",
-                                    "🧸": "primary",
-                                    "🎁": "success",
-                                    "🌹": "danger",
-                                    "🎂": "primary",
-                                    "💐": "success",
-                                    "🚀": "primary",
-                                    "🍾": "success",
-                                    "🏆": "success",
-                                    "💎": "primary",
-                                    "💍": "danger",
-                                }.get(emoji, "success"),
-                            )
-                        )
-                if row_buttons:
+            # Dynamic product list: official gifts and custom gifts are shown from DB.
+            # No hard-coded emoji catalogue; new products appear automatically.
+            row_buttons = []
+            gift_cfg_for_menu = load_gift_settings()
+            for product in rows[:90]:
+                price_value = int(product["price"] or 0)
+                if gift_cfg_for_menu.get("auto_rate_enabled") and product["source_type"] == "official":
+                    live_value = gift_price_for_stars(product["star_count"], gift_cfg_for_menu)
+                    price_value = int(live_value or 0)
+                currency = str(product["currency"] or "تومان")
+                price_text = f"{price_value:,} {currency}" if price_value > 0 else ("قیمت زنده ناموجود" if gift_cfg_for_menu.get("auto_rate_enabled") else "قیمت تنظیم نشده")
+                icon = str(product["icon"] or "🎁").strip() or "🎁"
+                label = str(product["button_text"] or product["name"]).strip()
+                row_buttons.append(InlineKeyboardButton(
+                    f"{icon} {label[:26]} | {price_text}"[:64],
+                    callback_data=f"buy_{product['id']}",
+                    style=str(product["button_style"] or "success") if str(product["button_style"] or "success") in {"primary", "success", "danger"} else "success",
+                ))
+                if len(row_buttons) == 2:
                     buttons.append(row_buttons)
+                    row_buttons = []
+            if row_buttons:
+                buttons.append(row_buttons)
         else:
             for product in rows:
                 price_value = int(product["price"] or 0)
@@ -5227,6 +6889,28 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         context.user_data["pending_product_id"] = product_id
         context.user_data.pop("pending_product_coupon", None)
+        if product_category == "gifts":
+            gift_cfg = load_gift_settings()
+            can_offer_auto = (
+                product["source_type"] == "official"
+                and bool(product["telegram_gift_id"])
+                and str(product["delivery_mode"] or "manual") == "auto"
+                and not gift_cfg.get("manual_delivery_all")
+            )
+            if gift_cfg.get("customer_delivery_choice") and can_offer_auto:
+                context.user_data["pending_gift_delivery_product_id"] = product_id
+                await query.edit_message_text(
+                    f"🎁 روش تحویل «{product['name']}» را انتخاب کن.\n\n"
+                    "⚡ ارسال خودکار توسط ربات فقط پس از تأیید پرداخت و در صورت موفقیت واقعی تلگرام انجام می‌شود.\n"
+                    "👤 تحویل دستی توسط پشتیبانی نیز در دسترس است.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("⚡ ارسال خودکار با ربات", callback_data=f"gift_customer_delivery_auto_{product_id}", style="success")],
+                        [InlineKeyboardButton("👤 تحویل دستی توسط پشتیبانی", callback_data=f"gift_customer_delivery_manual_{product_id}", style="primary")],
+                        [InlineKeyboardButton("❌ لغو سفارش", callback_data="gift_customer_delivery_cancel", style="danger")],
+                    ]),
+                )
+                return
+            context.user_data["pending_gift_delivery_mode"] = "manual" if gift_cfg.get("manual_delivery_all") else ("auto" if can_offer_auto else "manual")
         context.user_data.pop("pending_product_coupon_input", None)
         prompt = product_details_prompt(product)
         description = str(product["description"] or "").strip() if "description" in product.keys() else ""
@@ -5235,6 +6919,15 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         display_title = str(product["button_text"] or "").strip() or str(product["name"])
         currency = str(product["currency"] or "تومان") if "currency" in product.keys() else "تومان"
         current_price = int(dynamic_quote["sale_toman"]) if dynamic_quote else int(product["price"] or 0)
+        if product_category == "gifts" and product["source_type"] == "official" and load_gift_settings().get("auto_rate_enabled"):
+            gift_live = gift_price_for_stars(product["star_count"], load_gift_settings())
+            if gift_live is None:
+                await query.answer("قیمت زندهٔ این گیفت فعلاً معتبر نیست؛ خرید متوقف شد.", show_alert=True)
+                context.user_data.pop("pending_product_id", None)
+                return
+            current_price = int(gift_live)
+            context.user_data["pending_gift_price_quote"] = {"product_id": product_id, "sale_toman": current_price}
+            currency = "تومان"
         if dynamic_quote:
             currency = "تومان"
         old_price = int(product["old_price"] or 0) if (not dynamic_quote and "old_price" in product.keys()) else 0
@@ -5245,10 +6938,9 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         product_keyboard = []
         if current_price > 0:
             product_keyboard.append([InlineKeyboardButton("🏷️ وارد کردن کد تخفیف", callback_data=f"product_coupon_enter_{product_id}")])
-        product_keyboard.append([InlineKeyboardButton("🏠 لغو سفارش", callback_data="home")])
         product_message = (
             f"🛍 محصول انتخاب‌شده: {display_title}\n\n{prompt}\n\n"
-            "برای لغو، /start را بزنید."
+            "برای لغو سفارش از دکمهٔ «❌ لغو سفارش» در کیبورد پایین استفاده کن."
         )
         product_markup = InlineKeyboardMarkup(product_keyboard)
         image_file_id = str(product["image_file_id"] or "").strip() if "image_file_id" in product.keys() else ""
@@ -5273,6 +6965,11 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text(product_message, reply_markup=product_markup)
         else:
             await query.edit_message_text(product_message, reply_markup=product_markup)
+        await context.bot.send_message(
+            chat_id=int(query.message.chat_id),
+            text="اگر نمی‌خواهی ادامه بدهی، دکمهٔ «❌ لغو سفارش» را از کیبورد پایین بزن.",
+            reply_markup=customer_order_cancel_keyboard(),
+        )
         return
 
 
@@ -6518,7 +8215,9 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     SELECT orders.id, orders.user_id, orders.product_id,
                            orders.price, orders.status, orders.created_at,
                            orders.currency, orders.order_details, orders.receipt_file_id, orders.payment_method,
-                           products.name
+                           orders.buyer_username, orders.buyer_full_name, orders.recipient_user_id, orders.recipient_username,
+                           orders.product_name_snapshot, orders.order_code, orders.payment_verified_at, orders.delivered_at,
+                           orders.delivery_error, orders.delivery_mode, products.name, products.category
                     FROM orders
                     LEFT JOIN products ON products.id = orders.product_id
                     WHERE orders.id = ?
@@ -6533,35 +8232,34 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
-            keyboard = [
-                [InlineKeyboardButton(
-                    "✅ تأیید سفارش",
-                    callback_data=f"admin_order_approve_{order_id}"
-                )],
-                [InlineKeyboardButton(
-                    "❌ رد سفارش",
-                    callback_data=f"admin_order_reject_{order_id}"
-                )],
-                [InlineKeyboardButton(
-                    "🗑 حذف سفارش",
-                    callback_data=f"admin_order_delete_confirm_{order_id}"
-                )],
-                [InlineKeyboardButton(
-                    "⬅️ فهرست سفارش‌ها",
-                    callback_data="admin_orders"
-                )]
-            ]
+            keyboard = []
+            if not order["payment_verified_at"] and not order["delivered_at"]:
+                keyboard.extend([
+                    [InlineKeyboardButton("✅ تأیید سفارش", callback_data=f"admin_order_approve_{order_id}", style="success")],
+                    [InlineKeyboardButton("❌ رد سفارش", callback_data=f"admin_order_reject_{order_id}", style="danger")],
+                ])
+            elif str(order["category"] or "").lower() == "gifts" and not order["delivered_at"]:
+                keyboard.append([InlineKeyboardButton("🎁 جزئیات / ثبت تحویل گیفت", callback_data=f"gift_order_view_{order_id}", style="success")])
+            keyboard.extend([
+                [InlineKeyboardButton("🗑 حذف سفارش", callback_data=f"admin_order_delete_confirm_{order_id}")],
+                [InlineKeyboardButton("⬅️ فهرست سفارش‌ها", callback_data="admin_orders")],
+            ])
 
             await query.edit_message_text(
                 f"📦 سفارش #{order['id']}\n\n"
-                f"👤 مشتری: {order['user_id']}\n"
-                f"🛍 محصول: {order['name'] or ('محصول #' + str(order['product_id']))}\n"
-                f"💰 مبلغ: {order['price']:,} {order['currency'] or 'تومان'}\n"
-                f"📝 جزئیات: {order['order_details'] or 'ثبت نشده'}\n"
-                f"💳 روش پرداخت: {order['payment_method'] or 'نامشخص'}\n"
-                f"🧾 رسید: {'ثبت شده' if order['receipt_file_id'] else 'ثبت نشده'}\n"
-                f"📌 وضعیت: {order['status']}\n"
-                f"🕒 تاریخ: {order['created_at']}",
+                f"👤 اطلاعات خریدار\nID عددی خریدار: {order['user_id']}\nآیدی تلگرام خریدار: {'@'+order['buyer_username'] if order['buyer_username'] else 'تنظیم نشده'}\n"
+                + (f"\n🎯 اطلاعات گیرنده\nID عددی گیرنده: {order['recipient_user_id'] or 'ثبت نشده'}\nآیدی تلگرام گیرنده: {order['recipient_username'] or 'ثبت نشده'}\n" if str(order['category'] or '').lower() == 'gifts' else "")
+                + f"\n🛍 محصول: {order['product_name_snapshot'] or order['name'] or ('محصول #' + str(order['product_id']))}\n"
+                + f"🧾 کد سفارش: {order['order_code'] or ('#'+str(order['id']))}\n"
+                + f"💰 مبلغ: {order['price']:,} {order['currency'] or 'تومان'}\n"
+                + f"📝 جزئیات: {order['order_details'] or 'ثبت نشده'}\n"
+                + f"💳 روش پرداخت: {order['payment_method'] or 'نامشخص'}\n"
+                + f"🧾 رسید: {'ثبت شده' if order['receipt_file_id'] else 'ثبت نشده'}\n"
+                + f"📌 وضعیت: {order['status']}\n"
+                + f"📅 زمان ثبت: {format_iran_jalali_datetime(order['created_at'])}\n"
+                + f"💳 زمان تأیید پرداخت: {format_iran_jalali_datetime(order['payment_verified_at'])}\n"
+                + f"📦 زمان تحویل: {format_iran_jalali_datetime(order['delivered_at'])}\n"
+                + f"⚠️ خطای ارسال: {order['delivery_error'] or 'ندارد'}",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
             return
@@ -6651,60 +8349,91 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data.startswith("admin_order_approve_") or data.startswith("admin_order_reject_"):
             approve = data.startswith("admin_order_approve_")
             order_id = int(data.rsplit("_", 1)[1])
-            status = "تأیید شده" if approve else "رد شده"
-
             with db() as con:
                 ensure_discount_schema(con)
                 con.execute("BEGIN IMMEDIATE")
                 order = con.execute(
-                    "SELECT user_id, status FROM orders WHERE id = ?",
-                    (order_id,)
+                    "SELECT o.user_id,o.status,o.delivery_mode,o.recipient_user_id,o.payment_verified_at,o.delivered_at,p.category,p.name AS product_name "
+                    "FROM orders o LEFT JOIN products p ON p.id=o.product_id WHERE o.id = ?",
+                    (order_id,),
                 ).fetchone()
-
                 if not order:
-                    await query.edit_message_text(
-                        "این سفارش پیدا نشد.",
-                        reply_markup=back_menu()
-                    )
+                    await query.edit_message_text("این سفارش پیدا نشد.", reply_markup=back_menu())
                     return
-
                 if approve and str(order["status"] or "") == "رد شده":
-                    await query.answer("این سفارش قبلاً رد شده؛ درخواست جدید ثبت شود.", show_alert=True)
+                    await query.answer("این سفارش قبلاً رد شده؛ سفارش جدید ثبت شود.", show_alert=True)
                     return
-                customer_id = order["user_id"]
+                if approve and order["payment_verified_at"]:
+                    already = " و قبلاً تحویل شده" if order["delivered_at"] else " و در انتظار تحویل است"
+                    await query.answer("پرداخت این سفارش قبلاً تأیید شده" + already + "؛ برای جلوگیری از پرداخت/ارسال تکراری، دوباره تأیید نشد.", show_alert=True)
+                    return
                 if approve and str(order["status"] or "") == "در انتظار ارسال رسید":
                     await query.answer("هنوز رسیدی ثبت نشده است؛ پیش از تأیید باید رسید را بررسی کنید.", show_alert=True)
                     return
+                customer_id = int(order["user_id"])
+                category = str(order["category"] or "").lower()
                 if approve:
+                    new_status = "پرداخت تأیید شد - در انتظار تحویل" if category == "gifts" else "تأیید شده"
+                    con.execute("UPDATE orders SET status=?,payment_verified_at=?,delivery_error='' WHERE id=?",
+                                (new_status, iran_timestamp_now(), order_id))
                     con.execute("UPDATE coupon_usage SET status='used' WHERE order_id=? AND status='pending'", (order_id,))
-                elif str(order["status"] or "") not in ("رد شده", "تأیید شده"):
+                    log_order_event(con, order_id, "payment_approved", new_status, "پرداخت توسط مدیر تأیید شد.", ADMIN_ID)
+                else:
+                    new_status = "رد شده"
                     pending_use = con.execute(
-                        "SELECT code FROM coupon_usage WHERE order_id=? AND status='pending' LIMIT 1",
-                        (order_id,)
+                        "SELECT code FROM coupon_usage WHERE order_id=? AND status='pending' LIMIT 1", (order_id,)
                     ).fetchone()
                     if pending_use:
                         con.execute("DELETE FROM coupon_usage WHERE order_id=? AND status='pending'", (order_id,))
-                        con.execute("UPDATE discount_codes SET total_uses=MAX(0, COALESCE(total_uses, 0)-1) WHERE code=?", (pending_use["code"],))
-                con.execute(
-                    "UPDATE orders SET status = ? WHERE id = ?",
-                    (status, order_id)
-                )
+                        con.execute("UPDATE discount_codes SET total_uses=MAX(0, COALESCE(total_uses,0)-1) WHERE code=?", (pending_use["code"],))
+                    con.execute("UPDATE orders SET status=? WHERE id=?", (new_status, order_id))
+                    log_order_event(con, order_id, "payment_rejected", new_status, "پرداخت/رسید توسط مدیر رد شد.", ADMIN_ID)
+
+            delivery_note = ""
+            if approve and category == "gifts":
+                result = await try_deliver_official_gift(context, order_id)
+                if result.get("ok"):
+                    delivery_note = "\n✅ گیفت با موفقیت از طریق API رسمی تلگرام ارسال شد؛ زمان تحویل ثبت شد."
+                    with db() as con:
+                        log_order_event(con, order_id, "gift_delivered_auto", "تحویل‌شده", "ارسال رسمی گیفت توسط Telegram Bot API موفق بود.", ADMIN_ID)
+                elif result.get("manual"):
+                    delivery_note = "\n✋ پرداخت تأیید شد؛ تحویل این سفارش دستی است و هنوز تحویل‌شده ثبت نشده."
+                    with db() as con:
+                        log_order_event(con, order_id, "awaiting_manual_delivery", "پرداخت تأیید شد - در انتظار تحویل", result.get("reason", ""), ADMIN_ID)
+                else:
+                    delivery_note = "\n⚠️ ارسال خودکار ناموفق بود؛ سفارش تحویل‌شده اعلام نشد و در انتظار تحویل باقی ماند.\nخطا: " + str(result.get("reason", "نامشخص"))[:300]
+                    with db() as con:
+                        log_order_event(con, order_id, "gift_auto_delivery_failed", "پرداخت تأیید شد - در انتظار تحویل", result.get("reason", ""), ADMIN_ID)
 
             try:
+                customer_text = f"📦 وضعیت سفارش شما در SEYED PREMIUM تغییر کرد.\nکد سفارش: SP-{order_id:06d}\nوضعیت: {new_status}"
+                if approve and category == "gifts":
+                    with db() as con:
+                        delivered = con.execute("SELECT delivered_at,order_code,delivery_mode FROM orders WHERE id=?", (order_id,)).fetchone()
+                    if delivered and delivered["delivered_at"]:
+                        customer_text = f"✅ گیفت سفارش شما با موفقیت ارسال شد.\nکد سفارش: {delivered['order_code'] or ('#'+str(order_id))}\nزمان تحویل: {format_iran_jalali_datetime(delivered['delivered_at'])}"
+                    else:
+                        order_code = delivered["order_code"] if delivered else ""
+                        customer_text = f"✅ پرداخت سفارش گیفت شما تأیید شد.\nکد سفارش: {order_code or ('#'+str(order_id))}\nوضعیت: در انتظار تحویل توسط مدیریت."
+                        cfg = load_gift_settings()
+                        if cfg.get("support_first"):
+                            customer_text += "\n\n" + cfg["support_text"]
                 await context.bot.send_message(
                     chat_id=customer_id,
-                    text=f"📦 وضعیت سفارش شما در SEYED PREMIUM تغییر کرد.\nشماره سفارش: #{order_id}\nوضعیت: {status}"
+                    text=customer_text,
+                    reply_markup=(InlineKeyboardMarkup([[InlineKeyboardButton("💬 ارسال پیام به پشتیبانی", callback_data="support")]])
+                                  if approve and category == "gifts" and load_gift_settings().get("support_first") else None),
                 )
             except Exception:
-                pass
+                logger.exception("Could not notify customer about order #%s", order_id)
 
+            admin_text = f"✅ پرداخت سفارش #{order_id} تأیید شد." if approve else f"❌ سفارش #{order_id} رد شد."
             await query.edit_message_text(
-                f"✅ وضعیت سفارش #{order_id}: {status}",
+                admin_text + delivery_note,
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(
-                        "📦 فهرست سفارش‌ها",
-                        callback_data="admin_orders"
-                    )]
+                    [InlineKeyboardButton("🔎 جزئیات سفارش", callback_data=f"admin_order_view_{order_id}")],
+                    [InlineKeyboardButton("🎁 سفارش‌های گیفت", callback_data="gift_orders")],
+                    [InlineKeyboardButton("📦 فهرست سفارش‌ها", callback_data="admin_orders")],
                 ])
             )
             return
@@ -6777,6 +8506,24 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cancel_coupon_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     message = update.effective_message
+    if user and user.id == ADMIN_ID:
+        cleared = False
+        for key in ("gift_admin_input", "gift_custom_state", "support_admin_reply_state", "support_admin_search_state", "gift_order_search_state"):
+            if context.user_data.pop(key, None) is not None:
+                cleared = True
+        if cleared and message:
+            await message.reply_text("❌ عملیات مدیریتی لغو شد؛ مرحلهٔ ناقص ذخیره نشد.")
+            return
+    if user and user.id != ADMIN_ID:
+        with db() as con:
+            con.execute("DELETE FROM support_form_sessions WHERE user_id=?", (user.id,))
+            active_ticket = con.execute("SELECT ticket_id FROM support_active_tickets WHERE user_id=?", (user.id,)).fetchone()
+            if active_ticket:
+                con.execute("DELETE FROM support_active_tickets WHERE user_id=?", (user.id,))
+        context.user_data.pop("support_form_active", None)
+        if active_ticket and message:
+            await message.reply_text("✅ گفت‌وگوی پشتیبانی پایان یافت؛ تیکت و سوابق آن برای مدیریت محفوظ است.", reply_markup=main_menu())
+            return
     # /cancel exits transient Stars quantity/recipient forms without creating an order.
     if user and user.id != ADMIN_ID and (context.user_data.get("stars_custom_amount") is not None or context.user_data.get("stars_custom_order") or context.user_data.get("stars_custom_wait_recipient") or context.user_data.get("stars_fixed_wait_recipient")):
         was_waiting_fixed_recipient = bool(context.user_data.get("stars_fixed_wait_recipient"))
@@ -6996,6 +8743,265 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if user:
         register_user(user)
 
+    # Persistent support form: a copied form is parsed only while this user has opened support.
+    if message and user and user.id != ADMIN_ID:
+        with db() as con:
+            support_session = con.execute("SELECT user_id FROM support_form_sessions WHERE user_id=?", (user.id,)).fetchone()
+        if support_session:
+            if not message.text:
+                await message.reply_text("ابتدا فرم متنی پشتیبانی را کپی و تکمیل کن و همین‌جا بفرست. پس از ثبت تیکت می‌توانی عکس و فایل هم ارسال کنی.")
+                return
+            if _is_customer_cancel_text(message.text):
+                with db() as con:
+                    con.execute("DELETE FROM support_form_sessions WHERE user_id=?", (user.id,))
+                context.user_data.pop("support_form_active", None)
+                await message.reply_text("❌ ارسال پیام به پشتیبانی لغو شد؛ تیکتی ثبت نشد.", reply_markup=main_menu())
+                return
+            parsed_support = parse_support_form(message.text)
+            await create_support_ticket(update, context, parsed_support)
+            return
+        with db() as con:
+            active_ticket = con.execute("SELECT ticket_id FROM support_active_tickets WHERE user_id=?", (user.id,)).fetchone()
+        if active_ticket:
+            if message.text and _is_customer_cancel_text(message.text):
+                with db() as con:
+                    con.execute("DELETE FROM support_active_tickets WHERE user_id=?", (user.id,))
+                await message.reply_text("✅ گفت‌وگوی پشتیبانی پایان یافت؛ سوابق تیکت محفوظ است.", reply_markup=main_menu())
+                return
+            await append_support_customer_message(update, context, int(active_ticket["ticket_id"]))
+            return
+
+    # Admin reply to a ticket is sent first; only a successful Telegram send is saved as delivered.
+    if message and message.text and user and user.id == ADMIN_ID and context.user_data.get("support_admin_reply_state"):
+        state = context.user_data.get("support_admin_reply_state") or {}
+        reply_text = message.text.strip()
+        if _is_customer_cancel_text(reply_text) or reply_text.lower() == "/cancel":
+            context.user_data.pop("support_admin_reply_state", None)
+            await message.reply_text("❌ پاسخ‌گویی لغو شد؛ پیامی ارسال نشد.")
+            return
+        if not reply_text or len(reply_text) > 3500:
+            await message.reply_text("متن پاسخ باید بین ۱ تا ۳۵۰۰ نویسه باشد. دوباره بفرست یا /cancel بزن.")
+            return
+        ticket_id = int(state.get("ticket_id") or 0)
+        with db() as con:
+            ticket = con.execute("SELECT sender_user_id,ticket_code FROM support_tickets WHERE id=?", (ticket_id,)).fetchone()
+        if not ticket:
+            context.user_data.pop("support_admin_reply_state", None)
+            await message.reply_text("تیکت پیدا نشد؛ پاسخ ارسال نشد.")
+            return
+        try:
+            await context.bot.send_message(
+                chat_id=int(ticket["sender_user_id"]),
+                text=f"💎 پاسخ پشتیبانی SEYED PREMIUM\nشماره پیگیری: {ticket['ticket_code']}\n━━━━━━━━━━━━━━━━━━\n{reply_text}",
+            )
+        except Exception as exc:
+            logger.exception("Support reply delivery failed for ticket_id=%s", ticket_id)
+            await message.reply_text("❌ ارسال پاسخ به مشتری ناموفق بود؛ پاسخ به‌عنوان ارسال‌شده ذخیره نشد.\n" + str(exc)[:250])
+            return
+        now = iran_timestamp_now()
+        with db() as con:
+            con.execute("INSERT INTO support_ticket_messages(ticket_id,sender_user_id,sender_role,message_text,created_at) VALUES(?,?,'admin',?,?)",
+                        (ticket_id, ADMIN_ID, reply_text, now))
+            con.execute("UPDATE support_tickets SET status='پاسخ داده‌شده',updated_at=?,admin_replied_at=?,last_admin_id=? WHERE id=?",
+                        (now, now, ADMIN_ID, ticket_id))
+        context.user_data.pop("support_admin_reply_state", None)
+        await message.reply_text(f"✅ پاسخ با موفقیت برای مشتری ارسال و در سوابق تیکت {ticket['ticket_code']} ثبت شد.")
+        return
+
+    # Admin searches tickets/orders by numeric ID, username, ticket code or order code.
+    if message and message.text and user and user.id == ADMIN_ID and context.user_data.get("support_admin_search_state"):
+        value = message.text.strip()
+        if _is_customer_cancel_text(value) or value.lower() == "/cancel":
+            context.user_data.pop("support_admin_search_state", None)
+            await message.reply_text("❌ جست‌وجو لغو شد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💬 مدیریت تیکت‌ها", callback_data="admin_support_tickets")]]))
+            return
+        context.user_data.pop("support_admin_search_state", None)
+        orders_found = find_orders_for_support(value)
+        norm = normalize_ascii_digits(value).strip().lstrip("#")
+        with db() as con:
+            if norm.upper().startswith("SP-T"):
+                tickets_found = con.execute("SELECT id,ticket_code,status,buyer_user_id,product_name,created_at FROM support_tickets WHERE upper(ticket_code)=?", (norm.upper(),)).fetchall()
+            elif norm.isdigit():
+                tickets_found = con.execute("SELECT id,ticket_code,status,buyer_user_id,product_name,created_at FROM support_tickets WHERE buyer_user_id=? OR recipient_user_id=? OR sender_user_id=? ORDER BY id DESC LIMIT 10", (int(norm), int(norm), int(norm))).fetchall()
+            else:
+                uname = (norm if norm.startswith("@") else "@" + norm).lstrip("@").lower()
+                tickets_found = con.execute("SELECT id,ticket_code,status,buyer_user_id,product_name,created_at FROM support_tickets WHERE lower(sender_username)=? OR lower(buyer_username)=? OR lower(recipient_username)=? ORDER BY id DESC LIMIT 10", (uname, uname, "@"+uname)).fetchall()
+        lines = [f"🔎 نتیجه جست‌وجو برای: {value}", "━━━━━━━━━━━━━━━━━━"]
+        buttons = []
+        if tickets_found:
+            lines.append("\n💬 تیکت‌ها:")
+            for row in tickets_found:
+                lines.append(f"{row['ticket_code']} | {row['status']} | ID {row['buyer_user_id']} | {format_iran_jalali_datetime(row['created_at'])}")
+                buttons.append([InlineKeyboardButton(f"📩 {row['ticket_code']}", callback_data=f"admin_ticket_view_{row['id']}")])
+        if orders_found:
+            lines.append("\n📦 سفارش‌ها:")
+            for row in orders_found[:10]:
+                lines.append(f"{row['order_code'] or ('#'+str(row['id']))} | {row['product_name'] or 'محصول'} | {row['status']}")
+                buttons.append([InlineKeyboardButton(f"🔎 سفارش {row['order_code'] or ('#'+str(row['id']))}", callback_data=f"admin_order_view_{row['id']}")])
+        if not tickets_found and not orders_found:
+            lines.append("\nنتیجه‌ای پیدا نشد. ID، @username یا کد را بررسی کن.")
+        buttons.append([InlineKeyboardButton("🔙 مدیریت تیکت‌ها", callback_data="admin_support_tickets")])
+        await message.reply_text("\n".join(lines)[:3900], reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if message and message.text and user and user.id == ADMIN_ID and context.user_data.get("gift_order_search_state"):
+        value = message.text.strip()
+        if _is_customer_cancel_text(value) or value.lower() == "/cancel":
+            context.user_data.pop("gift_order_search_state", None)
+            await message.reply_text("❌ جست‌وجو لغو شد.", reply_markup=gift_admin_home_keyboard())
+            return
+        context.user_data.pop("gift_order_search_state", None)
+        found = find_orders_for_support(value)
+        gift_rows = []
+        if found:
+            ids = [int(r["id"]) for r in found]
+            with db() as con:
+                placeholders = ",".join("?" for _ in ids)
+                gift_rows = con.execute(
+                    f"SELECT o.id,o.order_code,o.status,p.name AS product_name,o.user_id,o.recipient_user_id,o.price FROM orders o JOIN products p ON p.id=o.product_id WHERE lower(p.category)='gifts' AND o.id IN ({placeholders}) ORDER BY o.id DESC",
+                    ids,
+                ).fetchall()
+        if gift_rows:
+            lines = [f"🔎 سفارش‌های گیفت برای: {value}"]
+            buttons=[]
+            for row in gift_rows:
+                code = row["order_code"] or f"#{row['id']}"
+                lines.append(f"\n{code} | {row['product_name']}\nخریدار ID: {row['user_id']} | گیرنده ID: {row['recipient_user_id'] or 'ثبت نشده'}\nمبلغ: {toman(row['price'])} | وضعیت: {row['status']}")
+                buttons.append([InlineKeyboardButton(f"🔎 جزئیات {code}", callback_data=f"gift_order_view_{row['id']}")])
+            buttons.append([InlineKeyboardButton("🔙 سفارش‌های گیفت", callback_data="gift_orders")])
+            await message.reply_text("\n".join(lines)[:3900], reply_markup=InlineKeyboardMarkup(buttons))
+        else:
+            await message.reply_text("برای این جست‌وجو سفارش گیفتی پیدا نشد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 سفارش‌های گیفت", callback_data="gift_orders")]]))
+        return
+
+    # Gift pricing/settings editor and owner top-up custom amount.
+    gift_input = context.user_data.get("gift_admin_input") if user and user.id == ADMIN_ID else None
+    if message and message.text and gift_input:
+        raw = message.text.strip()
+        if _is_customer_cancel_text(raw) or raw.lower() == "/cancel":
+            context.user_data.pop("gift_admin_input", None)
+            await message.reply_text("❌ عملیات لغو شد؛ هیچ تغییری ذخیره نشد.", reply_markup=gift_admin_home_keyboard())
+            return
+        field = gift_input.get("field")
+        if field == "base_star_rate":
+            clean = normalize_ascii_digits(raw).replace(",", "").replace("٬", "").replace("،", "").strip()
+            if not clean.isdigit() or not 1 <= int(clean) <= 100000000:
+                await message.reply_text("❌ نرخ باید عددی بین ۱ تا ۱۰۰٬۰۰۰٬۰۰۰ تومان باشد. دوباره بفرست یا /cancel را بزن.")
+                return
+            cfg = load_gift_settings(); cfg["base_star_rate_toman"] = int(clean); save_gift_settings(cfg)
+            sync_gift_prices_in_db()
+            context.user_data.pop("gift_admin_input", None)
+            await message.reply_text("✅ نرخ پایه ذخیره شد و قیمت گیفت‌های رسمی بر اساس نرخ جدید محاسبه شد.", reply_markup=gift_admin_home_keyboard())
+            return
+        if field == "profit_percent":
+            clean = normalize_ascii_digits(raw).replace("٪", "").replace("%", "").strip()
+            if not clean.isdigit() or not 0 <= int(clean) <= 1000:
+                await message.reply_text("❌ درصد سود باید عددی بین ۰ تا ۱۰۰۰ باشد.")
+                return
+            cfg = load_gift_settings(); cfg["profit_percent"] = int(clean); save_gift_settings(cfg)
+            sync_gift_prices_in_db()
+            context.user_data.pop("gift_admin_input", None)
+            await message.reply_text("✅ درصد سود ذخیره شد و قیمت‌های وابسته به Stars به‌روزرسانی شدند.", reply_markup=gift_admin_home_keyboard())
+            return
+        if field == "usd_settings":
+            normalized = normalize_ascii_digits(raw).strip()
+            price_match = re.fullmatch(r"قیمت\s+([0-9]+(?:\.[0-9]+)?)", normalized, re.IGNORECASE)
+            dollar_match = re.fullmatch(r"دلار\s+([0-9,٬،]+)", normalized, re.IGNORECASE)
+            if price_match:
+                try:
+                    value = Decimal(price_match.group(1))
+                    if not value.is_finite() or value <= 0 or value > Decimal("100"):
+                        raise InvalidOperation
+                except (InvalidOperation, ValueError):
+                    await message.reply_text("❌ قیمت دلاری معتبر نیست. نمونه: قیمت 0.0155")
+                    return
+                cfg = load_gift_settings(); cfg["usd_per_star_override"] = str(value); save_gift_settings(cfg)
+                note = "✅ قیمت پایه دلاری هر ⭐ ذخیره شد."
+            elif dollar_match:
+                amount = int(re.sub(r"[,٬،]", "", dollar_match.group(1)) or "0")
+                if amount == 0:
+                    cfg = load_gift_settings(); cfg["usd_toman_manual"] = 0; save_gift_settings(cfg)
+                    note = "✅ نرخ دلار به حالت خودکار برگشت."
+                elif 1000 <= amount <= 100000000:
+                    cfg = load_gift_settings(); cfg["usd_toman_manual"] = amount; save_gift_settings(cfg)
+                    note = "✅ نرخ دستی دلار ذخیره شد."
+                else:
+                    await message.reply_text("❌ نرخ دلار باید ۰ یا عددی بین ۱٬۰۰۰ تا ۱۰۰٬۰۰۰٬۰۰۰ تومان باشد.")
+                    return
+            else:
+                await message.reply_text("❌ دستور معتبر نیست. نمونه‌ها:\nقیمت 0.0155\nدلار 165000\nدلار 0")
+                return
+            sync_gift_prices_in_db()
+            context.user_data.pop("gift_admin_input", None)
+            await message.reply_text(note, reply_markup=gift_admin_home_keyboard())
+            return
+        if field == "support_text":
+            if not raw or len(raw) > 1500:
+                await message.reply_text("متن پیام باید بین ۱ تا ۱۵۰۰ نویسه باشد.")
+                return
+            cfg = load_gift_settings(); cfg["support_text"] = raw; save_gift_settings(cfg)
+            context.user_data.pop("gift_admin_input", None)
+            await message.reply_text("✅ متن پیام پشتیبانی ذخیره شد.", reply_markup=gift_admin_home_keyboard())
+            return
+        if field == "topup_amount":
+            clean = normalize_ascii_digits(raw).replace(",", "").replace("٬", "").strip()
+            if not clean.isdigit() or not 1 <= int(clean) <= 100000:
+                await message.reply_text("❌ تعداد باید بین ۱ تا ۱۰۰٬۰۰۰ باشد.")
+                return
+            context.user_data.pop("gift_admin_input", None)
+            await _create_owner_star_invoice(update, context, int(clean))
+            return
+
+    # Custom gift creation: link -> display name -> fixed Toman price. All new custom items stay manual.
+    custom_state = context.user_data.get("gift_custom_state") if user and user.id == ADMIN_ID else None
+    if message and message.text and custom_state:
+        raw = message.text.strip()
+        if _is_customer_cancel_text(raw) or raw.lower() == "/cancel":
+            context.user_data.pop("gift_custom_state", None)
+            await message.reply_text("❌ افزودن گیفت سفارشی لغو شد؛ چیزی ذخیره نشد.", reply_markup=gift_admin_home_keyboard())
+            return
+        step = custom_state.get("step")
+        if step == "link":
+            clean_link = raw if raw.startswith("http://") or raw.startswith("https://") else "https://" + raw
+            if not re.fullmatch(r"https?://t\.me/[A-Za-z0-9_./-]{3,180}/?", clean_link):
+                await message.reply_text("❌ لینک معتبر تلگرام بفرست؛ نمونه: https://t.me/nft/MoodPack-134232")
+                return
+            custom_state["link"] = clean_link
+            custom_state["step"] = "name"
+            context.user_data["gift_custom_state"] = custom_state
+            await message.reply_text("✏️ نام کامل این گیفت را بنویس؛ همان نامی که مشتری در فروشگاه می‌بیند.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو عملیات", callback_data="gift_custom_cancel")]]))
+            return
+        if step == "name":
+            if len(raw) < 2 or len(raw) > 100:
+                await message.reply_text("نام گیفت باید بین ۲ تا ۱۰۰ نویسه باشد.")
+                return
+            custom_state["name"] = raw
+            custom_state["step"] = "price"
+            context.user_data["gift_custom_state"] = custom_state
+            await message.reply_text("💵 قیمت فروش این گیفت چند تومان است؟ فقط عدد مثبت بفرست.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو عملیات", callback_data="gift_custom_cancel")]]))
+            return
+        if step == "price":
+            clean = normalize_ascii_digits(raw).replace(",", "").replace("٬", "").replace("،", "").strip()
+            if not clean.isdigit() or not 1 <= int(clean) <= 100000000000:
+                await message.reply_text("❌ قیمت باید عدد مثبت و معتبر باشد.")
+                return
+            with db() as con:
+                next_sort = con.execute("SELECT COALESCE(MAX(sort_order),0)+10 FROM products WHERE category='gifts'").fetchone()[0]
+                cur = con.execute(
+                    "INSERT INTO products(category,name,price,active,button_text,icon,button_style,sort_order,description,currency,source_type,custom_link,delivery_mode,catalog_available) "
+                    "VALUES('gifts',?,?,1,?,'🎁','success',?,?,'تومان','custom',?,'manual',0)",
+                    (custom_state["name"], int(clean), custom_state["name"], next_sort,
+                     "گیفت سفارشی؛ تحویل توسط مدیریت انجام می‌شود.", custom_state["link"]),
+                )
+                product_id = int(cur.lastrowid)
+            context.user_data.pop("gift_custom_state", None)
+            await message.reply_text(
+                f"✅ گیفت سفارشی «{custom_state['name']}» با قیمت {toman(int(clean))} تومان اضافه شد.\n"
+                "روش تحویل: دستی\nلینک و محصول در دیتابیس ذخیره شدند و در فروشگاه و مدیریت محصولات نمایش داده می‌شوند.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎁 مدیریت گیفت‌ها", callback_data="gift_catalog_page_1")], [InlineKeyboardButton("🔙 مدیریت گیفت", callback_data="gift_admin_home")]]),
+            )
+            return
+
     pricing_state = context.user_data.get("pricing_admin_state")
     if message and message.text and pricing_state:
         if not user or user.id != ADMIN_ID:
@@ -7055,10 +9061,29 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await message.reply_text(pricing_panel_text(cfg, "✅ تنظیمات ذخیره شد."), reply_markup=pricing_panel_keyboard(cfg))
         return
 
+    # Customer-facing cancel button is handled before recipient/product text validation,
+    # so it cannot fall through and ask for the Telegram ID again.
+    if message and message.text and user and user.id != ADMIN_ID and _is_customer_cancel_text(message.text):
+        customer_flow_keys = (
+            "pending_product_id", "pending_dynamic_quote", "pending_product_coupon",
+            "pending_product_coupon_input", "pending_stars_coupon", "stars_coupon",
+            "stars_recipient", "stars_custom_amount", "stars_custom_order",
+            "stars_custom_wait_recipient", "stars_fixed_wait_recipient",
+        )
+        active_customer_flow = any(context.user_data.get(key) is not None for key in customer_flow_keys)
+        if active_customer_flow:
+            for key in customer_flow_keys:
+                context.user_data.pop(key, None)
+            await message.reply_text(
+                "✅ سفارش لغو شد؛ هیچ سفارش جدیدی ثبت نشد و مرحلهٔ دریافت آیدی متوقف شد.",
+                reply_markup=main_menu(),
+            )
+            return
+
     fixed_recipient_state = context.user_data.get("stars_fixed_wait_recipient")
     if message and message.text and fixed_recipient_state and user and user.id != ADMIN_ID:
         raw_recipient = message.text.strip()
-        if raw_recipient.casefold() in {"لغو", "cancel"}:
+        if _is_customer_cancel_text(raw_recipient):
             context.user_data.pop("stars_fixed_wait_recipient", None)
             context.user_data.pop("stars_recipient", None)
             try:
@@ -7172,7 +9197,7 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
     recipient_state = context.user_data.get("stars_custom_wait_recipient")
     if message and message.text and recipient_state:
         raw_recipient = normalize_ascii_digits(message.text.strip())
-        if raw_recipient.casefold() in {"لغو", "cancel"}:
+        if _is_customer_cancel_text(raw_recipient):
             context.user_data.pop("stars_custom_wait_recipient", None)
             context.user_data.pop("stars_custom_order", None)
             await message.reply_text("✅ سفارش مقدار دلخواه لغو شد؛ سفارشی ساخته نشده است.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⭐ بازگشت به استارز", callback_data="service_stars", style="primary")]]))
@@ -7259,6 +9284,8 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 "WHERE id=? AND user_id=? AND status='در انتظار ارسال رسید'",
                 (file_id, int(order["id"]), user.id),
             )
+            if cur.rowcount == 1:
+                log_order_event(con, int(order["id"]), "receipt_uploaded", "در انتظار بررسی رسید", "تصویر رسید توسط مشتری ارسال شد.", user.id)
         if cur.rowcount != 1:
             await message.reply_text("وضعیت سفارش تغییر کرده است؛ رسید ثبت نشد. لطفاً از پشتیبانی پیگیری کن.")
             return
@@ -8314,6 +10341,22 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return
         preflight_category = str(preflight_product["category"] or "").strip().lower()
         order_live_quote = None
+        gift_order_live_price = None
+        if preflight_category == "gifts" and preflight_product["source_type"] == "official" and load_gift_settings().get("auto_rate_enabled"):
+            await refresh_auto_pricing(force=False)
+            gift_cfg_now = load_gift_settings()
+            gift_order_live_price = gift_price_for_stars(preflight_product["star_count"], gift_cfg_now)
+            expected_gift = context.user_data.get("pending_gift_price_quote") or {}
+            if gift_order_live_price is None:
+                context.user_data.pop("pending_product_id", None)
+                context.user_data.pop("pending_gift_price_quote", None)
+                await message.reply_text("⚠️ قیمت زندهٔ این گیفت در دسترس نیست؛ برای جلوگیری از قیمت اشتباه، سفارش ثبت نشد.")
+                return
+            if int(expected_gift.get("sale_toman", -1)) != int(gift_order_live_price):
+                context.user_data.pop("pending_product_id", None)
+                context.user_data.pop("pending_gift_price_quote", None)
+                await message.reply_text(f"قیمت گیفت تغییر کرده است. قیمت تازه: {toman(gift_order_live_price)} تومان. محصول را دوباره انتخاب کن تا قیمت جدید را ببینی.")
+                return
         if preflight_category in {"stars", "premium"}:
             await refresh_auto_pricing(force=True)
             order_live_quote = dynamic_product_quote(preflight_product)
@@ -8358,7 +10401,28 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     return
 
                 category = (product["category"] or "").lower()
-                if category in ("premium", "stars", "gifts"):
+                recipient_user_id = None
+                recipient_username = ""
+                if category == "gifts":
+                    gift_id_match = re.search(r"(?im)^\s*ID\s*عددی\s*گیرنده\s*[:：]\s*(\d{5,20})\s*$", normalize_ascii_digits(details))
+                    username_match = re.search(r"(?im)^\s*آیدی\s*تلگرام\s*گیرنده\s*[:：]\s*(.*)$", details)
+                    if not gift_id_match:
+                        await message.reply_text("❌ برای ثبت سفارش گیفت، ID عددی گیرنده را جداگانه وارد کن.\nنمونه:\nID عددی گیرنده: 123456789\nآیدی تلگرام گیرنده: @username یا ندارم")
+                        return
+                    recipient_user_id = int(gift_id_match.group(1))
+                    if username_match:
+                        recipient_username = normalize_optional_username(username_match.group(1))
+                        if recipient_username is None:
+                            await message.reply_text("❌ آیدی تلگرام گیرنده معتبر نیست. آن را با @ وارد کن یا بنویس ندارم.")
+                            return
+                    gift_cfg_now = load_gift_settings()
+                    requested_mode = str(context.user_data.get("pending_gift_delivery_mode") or ("manual" if gift_cfg_now["manual_delivery_all"] else product["delivery_mode"] or "manual"))
+                    if gift_cfg_now["manual_delivery_all"]:
+                        requested_mode = "manual"
+                    if requested_mode == "auto" and (product["source_type"] != "official" or not product["telegram_gift_id"]):
+                        requested_mode = "manual"
+                    context.user_data["pending_gift_delivery_mode"] = requested_mode
+                elif category in ("premium", "stars"):
                     if not details.startswith("@") or len(details) < 2:
                         await message.reply_text("لطفاً آیدی تلگرام را با @ ارسال کنید.\nمثال: @SeyedPro_AIA")
                         return
@@ -8367,7 +10431,8 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                         await message.reply_text("لطفاً لینک گروه یا کانال تلگرام را ارسال کنید؛ لینک عمومی یا دعوت خصوصی.")
                         return
 
-                original_price = int(order_live_quote["sale_toman"]) if order_live_quote else int(product["price"] or 0)
+                original_price = (int(order_live_quote["sale_toman"]) if order_live_quote else
+                                  int(gift_order_live_price) if gift_order_live_price is not None else int(product["price"] or 0))
                 order_price = original_price
                 if pending_coupon and int(pending_coupon.get("product_id", -1)) == int(product_id):
                     validation = validate_coupon_for_order(
@@ -8384,19 +10449,36 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     coupon_discount = int(validation["discount"])
                     order_price = int(validation["final_price"])
 
-                order_currency = "تومان" if order_live_quote else str(product["currency"] or "تومان")
+                order_currency = "تومان" if (order_live_quote or gift_order_live_price is not None) else str(product["currency"] or "تومان")
                 stored_details = details
                 if order_live_quote:
                     stored_details += "\n\n[ریز محاسبه قیمت برای بررسی مدیر]\n" + quote_breakdown_text(order_live_quote)
+                if gift_order_live_price is not None:
+                    gift_unit = gift_unit_sale_price(load_gift_settings())
+                    stored_details += f"\n\n[محاسبه قیمت گیفت]\nقیمت هر ⭐ با سود: {toman(gift_unit)} تومان\nتعداد Stars گیفت: {int(product['star_count'] or 0)}\nقیمت نهایی: {toman(gift_order_live_price)} تومان"
                 card_number = str(bot_text("payment_card_number") or "").strip()
                 payment_ready = bool(card_number and card_number.casefold() not in {"هنوز تنظیم نشده", "تنظیم نشده", "ثبت نشده"})
                 order_status = "در انتظار ارسال رسید" if order_price > 0 and payment_ready else "در انتظار بررسی مدیر"
                 payment_method = "کارت‌به‌کارت" if order_price > 0 and payment_ready else "نیازمند هماهنگی مدیر"
+                chosen_delivery_mode = "manual"
+                saved_gift_id = ""
+                if category == "gifts":
+                    gift_cfg_now = load_gift_settings()
+                    chosen_delivery_mode = str(context.user_data.get("pending_gift_delivery_mode") or product["delivery_mode"] or "manual")
+                    if gift_cfg_now["manual_delivery_all"] or product["source_type"] != "official" or not product["telegram_gift_id"]:
+                        chosen_delivery_mode = "manual"
+                    saved_gift_id = str(product["telegram_gift_id"] or "")
                 cur = con.execute(
-                    "INSERT INTO orders (user_id, product_id, price, status, coupon_code, coupon_discount, currency, order_details, payment_method) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (user.id, int(product_id), order_price, order_status, coupon_code, coupon_discount, order_currency, stored_details, payment_method),
+                    "INSERT INTO orders (user_id, product_id, price, status, coupon_code, coupon_discount, currency, order_details, payment_method, buyer_username, buyer_full_name, recipient_user_id, recipient_username, product_name_snapshot, gift_id, delivery_mode) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (user.id, int(product_id), order_price, order_status, coupon_code, coupon_discount, order_currency, stored_details,
+                     payment_method, user.username or "", user.full_name or "", recipient_user_id,
+                     recipient_username or "", str(product["name"] or ""), saved_gift_id, chosen_delivery_mode),
                 )
                 order_id = cur.lastrowid
+                order_code = f"SP-G{int(order_id):06d}" if category == "gifts" else f"SP-{int(order_id):06d}"
+                con.execute("UPDATE orders SET order_code=? WHERE id=?", (order_code, order_id))
+                log_order_event(con, order_id, "created", order_status, f"محصول: {product['name']} | مبلغ: {order_price} {order_currency}", user.id)
                 if coupon_code:
                     # Pending order reserves a use atomically. Rejection/deletion releases it.
                     con.execute(
@@ -8416,6 +10498,9 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.user_data.pop("pending_dynamic_quote", None)
         context.user_data.pop("pending_product_coupon", None)
         context.user_data.pop("pending_product_coupon_input", None)
+        context.user_data.pop("pending_gift_delivery_mode", None)
+        context.user_data.pop("pending_gift_delivery_product_id", None)
+        context.user_data.pop("pending_gift_price_quote", None)
         price_text = f"{order_price:,} {order_currency}" if original_price > 0 else "نیازمند استعلام"
         coupon_summary = (f"\nکد تخفیف: {coupon_code}\nمیزان تخفیف: {coupon_discount:,} {order_currency}\nقیمت اصلی: {original_price:,} {order_currency}"
                           if coupon_code else "")
@@ -8428,8 +10513,12 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     f"کاربر: {user.full_name}\n"
                     f"شناسه کاربر: {user.id}\n"
                     f"محصول: {product['name']}\n"
-                    f"اطلاعات سفارش: {details}\n"
-                    f"قیمت نهایی: {price_text}{coupon_summary}\n"
+                    f"کد سفارش: {order_code}\n"
+                    f"ID عددی خریدار: {user.id} | آیدی: @{user.username or 'تنظیم نشده'}\n"
+                    + (f"ID عددی گیرنده: {recipient_user_id or 'ثبت نشده'} | آیدی: {recipient_username or 'ثبت نشده'}\n" if category == "gifts" else "")
+                    + f"زمان ثبت: {format_iran_jalali_datetime(utc_now().isoformat(timespec='seconds'))}\n"
+                    + f"اطلاعات سفارش: {details}\n"
+                    + f"قیمت نهایی: {price_text}{coupon_summary}\n"
                     f"روش پرداخت: {payment_method}\n"
                     f"وضعیت: {order_status}"
                 ),
@@ -8441,7 +10530,7 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             context.user_data["pending_receipt_order_id"] = int(order_id)
             card_owner = str(bot_text("payment_card_owner") or "").strip()
             customer_message = (
-                f"✅ سفارش شما ثبت شد. شماره سفارش: #{order_id}\n\n"
+                f"✅ سفارش شما ثبت شد. کد سفارش: {order_code}\n\n"
                 f"🛍 محصول: {product['name']}\n📨 اطلاعات سفارش: {details}\n"
                 f"💰 مبلغ قابل پرداخت: {price_text}"
                 + (f"\n🏷️ کد تخفیف: {coupon_code}\n🎁 میزان تخفیف: {coupon_discount:,} {order_currency}" if coupon_code else "")
@@ -8451,7 +10540,7 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
         else:
             customer_message = (
-                f"✅ درخواست شما ثبت شد.\n\n📦 شماره سفارش: #{order_id}\n"
+                f"✅ درخواست شما ثبت شد.\n\n📦 کد سفارش: {order_code}\n"
                 f"🛍 محصول: {product['name']}\n📨 اطلاعات ارسالی: {details}\n💰 مبلغ: {price_text}\n\n"
                 "اطلاعات پرداخت هنوز تنظیم نشده یا قیمت نیازمند بررسی است. فعلاً پرداخت انجام نده؛ مدیر درخواست را بررسی می‌کند و اطلاع می‌دهد."
             )
@@ -8517,8 +10606,17 @@ def main():
     app.add_handler(CommandHandler("admin", admin))
     app.add_handler(CommandHandler("cancel", cancel_coupon_creation))
     app.add_handler(CallbackQueryHandler(callbacks))
+    if PreCheckoutQueryHandler is not None:
+        app.add_handler(PreCheckoutQueryHandler(handle_owner_star_precheckout))
+    successful_payment_filter = getattr(filters, "SUCCESSFUL_PAYMENT", None)
+    if successful_payment_filter is not None:
+        app.add_handler(MessageHandler(successful_payment_filter, handle_owner_star_success))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
-    app.add_handler(MessageHandler(filters.PHOTO, text_message))
+    support_media_filters = (
+        filters.PHOTO | filters.Document.ALL | filters.VIDEO | filters.AUDIO |
+        filters.VOICE | filters.ANIMATION | filters.Sticker.ALL | filters.VIDEO_NOTE
+    )
+    app.add_handler(MessageHandler(support_media_filters, text_message))
 
 
 
