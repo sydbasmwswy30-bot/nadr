@@ -1608,7 +1608,7 @@ def gift_admin_home_keyboard():
         [InlineKeyboardButton("📩 «اول به پشتیبانی پیام بده»: " + ("روشن" if settings['support_first'] else "خاموش"), callback_data="gift_support_first", style="primary")],
         [InlineKeyboardButton("📝 متن پیام «اول به پشتیبانی پیام بده»", callback_data="gift_support_text", style="primary")],
         [InlineKeyboardButton("📋 سفارش‌های گیفت", callback_data="gift_orders", style="primary")],
-        [InlineKeyboardButton("🔙 بازگشت", callback_data="admin", style="danger")],
+        [InlineKeyboardButton("🔙 بازگشت به مدیریت قیمت‌گذاری", callback_data="admin_auto_prices", style="danger")],
     ])
 
 
@@ -4022,8 +4022,113 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _start_mark("reply_text completed")
 
 # ==========================================
-# پنل مدیریت
+# مرکز مدیریت قیمت‌گذاری محصولات
 # ==========================================
+
+AUTO_PRICE_CATEGORY_DEFS = (
+    ("numbers", "📱 شماره مجازی", ("numbers", "virtual_numbers", "virtual_number", "phone_numbers")),
+    ("configs", "🛒 خرید کانفیگ", ("configs", "config", "vpn", "v2ray", "wireguard", "vpn_configs")),
+    ("ton", "💎 خرید تون", ("ton", "tons")),
+    ("premium", "💎 پرمیوم تلگرام", ("premium", "telegram_premium")),
+    ("stars", "⭐ استارز تلگرام", ("stars", "telegram_stars")),
+    ("gifts", "🎁 گیفت تلگرام", ("gifts", "telegram_gifts")),
+    ("boost", "🚀 بوست تلگرام", ("boost", "telegram_boost", "boosts")),
+    ("members", "👥 ممبر تلگرام", ("members", "member", "telegram_members", "telegram_member")),
+    ("reactions", "💙 ری‌اکشن تلگرام", ("reactions", "reaction", "telegram_reactions")),
+    ("views", "👀 ویو تلگرام", ("views", "view", "telegram_views")),
+    ("instagram_followers", "📸 فالوور اینستاگرام", ("instagram_followers", "instagram_follower", "followers")),
+    ("instagram_likes", "❤️ لایک اینستاگرام", ("instagram_likes", "instagram_like", "likes")),
+)
+
+
+def _auto_price_category_map(context):
+    """Build the fixed 12 storefront groups plus any new product categories saved later."""
+    with db() as con:
+        rows = con.execute(
+            "SELECT DISTINCT category FROM products WHERE category IS NOT NULL AND TRIM(category) != '' ORDER BY category COLLATE NOCASE"
+        ).fetchall()
+    existing = [str(row[0]).strip() for row in rows if str(row[0] or '').strip()]
+    result = []
+    known = set()
+    token_map = {}
+    for key, label, aliases in AUTO_PRICE_CATEGORY_DEFS:
+        alias_set = {str(x).casefold() for x in aliases}
+        matched = [cat for cat in existing if cat.casefold() in alias_set]
+        for cat in matched:
+            known.add(cat.casefold())
+        token = key
+        token_map[token] = {"label": label, "categories": tuple(matched or (key,))}
+        result.append((token, label))
+    # Any category introduced in the product manager is included without code changes.
+    import hashlib
+    for cat in existing:
+        if cat.casefold() in known:
+            continue
+        token = "x" + hashlib.sha1(cat.encode("utf-8")).hexdigest()[:10]
+        token_map[token] = {"label": f"📦 {cat}", "categories": (cat,)}
+        result.append((token, f"📦 {cat}"))
+    context.user_data["auto_price_category_tokens"] = token_map
+    return result
+
+
+def auto_price_categories_markup(context):
+    categories = _auto_price_category_map(context)
+    buttons = [[InlineKeyboardButton(label, callback_data=f"admin_auto_cat|{token}|1", style="primary")]
+               for token, label in categories]
+    buttons.append([InlineKeyboardButton("🔙 بازگشت به مدیریت", callback_data="admin")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def auto_price_category_screen(context, token, page=1):
+    token_map = context.user_data.get("auto_price_category_tokens") or {}
+    entry = token_map.get(token)
+    if not entry:
+        # Fixed categories can be reconstructed after a restart.
+        _auto_price_category_map(context)
+        token_map = context.user_data.get("auto_price_category_tokens") or {}
+        entry = token_map.get(token)
+    if not entry:
+        return ("⚠️ این دسته‌بندی دیگر در دسترس نیست. از مرکز مدیریت قیمت‌گذاری دوباره وارد شو.",
+                InlineKeyboardMarkup([[InlineKeyboardButton("🔙 مرکز قیمت‌گذاری", callback_data="admin_auto_prices")]]))
+    if token == "gifts":
+        return (None, None)
+
+    categories = tuple(entry["categories"])
+    placeholders = ",".join("?" for _ in categories)
+    with db() as con:
+        rows = con.execute(
+            f"SELECT id, name, price, currency, active FROM products WHERE category IN ({placeholders}) ORDER BY sort_order, id",
+            categories,
+        ).fetchall()
+    per_page = 8
+    total_pages = max(1, (len(rows) + per_page - 1) // per_page)
+    page = min(max(1, int(page)), total_pages)
+    visible = rows[(page - 1) * per_page: page * per_page]
+    lines = [f"⚙️ مدیریت قیمت‌گذاری | {entry['label']}", "━━━━━━━━━━━━━━━━━━"]
+    buttons = []
+    if not rows:
+        lines.append("\nهنوز محصولی در این گروه ثبت نشده است.")
+        lines.append("\nبا افزودن محصول در بخش «محصولات و قیمت‌ها»، اینجا به‌صورت خودکار نمایش داده می‌شود.")
+    else:
+        lines.append(f"\n📦 تعداد محصولات: {len(rows)} | صفحه {page} از {total_pages}\n")
+        for row in visible:
+            price = int(row["price"] or 0)
+            currency = str(row["currency"] or "تومان")
+            price_text = f"{toman(price)} {currency}" if price > 0 else "تنظیم نشده"
+            status = "🟢 فعال" if int(row["active"] or 0) else "🔴 غیرفعال"
+            lines.append(f"• {row['name']} | {price_text} | {status}")
+            buttons.append([InlineKeyboardButton(f"{str(row['name'])[:42]} | مدیریت", callback_data=f"admin_auto_product|{row['id']}|{token}|{page}")])
+    nav = []
+    if page > 1:
+        nav.append(InlineKeyboardButton("⬅️ قبلی", callback_data=f"admin_auto_cat|{token}|{page-1}"))
+    if page < total_pages:
+        nav.append(InlineKeyboardButton("بعدی ➡️", callback_data=f"admin_auto_cat|{token}|{page+1}"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton("➕ افزودن / مدیریت محصولات", callback_data="admin_products")])
+    buttons.append([InlineKeyboardButton("🔙 بازگشت به فهرست محصولات", callback_data="admin_auto_prices")])
+    return ("\n".join(lines)[:3900], InlineKeyboardMarkup(buttons))
+
 
 async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_channel_membership(update, context):
@@ -4039,7 +4144,7 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("🛍 محصولات و قیمت‌ها", callback_data="admin_products", style="primary")],
         [InlineKeyboardButton("📦 آخرین سفارش‌ها", callback_data="admin_orders", style="primary"),
          InlineKeyboardButton("🏷️ مدیریت کدهای تخفیف", callback_data="admin_coupons", style="primary")],
-        [InlineKeyboardButton("🎁 مدیریت گیفت تلگرام", callback_data="gift_admin_home", style="primary"),
+        [InlineKeyboardButton("⚙️ مدیریت قیمت‌گذاری خودکار", callback_data="admin_auto_prices", style="primary"),
          InlineKeyboardButton("💬 پیام‌های پشتیبانی", callback_data="admin_support_tickets", style="success")],
         [InlineKeyboardButton(f"⌨️ تغییر به کیبورد معمولی{' ✅' if current_mode == MENU_TYPE_KEYBOARD else ''}", callback_data="admin_menu_set_keyboard", style="success"),
          InlineKeyboardButton(f"💎 تغییر به شیشه‌ای{' ✅' if current_mode == MENU_TYPE_INLINE else ''}", callback_data="admin_menu_set_inline", style="success")],
@@ -7202,6 +7307,8 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                  InlineKeyboardButton("🛍 محصولات و قیمت‌ها", callback_data="admin_products")],
                 [InlineKeyboardButton("📦 آخرین سفارش‌ها", callback_data="admin_orders"),
                  InlineKeyboardButton("🏷️ مدیریت کدهای تخفیف", callback_data="admin_coupons")],
+                [InlineKeyboardButton("⚙️ مدیریت قیمت‌گذاری خودکار", callback_data="admin_auto_prices", style="primary"),
+                 InlineKeyboardButton("💬 پیام‌های پشتیبانی", callback_data="admin_support_tickets", style="success")],
                 [InlineKeyboardButton(f"⌨️ تغییر به کیبورد معمولی{' ✅' if current_mode == MENU_TYPE_KEYBOARD else ''}", callback_data="admin_menu_set_keyboard"),
                  InlineKeyboardButton(f"💎 تغییر به شیشه‌ای{' ✅' if current_mode == MENU_TYPE_INLINE else ''}", callback_data="admin_menu_set_inline")],
                 [InlineKeyboardButton("💹 قیمت‌گذاری خودکار استارز/پرمیوم", callback_data="admin_auto_pricing", style="primary")],
@@ -7212,6 +7319,28 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"⚙️ پنل مدیریت SEYED PREMIUM\n\n🔹 حالت منوی کل ربات: {mode_label}",
                 reply_markup=keyboard
             )
+            return
+
+        if data == "admin_auto_prices":
+            context.user_data.pop("auto_pricing_return", None)
+            await query.edit_message_text(
+                "⚙️ مدیریت قیمت‌گذاری خودکار محصولات | SEYED PREMIUM\n━━━━━━━━━━━━━━━━━━\n\nهمهٔ گروه‌های محصولات فروشگاه در این بخش قرار دارند. با انتخاب هر گروه، محصولات و قیمت‌های همان گروه را مدیریت کن.\n\nمحصولات و دسته‌بندی‌های جدید نیز به‌صورت خودکار به این فهرست اضافه می‌شوند:",
+                reply_markup=auto_price_categories_markup(context),
+            )
+            return
+
+        if data.startswith("admin_auto_cat|"):
+            try:
+                _, token, page_text = data.split("|", 2)
+                page = max(1, int(page_text))
+            except (ValueError, TypeError):
+                await query.answer("درخواست دسته‌بندی معتبر نیست.", show_alert=True)
+                return
+            if token == "gifts":
+                await _show_gift_admin_home(query, context.bot)
+                return
+            text_value, markup = auto_price_category_screen(context, token, page)
+            await query.edit_message_text(text_value, reply_markup=markup)
             return
 
         if data == "admin_auto_pricing":
@@ -7884,12 +8013,24 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        if data.startswith("admin_auto_product|"):
+            try:
+                _, pid_text, return_token, return_page = data.split("|", 3)
+                pid = int(pid_text)
+                context.user_data["auto_pricing_return"] = f"admin_auto_cat|{return_token}|{max(1, int(return_page))}"
+            except (ValueError, TypeError):
+                await query.answer("درخواست محصول معتبر نیست.", show_alert=True)
+                return
+            data = f"admin_p_edit_{pid}"
+
         if data == "admin_products" or data.startswith("admin_products_page_") or data.startswith("admin_p_"):
             if user_id != ADMIN_ID:
                 await query.answer("دسترسی مجاز نیست.", show_alert=True)
                 return
 
             # صفحه‌بندی قبل از پردازش سایر callbackها تشخیص داده می‌شود.
+            if data == "admin_products":
+                context.user_data.pop("auto_pricing_return", None)
             products_page = 1
             if data.startswith("admin_products_page_"):
                 try:
@@ -7905,6 +8046,8 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "boost": "🚀 بوست",
                 "gifts": "🎁 گیفت",
                 "numbers": "📱 شماره مجازی",
+                "configs": "🛒 خرید کانفیگ",
+                "ton": "💎 خرید تون",
                 "members": "👥 ممبر تلگرام",
                 "reactions": "💙 ری‌اکشن تلگرام",
                 "views": "👀 ویو تلگرام",
@@ -7971,6 +8114,8 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not row:
                     await query.answer("محصول پیدا نشد.", show_alert=True)
                     return
+                product_back_callback = context.user_data.get("auto_pricing_return") or "admin_products"
+                product_back_label = "↩️ بازگشت به گروه قیمت‌گذاری" if context.user_data.get("auto_pricing_return") else "↩️ بازگشت به محصولات"
                 keyboard = [
                     [InlineKeyboardButton("✏️ ویرایش نام", callback_data=f"admin_p_name_{pid}"),
                      InlineKeyboardButton("💰 ویرایش قیمت", callback_data=f"admin_p_price_{pid}")],
@@ -7984,7 +8129,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                      InlineKeyboardButton("🏷️ قیمت قبلی", callback_data=f"admin_p_old_price_{pid}")],
                     [InlineKeyboardButton("📂 ویرایش دسته‌بندی", callback_data=f"admin_p_cat_{pid}")],
                     [InlineKeyboardButton("⭐ مقدار بستهٔ استارز", callback_data=f"admin_p_star_amount_{pid}")],
-                    [InlineKeyboardButton("↩️ بازگشت به محصولات", callback_data="admin_products")],
+                    [InlineKeyboardButton(product_back_label, callback_data=product_back_callback)],
                 ]
                 amount_text = str(row["star_amount"] or "تنظیم نشده")
                 text = (
@@ -8021,6 +8166,8 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Reuse the regular edit screen below by rebuilding it directly.
                 with db() as con:
                     row = con.execute("SELECT id, name, price, category, button_text, icon, button_style, sort_order, description, star_amount, currency, old_price, image_file_id FROM products WHERE id=?", (pid,)).fetchone()
+                product_back_callback = context.user_data.get("auto_pricing_return") or "admin_products"
+                product_back_label = "↩️ بازگشت به گروه قیمت‌گذاری" if context.user_data.get("auto_pricing_return") else "↩️ بازگشت به محصولات"
                 keyboard = [
                     [InlineKeyboardButton("✏️ ویرایش نام", callback_data=f"admin_p_name_{pid}"), InlineKeyboardButton("💰 ویرایش قیمت", callback_data=f"admin_p_price_{pid}")],
                     [InlineKeyboardButton("🏷️ متن دکمه", callback_data=f"admin_p_button_text_{pid}"), InlineKeyboardButton("✧ آیکون", callback_data=f"admin_p_icon_{pid}")],
@@ -8028,7 +8175,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     [InlineKeyboardButton("📝 توضیحات محصول", callback_data=f"admin_p_description_{pid}"), InlineKeyboardButton("🖼️ تصویر محصول", callback_data=f"admin_p_image_{pid}")],
                     [InlineKeyboardButton("💱 واحد پول", callback_data=f"admin_p_currency_{pid}"), InlineKeyboardButton("🏷️ قیمت قبلی", callback_data=f"admin_p_old_price_{pid}")],
                     [InlineKeyboardButton("📂 ویرایش دسته‌بندی", callback_data=f"admin_p_cat_{pid}"), InlineKeyboardButton("⭐ مقدار بستهٔ استارز", callback_data=f"admin_p_star_amount_{pid}")],
-                    [InlineKeyboardButton("↩️ بازگشت به محصولات", callback_data="admin_products")],
+                    [InlineKeyboardButton(product_back_label, callback_data=product_back_callback)],
                 ]
                 await query.edit_message_text(
                     f"🛠 ویرایش محصول #{pid}\n\nنام: {row['name']}\nمتن دکمه: {row['button_text'] or 'همان نام محصول'}\n"
@@ -9990,7 +10137,8 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
         value = message.text.strip()
         if value == "/cancel":
             context.user_data.pop("product_admin_state", None)
-            await message.reply_text("عملیات لغو شد.")
+            back = context.user_data.get("auto_pricing_return") or "admin_products"
+            await message.reply_text("عملیات لغو شد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ بازگشت به مدیریت محصول", callback_data=back)]]))
             return
 
         state = context.user_data.get("product_admin_state", {})
@@ -10065,7 +10213,8 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             with db() as con:
                 cur = con.execute("UPDATE products SET name=? WHERE id=?", (value, int(state["product_id"])))
             context.user_data.pop("product_admin_state", None)
-            await message.reply_text("✅ نام محصول ویرایش شد." if cur.rowcount else "محصول پیدا نشد.")
+            back = context.user_data.get("auto_pricing_return") or "admin_products"
+            await message.reply_text("✅ نام محصول ویرایش شد." if cur.rowcount else "محصول پیدا نشد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ بازگشت به مدیریت محصول", callback_data=back)]]))
             return
 
         if action == "edit_price":
@@ -10079,7 +10228,8 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             with db() as con:
                 cur = con.execute("UPDATE products SET price=? WHERE id=?", (price, int(state["product_id"])))
             context.user_data.pop("product_admin_state", None)
-            await message.reply_text("✅ قیمت محصول ویرایش شد." if cur.rowcount else "محصول پیدا نشد.")
+            back = context.user_data.get("auto_pricing_return") or "admin_products"
+            await message.reply_text("✅ قیمت محصول ویرایش شد." if cur.rowcount else "محصول پیدا نشد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ بازگشت به مدیریت محصول", callback_data=back)]]))
             return
 
         pid = int(state.get("product_id", 0) or 0)
@@ -10150,7 +10300,8 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         if action in {"edit_button_text", "edit_icon", "edit_sort_order", "edit_description", "edit_star_amount", "edit_currency", "edit_old_price"}:
             context.user_data.pop("product_admin_state", None)
-            await message.reply_text("✅ تنظیم محصول ذخیره شد و در منوی مربوطه از اطلاعات جدید خوانده می‌شود." if cur and cur.rowcount else "محصول پیدا نشد.")
+            back = context.user_data.get("auto_pricing_return") or "admin_products"
+            await message.reply_text("✅ تنظیم محصول ذخیره شد و در منوی مربوطه از اطلاعات جدید خوانده می‌شود." if cur and cur.rowcount else "محصول پیدا نشد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ بازگشت به مدیریت محصول", callback_data=back)]]))
             return
 
     if message and message.text and context.user_data.get("editor_wait_key"):
