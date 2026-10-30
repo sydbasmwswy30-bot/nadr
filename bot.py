@@ -1833,7 +1833,7 @@ def support_form_markup(copy_text):
             buttons.append([InlineKeyboardButton("📋 کپی سریع فرم", copy_text=CopyTextButton(text=copy_text))])
     except Exception:
         logger.warning("Copy-text button not available in this PTB version", exc_info=True)
-    buttons.append([InlineKeyboardButton("❌ لغو عملیات", callback_data="support_cancel", style="danger")])
+    buttons.append([InlineKeyboardButton("❌ لغو عملیات", callback_data="global_cancel", style="danger")])
     buttons.append([InlineKeyboardButton("🏠 منوی اصلی", callback_data="home", style="primary")])
     return InlineKeyboardMarkup(buttons)
 
@@ -2414,11 +2414,16 @@ def _auto_pricing_defaults():
         "catalog_prices": {"stars_price_per_star_usd": "", "stars_max_per_order": 50000, "premium_usd": {}},
         "catalog_valid": False,
         "catalog_updated_at": "",
+        "premium_catalog_valid": None,
+        "premium_catalog_updated_at": "",
+        "premium_catalog_error": "قیمت‌های مرجع پرمیوم هنوز دریافت نشده‌اند.",
         "catalog_attempted_at": "",
         "catalog_error": "قیمت عمومی هنوز دریافت نشده است.",
         "fx_rate_toman": "",
         "fx_valid": False,
         "fx_source_updated_at": "",
+        "fx_source_name": "",
+        "fx_source_symbol": "",
         "fx_fetched_at": "",
         "fx_attempted_at": "",
         "fx_error": "نرخ ارز هنوز دریافت نشده است.",
@@ -2739,6 +2744,15 @@ def _premium_feed_parts(auto_cfg=None):
     return cfg, prices, catalog_ok, fx_ok
 
 
+def _premium_catalog_is_fresh(cfg):
+    """Premium prices have their own validity clock, independent from Stars prices."""
+    explicit_flag = cfg.get("premium_catalog_valid")
+    if explicit_flag is None:  # compatibility with databases created before this split
+        return bool(cfg.get("catalog_valid") and _pricing_timestamp_fresh(cfg.get("catalog_updated_at")))
+    timestamp = cfg.get("premium_catalog_updated_at")
+    return bool(explicit_flag and _pricing_timestamp_fresh(timestamp))
+
+
 def premium_effective_star_rate_toman(settings=None, auto_cfg=None):
     settings = settings or load_premium_manager_settings()
     auto_cfg, prices, catalog_ok, fx_ok = _premium_feed_parts(auto_cfg)
@@ -2782,7 +2796,7 @@ def premium_price_quote(months, settings=None, auto_cfg=None):
     cost_toman = None
     source = ""
     if settings.get("auto_fragment_enabled"):
-        if not (catalog_ok and fx):
+        if not (_premium_catalog_is_fresh(auto_cfg) and fx):
             return None
         fragment_usd = _pricing_decimal((prices.get("premium_usd") or {}).get(str(months)))
         if fragment_usd is None:
@@ -2859,7 +2873,9 @@ def premium_admin_text(note=""):
         f"🔵 نرخ خودکار فرگمنت: {'روشن' if settings['auto_fragment_enabled'] else 'خاموش'}",
         f"📈 درصد سود پرمیوم: {settings['profit_percent']}٪",
         f"💵 نرخ دلار/تتر محاسباتی: {toman(settings['usd_toman_manual'] or (auto_cfg.get('fx_rate_toman') if fx_ok else 0))} تومان",
-        f"🕒 آخرین دریافت قیمت مرجع: {_pricing_time_text(auto_cfg.get('catalog_updated_at')) if catalog_ok else 'قیمت زنده تأیید نشده'}",
+        f"🌐 منبع نرخ ارز: {auto_cfg.get('fx_source_name') or 'هنوز تأیید نشده'} ({auto_cfg.get('fx_source_symbol') or '—'})",
+        f"🕒 آخرین دریافت نرخ استارز: {_pricing_time_text(auto_cfg.get('catalog_updated_at')) if catalog_ok else 'قیمت زنده تأیید نشده'}",
+        f"🕒 آخرین دریافت قیمت فرگمنت: {_pricing_time_text(auto_cfg.get('premium_catalog_updated_at') or auto_cfg.get('catalog_updated_at')) if _premium_catalog_is_fresh(auto_cfg) else 'قیمت سه پلن تأیید نشده'}",
         f"🕒 آخرین دریافت نرخ ارز: {_pricing_time_text(auto_cfg.get('fx_source_updated_at')) if fx_ok else 'نرخ زنده تأیید نشده'}",
         "",
     ]
@@ -2878,7 +2894,9 @@ def premium_admin_text(note=""):
     lines.append("قیمت Fragment از API واسط و غیررسمی دریافت می‌شود؛ منبع رسمی عمومی برای قیمت‌خوانی مستقیم Fragment تأیید نشده است.")
     lines.append("تحویل خودکار فقط پس از تأیید پرداخت و کنترل موجودی واقعی Stars انجام می‌شود.")
     if auto_cfg.get("catalog_error") and not catalog_ok:
-        lines.append("⚠️ وضعیت منبع قیمت: " + str(auto_cfg.get("catalog_error"))[:180])
+        lines.append("⚠️ وضعیت منبع استارز: " + str(auto_cfg.get("catalog_error"))[:180])
+    if auto_cfg.get("premium_catalog_error") and not _premium_catalog_is_fresh(auto_cfg):
+        lines.append("⚠️ وضعیت منبع فرگمنت: " + str(auto_cfg.get("premium_catalog_error"))[:180])
     if auto_cfg.get("fx_error") and not fx_ok:
         lines.append("⚠️ وضعیت منبع ارز: " + str(auto_cfg.get("fx_error"))[:180])
     if note:
@@ -3057,42 +3075,244 @@ def pricing_panel_keyboard(cfg=None):
 
 
 async def _fetch_public_price_catalog(client):
-    """Read-only public price quotes. Never creates purchases or uses wallet credentials."""
+    """Read public, no-credential Fragment reference quotes; never creates a purchase."""
     async def get_quote(product, amount):
         response = await client.get(
             _PUBLIC_PRICE_API_BASE,
             params={"product": product, "amount": int(amount)},
-            headers={"Accept": "application/json", "User-Agent": "SEYED-PREMIUM-price-check/1.0"},
+            headers={"Accept": "application/json", "User-Agent": "SEYED-PREMIUM-price-check/2.0"},
         )
         response.raise_for_status()
         payload = response.json()
         if not isinstance(payload, dict):
-            raise ValueError("پاسخ سرویس قیمت ساختار معتبری ندارد.")
-        quote = payload.get("data", payload)
-        if isinstance(quote, dict) and isinstance(quote.get("quote"), dict):
-            quote = quote["quote"]
-        if not isinstance(quote, dict):
-            raise ValueError("ساختار قیمت دریافت‌شده معتبر نیست.")
-        prices = quote.get("prices") or {}
-        if not isinstance(prices, dict):
-            raise ValueError("قیمت‌های دریافتی معتبر نیستند.")
+            raise ValueError("پاسخ سرویس قیمت ساختار JSON معتبر ندارد.")
+        quote = payload
+        for key in ("data", "result", "quote"):
+            candidate = quote.get(key) if isinstance(quote, dict) else None
+            if isinstance(candidate, dict):
+                quote = candidate
         stale = quote.get("stale", payload.get("stale", False))
         if stale is True or quote.get("unavailable") is True or payload.get("unavailable") is True:
-            raise ValueError("منبع قیمت دادهٔ قدیمی یا ناموجود اعلام کرد.")
-        usdt = _pricing_decimal(prices.get("usdt", quote.get("usdt")))
-        if usdt is None or usdt <= 0:
-            raise ValueError("قیمت USDT در پاسخ منبع وجود ندارد یا معتبر نیست.")
-        return usdt
+            raise ValueError("منبع قیمت، دادهٔ قدیمی یا ناموجود اعلام کرد.")
+        prices = quote.get("prices")
+        if not isinstance(prices, dict):
+            prices = quote
+        value = None
+        for key in ("usdt", "price_usdt", "unit_usdt", "priceUsdt", "usd"):
+            value = _pricing_decimal(prices.get(key))
+            if value is not None:
+                break
+        if value is None or value <= 0:
+            raise ValueError("قیمت USDT در پاسخ مرجع موجود یا معتبر نیست.")
+        # If the API provides a quote age, reject old prices even when stale is omitted.
+        age = quote.get("age_sec", payload.get("age_sec"))
+        if age is not None:
+            try:
+                age_seconds = float(age)
+            except (TypeError, ValueError):
+                raise ValueError("سن قیمت مرجع قابل‌تشخیص نیست.")
+            if age_seconds < 0 or age_seconds > 3600:
+                raise ValueError("قیمت مرجع بیش از یک ساعت عمر دارد.")
+        return value
 
-    stars_reference = await get_quote("stars", 50)
+    requests = [("stars", 50), ("premium", 3), ("premium", 6), ("premium", 12)]
+    results = await asyncio.gather(
+        *(get_quote(product, amount) for product, amount in requests),
+        return_exceptions=True,
+    )
+    stars_result = results[0]
+    stars_error = ""
+    if isinstance(stars_result, Exception):
+        stars_error = f"{type(stars_result).__name__}: {str(stars_result)[:180]}"
+        logger.warning("Public Fragment Stars quote unavailable: %s", stars_error)
+        stars_price_per_star = ""
+    else:
+        stars_price_per_star = str(stars_result / Decimal(50))
+
     premium_prices = {}
-    for months in (3, 6, 12):
-        premium_prices[str(months)] = str(await get_quote("premium", months))
+    premium_errors = {}
+    for months, result in zip((3, 6, 12), results[1:]):
+        if isinstance(result, Exception):
+            premium_errors[str(months)] = f"{type(result).__name__}: {str(result)[:180]}"
+            logger.warning("Public Fragment Premium quote unavailable for %s months: %s", months, premium_errors[str(months)])
+        else:
+            premium_prices[str(months)] = str(result)
     return {
-        "stars_price_per_star_usd": str(stars_reference / Decimal(50)),
+        "stars_price_per_star_usd": stars_price_per_star,
         "stars_max_per_order": 1000000,
         "premium_usd": premium_prices,
+        "stars_quote_error": stars_error,
+        "premium_quote_errors": premium_errors,
+        "catalog_source": "Fragment API عمومی (خواندن قیمت؛ بدون کلید و بدون خرید)",
     }
+
+
+async def _fetch_tgsuperstars_price_catalog(client, api_key):
+    """Optional second quote source for operators who configured a supplier key."""
+    response = await client.get(
+        _PROVIDER_PRODUCTS_URL,
+        headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("پاسخ تأمین‌کننده ساختار JSON معتبر ندارد.")
+    catalog = payload.get("data", payload)
+    payload_meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+    catalog_meta = catalog.get("meta") if isinstance(catalog, dict) and isinstance(catalog.get("meta"), dict) else {}
+    stale = any((
+        payload.get("unavailable") is True,
+        isinstance(catalog, dict) and catalog.get("unavailable") is True,
+        payload.get("stale") is True,
+        isinstance(catalog, dict) and catalog.get("stale") is True,
+        payload_meta.get("stale") is True,
+        catalog_meta.get("stale") is True,
+        str(payload.get("source_status", "")).lower() in {"stale", "unavailable"},
+        isinstance(catalog, dict) and str(catalog.get("source_status", "")).lower() in {"stale", "unavailable"},
+    ))
+    if not isinstance(catalog, dict) or stale:
+        raise ValueError("منبع تأمین‌کننده قیمت تازه ارائه نکرد.")
+    stars_info = catalog.get("stars") or {}
+    stars_currency = str(stars_info.get("currency") or catalog.get("currency") or "USD").upper()
+    unit_price = _pricing_decimal(stars_info.get("price_per_star"))
+    if stars_currency not in {"USD", "USDT"} or unit_price is None:
+        raise ValueError("قیمت یا واحد پول استارز در منبع تأمین‌کننده معتبر نیست.")
+    premium_raw = catalog.get("premium") or {}
+    premium_prices = {}
+    for months in (3, 6, 12):
+        item = premium_raw.get(str(months)) or premium_raw.get(months)
+        if not isinstance(item, dict):
+            continue
+        currency = str(item.get("currency") or catalog.get("currency") or "USD").upper()
+        value = _pricing_decimal(item.get("partner_price"))
+        if currency in {"USD", "USDT"} and value is not None:
+            premium_prices[str(months)] = str(value)
+    try:
+        upstream_max = int(stars_info.get("max_per_order") or 50000)
+    except (TypeError, ValueError):
+        upstream_max = 50000
+    return {
+        "stars_price_per_star_usd": str(unit_price),
+        "stars_max_per_order": max(50, upstream_max),
+        "premium_usd": premium_prices,
+        "catalog_source": "TgSuperstars (کلید API مدیر)",
+    }
+
+
+def _merge_quote_catalog(primary, fallback):
+    """Use primary fields where present and safely fill missing fields from fallback."""
+    result = dict(primary or {})
+    fallback = fallback or {}
+    if _pricing_decimal(result.get("stars_price_per_star_usd")) is None:
+        result["stars_price_per_star_usd"] = fallback.get("stars_price_per_star_usd", "")
+        result["stars_max_per_order"] = fallback.get("stars_max_per_order", result.get("stars_max_per_order", 1000000))
+    premium = result.get("premium_usd") if isinstance(result.get("premium_usd"), dict) else {}
+    fallback_premium = fallback.get("premium_usd") if isinstance(fallback.get("premium_usd"), dict) else {}
+    premium = dict(premium)
+    for month in ("3", "6", "12"):
+        if _pricing_decimal(premium.get(month)) is None and _pricing_decimal(fallback_premium.get(month)) is not None:
+            premium[month] = fallback_premium[month]
+    result["premium_usd"] = premium
+    result["catalog_source"] = " + ".join(x for x in (result.get("catalog_source"), fallback.get("catalog_source")) if x)
+    return result
+
+
+def _extract_fx_rate_toman(payload):
+    """Parse the public Iran Market feed without depending on one symbol/schema version."""
+    if not isinstance(payload, dict):
+        raise ValueError("پاسخ منبع ارز ساختار JSON معتبری ندارد.")
+    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+    if meta.get("stale") is True or str(meta.get("source_status", "")).lower() in {"stale", "unavailable"}:
+        raise ValueError("منبع ارز دادهٔ قدیمی یا ناموجود اعلام کرده است.")
+
+    rows = payload.get("data")
+    if isinstance(rows, dict):
+        rows = list(rows.values())
+    if not isinstance(rows, list):
+        raise ValueError("فهرست قیمت‌های منبع ارز قابل‌شناسایی نیست.")
+
+    by_symbol = {
+        str(item.get("symbol") or "").upper(): item
+        for item in rows if isinstance(item, dict)
+    }
+    # Prefer the Tether quote; if unavailable, use the documented free-USD quote.
+    chosen_symbol = next((symbol for symbol in ("USDT_IRR", "USD_IRR_FREE", "USD_IRR") if symbol in by_symbol), None)
+    if not chosen_symbol:
+        raise ValueError("نماد تتر/دلار در خوراک قیمت پیدا نشد.")
+    row = by_symbol[chosen_symbol]
+    if row.get("stale") is True or str(row.get("source_status", "")).lower() in {"stale", "unavailable"}:
+        raise ValueError("قیمت دلار/تتر در منبع قدیمی یا ناموجود است.")
+
+    rate = _pricing_decimal(row.get("price"))
+    if rate is None:
+        raise ValueError("مقدار نرخ دلار/تتر معتبر نیست.")
+
+    unit = str(row.get("unit") or meta.get("unit") or "toman").strip().lower()
+    if unit in {"rial", "riyal", "irr", "ریال"}:
+        rate = rate / Decimal(10)
+    elif unit not in {"toman", "تومان", "tmn", "irt", "تومان ایران"}:
+        raise ValueError("واحد قیمت ارز مشخص نیست؛ نرخ برای جلوگیری از اشتباه پذیرفته نشد.")
+
+    source_time = (
+        row.get("timestamp") or row.get("updated_at") or row.get("last_updated")
+        or meta.get("updated_at") or meta.get("published_at") or meta.get("generated_at")
+    )
+    if isinstance(source_time, (int, float)):
+        try:
+            source_time = datetime.fromtimestamp(float(source_time), tz=timezone.utc).isoformat(timespec="seconds")
+        except (ValueError, OverflowError, OSError):
+            source_time = None
+    if not source_time or not _pricing_timestamp_fresh(source_time, 3600):
+        raise ValueError("زمان آخرین به‌روزرسانی نرخ ارز موجود نیست یا بیش از یک ساعت قدیمی است.")
+
+    if rate < Decimal("1000") or rate > Decimal("100000000"):
+        raise ValueError("نرخ دریافتی خارج از محدودهٔ قابل‌قبول تومان است.")
+    return rate, str(source_time), chosen_symbol
+
+
+def _extract_nobitex_fx_rate_toman(payload):
+    """Extract a fresh USDT/IRT quote from Nobitex public orderbook; IRT prices are Toman."""
+    if not isinstance(payload, dict) or str(payload.get("status", "")).lower() != "ok":
+        raise ValueError("پاسخ بازار نوبیتکس معتبر نیست.")
+    updated_ms = payload.get("lastUpdate")
+    try:
+        updated_dt = datetime.fromtimestamp(float(updated_ms) / 1000.0, tz=timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError):
+        raise ValueError("زمان به‌روزرسانی بازار نوبیتکس موجود نیست.")
+    updated_at = updated_dt.isoformat(timespec="seconds")
+    if not _pricing_timestamp_fresh(updated_at, 300):
+        raise ValueError("دادهٔ بازار نوبیتکس بیش از ۵ دقیقه قدیمی است.")
+
+    rate = _pricing_decimal(payload.get("lastTradePrice"))
+    if rate is None:
+        bids = payload.get("bids") or []
+        asks = payload.get("asks") or []
+        bid = _pricing_decimal(bids[0][0]) if bids and isinstance(bids[0], (list, tuple)) and bids[0] else None
+        ask = _pricing_decimal(asks[0][0]) if asks and isinstance(asks[0], (list, tuple)) and asks[0] else None
+        if bid is not None and ask is not None and bid <= ask:
+            rate = (bid + ask) / Decimal(2)
+    if rate is None or rate < Decimal("1000") or rate > Decimal("100000000"):
+        raise ValueError("قیمت USDT در بازار نوبیتکس معتبر نیست.")
+    return rate, updated_at, "USDTIRT"
+
+
+async def _fetch_live_fx_toman(client):
+    """Primary: Iran Market free-market USD/USDT feed. Fallback: Nobitex USDTIRT."""
+    failures = []
+    sources = (
+        ("Iran Market Data", _FX_DATA_URL, _extract_fx_rate_toman),
+        ("Nobitex USDTIRT", "https://apiv2.nobitex.ir/v3/orderbook/USDTIRT", _extract_nobitex_fx_rate_toman),
+    )
+    for source_name, url, parser in sources:
+        try:
+            response = await client.get(url, headers={"Accept": "application/json", "User-Agent": "SEYED-PREMIUM-FX/2.0"})
+            response.raise_for_status()
+            rate, source_time, symbol = parser(response.json())
+            return rate, source_time, symbol, source_name
+        except Exception as exc:
+            failures.append(f"{source_name}: {type(exc).__name__} ({str(exc)[:120]})")
+            logger.warning("FX source failed: %s", failures[-1], exc_info=True)
+    raise RuntimeError("هیچ منبع تازهٔ نرخ ارز پاسخ معتبر نداد. " + " | ".join(failures))
 
 
 async def refresh_auto_pricing(force=False):
@@ -3106,105 +3326,78 @@ async def refresh_auto_pricing(force=False):
         api_key = str(cfg.get("provider_api_key") or "").strip()
 
         last_age = _pricing_timestamp_age(cfg.get("catalog_attempted_at"))
-        due = (
-            last_age is None
-            or last_age >= _PROVIDER_REFRESH_COOLDOWN_SECONDS
-            or (force and last_age >= _PROVIDER_FORCE_REFRESH_COOLDOWN_SECONDS)
-        )
+        # An explicit admin refresh must bypass the background cooldown.
+        due = bool(force) or last_age is None or last_age >= _PROVIDER_REFRESH_COOLDOWN_SECONDS
         if due:
             cfg["catalog_attempted_at"] = now_iso
             save_auto_pricing_config(cfg)
             try:
                 async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
-                    if api_key:
-                        # Optional paid-provider route retained for users who already have a key.
-                        response = await client.get(_PROVIDER_PRODUCTS_URL, headers={"Authorization": f"Bearer {api_key}"})
-                        response.raise_for_status()
-                        payload = response.json()
-                        catalog = payload.get("data", payload) if isinstance(payload, dict) else None
-                        payload_meta = payload.get("meta") or {}
-                        catalog_meta = catalog.get("meta") or {} if isinstance(catalog, dict) else {}
-                        if (not isinstance(catalog, dict)
-                                or payload.get("unavailable") is True
-                                or catalog.get("unavailable") is True
-                                or payload.get("stale") is True
-                                or catalog.get("stale") is True
-                                or payload_meta.get("stale") is True
-                                or catalog_meta.get("stale") is True
-                                or str(payload.get("source_status", "")).lower() in {"stale", "unavailable"}
-                                or str(catalog.get("source_status", "")).lower() in {"stale", "unavailable"}):
-                            raise ValueError("کاتالوگ تأمین‌کننده قیمت را موقتاً در دسترس اعلام نکرد یا دادهٔ آن کش‌شده است.")
-                        stars_info = catalog.get("stars") or {}
-                        stars_currency = str(stars_info.get("currency") or catalog.get("currency") or "USD").upper()
-                        unit_price = _pricing_decimal(stars_info.get("price_per_star"))
-                        if stars_currency not in {"USD", "USDT"} or unit_price is None:
-                            raise ValueError("قیمت هر استارز یا واحد پول کاتالوگ معتبر نیست.")
-                        premium_raw = catalog.get("premium") or {}
-                        premium_prices = {}
-                        for months in (3, 6, 12):
-                            item = premium_raw.get(str(months)) or premium_raw.get(months)
-                            if not isinstance(item, dict):
-                                continue
-                            currency = str(item.get("currency") or catalog.get("currency") or "USD").upper()
-                            value = _pricing_decimal(item.get("partner_price"))
-                            if currency in {"USD", "USDT"} and value is not None:
-                                premium_prices[str(months)] = str(value)
-                        try:
-                            upstream_max = int(stars_info.get("max_per_order") or 50000)
-                        except (TypeError, ValueError):
-                            upstream_max = 50000
-                        catalog_prices = {
-                            "stars_price_per_star_usd": str(unit_price),
-                            "stars_max_per_order": max(50, upstream_max),
-                            "premium_usd": premium_prices,
-                        }
-                    else:
-                        # Free read-only quote source; does not place orders or require credentials.
+                    # Public Fragment reference is always available without wallet/API secrets.
+                    # If the admin has a supplier key, query it too and merge good fields;
+                    # an expired/invalid supplier key must never break the public quote route.
+                    catalog_prices = {}
+                    try:
                         catalog_prices = await _fetch_public_price_catalog(client)
-                if not catalog_prices.get("premium_usd", {}).get("3") or not catalog_prices.get("premium_usd", {}).get("6") or not catalog_prices.get("premium_usd", {}).get("12"):
-                    raise ValueError("قیمت یکی از بسته‌های پرمیوم از منبع دریافت نشد.")
+                    except Exception as public_exc:
+                        logger.warning("Public Fragment quote source failed: %s", public_exc, exc_info=True)
+                    if api_key:
+                        try:
+                            supplier_catalog = await _fetch_tgsuperstars_price_catalog(client, api_key)
+                            catalog_prices = _merge_quote_catalog(catalog_prices, supplier_catalog)
+                        except Exception as provider_exc:
+                            logger.warning("Optional supplier quote source failed: %s", provider_exc, exc_info=True)
+                    if not catalog_prices:
+                        raise RuntimeError("منبع عمومی Fragment و منبع تأمین‌کننده هیچ قیمت معتبری ندادند.")
+                # Stars and Premium have separate validity flags and update timestamps.
+                if not isinstance(catalog_prices.get("premium_usd"), dict):
+                    catalog_prices["premium_usd"] = {}
+                stars_price = _pricing_decimal(catalog_prices.get("stars_price_per_star_usd"))
+                if stars_price is not None:
+                    cfg["catalog_valid"] = True
+                    cfg["catalog_updated_at"] = utc_now().isoformat(timespec="seconds")
+                    cfg["catalog_error"] = ""
+                else:
+                    cfg["catalog_valid"] = False
+                    cfg["catalog_error"] = "قیمت مرجع هر استارز دریافت نشد."
+                premium_prices = catalog_prices.get("premium_usd") or {}
+                if all(_pricing_decimal(premium_prices.get(str(m))) is not None for m in (3, 6, 12)):
+                    cfg["premium_catalog_valid"] = True
+                    cfg["premium_catalog_updated_at"] = utc_now().isoformat(timespec="seconds")
+                    cfg["premium_catalog_error"] = ""
+                else:
+                    cfg["premium_catalog_valid"] = False
+                    missing = [str(m) for m in (3, 6, 12) if _pricing_decimal(premium_prices.get(str(m))) is None]
+                    cfg["premium_catalog_error"] = "قیمت مرجع پلن‌های " + "، ".join(missing) + " ماهه دریافت نشد."
                 cfg["catalog_prices"] = catalog_prices
-                cfg["catalog_valid"] = True
-                cfg["catalog_updated_at"] = utc_now().isoformat(timespec="seconds")
-                cfg["catalog_error"] = ""
             except Exception as exc:
-                logger.warning("Live pricing catalog refresh failed: %s", type(exc).__name__)
+                logger.exception("Live pricing catalog refresh failed")
                 cfg["catalog_valid"] = False
-                cfg["catalog_error"] = f"دریافت کاتالوگ ناموفق بود ({type(exc).__name__})."
+                cfg["premium_catalog_valid"] = False
+                cfg["catalog_error"] = f"دریافت قیمت مرجع استارز ناموفق بود ({type(exc).__name__})."
+                cfg["premium_catalog_error"] = f"دریافت قیمت مرجع پرمیوم ناموفق بود ({type(exc).__name__})."
             save_auto_pricing_config(cfg)
         elif not cfg.get("catalog_valid"):
             cfg["catalog_error"] = cfg.get("catalog_error") or "تلاش بعدی پس از پایان محدودیت درخواست انجام می‌شود."
 
         fx_age = _pricing_timestamp_age(cfg.get("fx_attempted_at"))
-        if fx_age is None or fx_age >= _FX_REFRESH_COOLDOWN_SECONDS:
+        if fx_age is None or fx_age >= _FX_REFRESH_COOLDOWN_SECONDS or force:
             cfg["fx_attempted_at"] = utc_now().isoformat(timespec="seconds")
             save_auto_pricing_config(cfg)
             try:
-                async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
-                    response = await client.get(_FX_DATA_URL)
-                response.raise_for_status()
-                payload = response.json()
-                if not isinstance(payload, dict):
-                    raise ValueError("ساختار پاسخ نرخ ارز معتبر نیست.")
-                meta = payload.get("meta") or {}
-                if str(meta.get("unit") or "").lower() != "toman" or meta.get("stale") is True:
-                    raise ValueError("خوراک نرخ ارز منقضی یا با واحد نامعتبر است.")
-                fx_row = next((item for item in payload.get("data", []) if isinstance(item, dict) and item.get("symbol") == "USDT_IRR"), None)
-                if not fx_row or fx_row.get("stale") is True:
-                    raise ValueError("نرخ تتر بازار آزاد در خوراک پیدا نشد یا منقضی است.")
-                rate = _pricing_decimal(fx_row.get("price"))
-                source_time = fx_row.get("timestamp") or meta.get("updated_at")
-                if rate is None or not _pricing_timestamp_fresh(source_time, 3600):
-                    raise ValueError("زمان یا مقدار نرخ دلار معتبر و تازه نیست.")
+                async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+                    rate, source_time, fx_symbol, fx_source_name = await _fetch_live_fx_toman(client)
                 cfg["fx_rate_toman"] = str(rate)
                 cfg["fx_source_updated_at"] = str(source_time)
+                cfg["fx_source_symbol"] = fx_symbol
+                cfg["fx_source_name"] = fx_source_name
                 cfg["fx_fetched_at"] = utc_now().isoformat(timespec="seconds")
                 cfg["fx_valid"] = True
                 cfg["fx_error"] = ""
             except Exception as exc:
-                logger.warning("Live FX refresh failed: %s", type(exc).__name__)
+                logger.exception("All live FX sources failed")
                 cfg["fx_valid"] = False
-                cfg["fx_error"] = f"دریافت نرخ ارز ناموفق بود ({type(exc).__name__})."
+                cfg["fx_error"] = str(exc)[:500] or f"دریافت نرخ ارز ناموفق بود ({type(exc).__name__})."
             save_auto_pricing_config(cfg)
 
         cfg = load_auto_pricing_config()
@@ -3222,6 +3415,7 @@ async def auto_pricing_refresh_loop(application):
         try:
             await refresh_auto_pricing(force=False)
             sync_gift_prices_in_db()
+            sync_premium_prices_in_db()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -4738,16 +4932,137 @@ async def _safe_callback_answer(query):
         logger.debug("Callback answer could not be sent", exc_info=True)
 
 
+GLOBAL_CANCEL_STATE_KEYS = (
+    # Admin forms and editors
+    "gift_admin_input", "premium_admin_input", "gift_custom_state",
+    "support_admin_reply_state", "support_admin_search_state", "gift_order_search_state",
+    "pricing_admin_state", "product_admin_state", "uiadm_state", "editor_wait_key",
+    "coupon_edit_state", "coupon_edit_categories", "coupon_category_add_state",
+    "coupon_scope_state", "admin_coupon_state",
+    # Customer order forms that have not yet created an order
+    "mediator_request_state", "ton_purchase_state",
+    "stars_custom_amount", "stars_custom_order", "stars_custom_wait_recipient",
+    "stars_fixed_wait_recipient", "stars_custom_chat_id", "stars_custom_message_id",
+    "stars_recipient", "stars_coupon", "pending_stars_coupon",
+    "pending_product_id", "pending_dynamic_quote", "pending_gift_delivery_mode",
+    "pending_gift_delivery_product_id", "pending_gift_price_quote",
+    "pending_product_coupon", "pending_product_coupon_input",
+    # VPN/VIP configuration input states
+    "config_duration", "config_invoice_amount", "config_invoice_expires_at",
+    "config_invoice_open", "config_plan_type", "config_price", "config_volume",
+    "config_wait_duration", "config_wait_volume", "vip_duration", "vip_invoice_amount",
+    "vip_payment_open", "vip_plan_type", "vip_price", "vip_volume",
+    "vip_wait_duration", "vip_wait_volume",
+)
+
+
+def clear_active_operation_state(context):
+    """Clear only transient forms; never delete saved orders, payment receipts or settings."""
+    cleared = []
+    for key in GLOBAL_CANCEL_STATE_KEYS:
+        if key in context.user_data:
+            context.user_data.pop(key, None)
+            cleared.append(key)
+    if context.user_data.pop("support_form_active", None):
+        cleared.append("support_form_active")
+    return cleared
+
+
+def safe_premium_admin_keyboard():
+    try:
+        return premium_admin_keyboard()
+    except Exception:
+        logger.exception("Could not build premium admin keyboard; using fallback")
+        return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 پنل مدیریت", callback_data="admin")]])
+
+
+async def safe_callback_edit_or_reply(query, text, reply_markup=None):
+    """Render a callback result without allowing an edit failure to become a handler crash."""
+    try:
+        await query.edit_message_text(text=text, reply_markup=reply_markup)
+        return True
+    except Exception as edit_exc:
+        logger.warning("Callback message edit failed; falling back to a new message: %s", edit_exc, exc_info=True)
+        try:
+            source_message = getattr(query, "message", None)
+            if source_message is not None:
+                await source_message.reply_text(text=text, reply_markup=reply_markup)
+                return True
+        except Exception:
+            logger.exception("Callback fallback reply failed")
+        try:
+            await query.answer(str(text).replace("\n", " ")[:190], show_alert=True)
+        except Exception:
+            logger.exception("Callback alert fallback failed")
+        return False
+
+
+async def handle_global_cancel_callback(update, context):
+    """Global cancel for every button visibly labelled '❌ لغو عملیات'."""
+    query = update.callback_query
+    user = update.effective_user
+    if not query or not user:
+        return
+    await _safe_callback_answer(query)
+    cleared = clear_active_operation_state(context)
+    if "support_form_active" in cleared:
+        try:
+            with db() as con:
+                con.execute("DELETE FROM support_form_sessions WHERE user_id=?", (user.id,))
+        except Exception:
+            logger.exception("Could not remove cancelled support form session")
+
+    if user.id == ADMIN_ID:
+        if "premium_admin_input" in cleared:
+            destination = "premium_admin_home"
+            title = "مدیریت پرمیوم"
+        elif "gift_admin_input" in cleared or "gift_custom_state" in cleared or "gift_order_search_state" in cleared:
+            destination = "gift_admin_home"
+            title = "مدیریت گیفت"
+        elif "pricing_admin_state" in cleared:
+            destination = "admin_auto_pricing"
+            title = "قیمت‌گذاری خودکار"
+        elif "product_admin_state" in cleared:
+            destination = "admin_products"
+            title = "مدیریت محصولات"
+        else:
+            destination = "admin"
+            title = "پنل مدیریت"
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton(f"🔙 بازگشت به {title}", callback_data=destination)]])
+    else:
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 منوی اصلی", callback_data="home", style="primary")]])
+
+    if cleared:
+        message = "❌ عملیات جاری لغو شد؛ هیچ مقدارِ ذخیره‌نشده‌ای ثبت نشد."
+        if context.user_data.get("pending_receipt_order_id"):
+            message += "\nسفارشِ از قبل ثبت‌شده و منتظر رسید تغییر نکرده است؛ برای لغو آن از دکمهٔ «لغو سفارش» استفاده کن."
+    else:
+        message = "عملیات ورودیِ فعالی برای لغو پیدا نشد."
+    await safe_callback_edit_or_reply(query, message, reply_markup=markup)
+
+
 async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _handler_started = time.perf_counter()
     try:
         await _callbacks_impl(update, context)
-    except Exception:
+    except Exception as exc:
         logger.exception("Unhandled callback failure; update_id=%s", getattr(update, "update_id", None))
         query = update.callback_query
         if query:
+            # For the two live-rate buttons, return a useful diagnostic instead of
+            # leaving the spinner/progress text on screen.
+            if query.data in {"premium_auto_star_rate_toggle", "premium_auto_fragment_toggle"}:
+                try:
+                    await safe_callback_edit_or_reply(
+                        query,
+                        f"⚠️ عملیات نرخ خودکار کامل نشد ({type(exc).__name__}: {str(exc)[:350]}). حالت دستی/قبلی حفظ شد؛ جزئیات کامل در لاگ ثبت شد.",
+                        safe_premium_admin_keyboard(),
+                    )
+                    return
+                except Exception:
+                    logger.exception("Could not render premium pricing callback diagnostic")
             try:
-                await query.answer("خطایی رخ داد؛ خطا ثبت شد. دوباره تلاش کن.", show_alert=True)
+                await query.answer(f"خطا: {type(exc).__name__}؛ جزئیات در لاگ ثبت شد.", show_alert=True)
             except Exception:
                 logger.exception("Could not notify user about callback failure")
     finally:
@@ -5008,7 +5323,7 @@ async def handle_gift_support_callback(query, context):
         context.user_data["gift_admin_input"] = {"field": "base_star_rate"}
         await query.edit_message_text(
             "💰 نرخ پایه هر ⭐ چند تومان باشد؟\nمثلاً 1000\n\nعدد مثبت بفرست. برای لغو /cancel را بزن.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو عملیات", callback_data="gift_input_cancel", style="danger")], [InlineKeyboardButton("🔙 بازگشت", callback_data="gift_admin_home")]])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو عملیات", callback_data="global_cancel", style="danger")], [InlineKeyboardButton("🔙 بازگشت", callback_data="gift_admin_home")]])
         )
         return True
 
@@ -5016,7 +5331,7 @@ async def handle_gift_support_callback(query, context):
         context.user_data["gift_admin_input"] = {"field": "profit_percent"}
         await query.edit_message_text(
             "📈 چند درصد سود روی قیمت استارزی اضافه شود؟\nمثلاً 20\n\nعدد بین ۰ تا ۱۰۰۰ بفرست. برای لغو /cancel را بزن.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو عملیات", callback_data="gift_input_cancel", style="danger")], [InlineKeyboardButton("🔙 بازگشت", callback_data="gift_admin_home")]])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو عملیات", callback_data="global_cancel", style="danger")], [InlineKeyboardButton("🔙 بازگشت", callback_data="gift_admin_home")]])
         )
         return True
 
@@ -5058,7 +5373,7 @@ async def handle_gift_support_callback(query, context):
             "دلار 165000  ← نرخ دستی دلار به تومان\n"
             "دلار 0  ← استفاده از نرخ خودکار دلار\n\n"
             "برای لغو /cancel را بزن.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو عملیات", callback_data="gift_input_cancel", style="danger")], [InlineKeyboardButton("🔙 بازگشت", callback_data="gift_admin_home")]])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو عملیات", callback_data="global_cancel", style="danger")], [InlineKeyboardButton("🔙 بازگشت", callback_data="gift_admin_home")]])
         )
         return True
 
@@ -5074,7 +5389,7 @@ async def handle_gift_support_callback(query, context):
         context.user_data["gift_admin_input"] = {"field": "support_text"}
         await query.edit_message_text(
             "📝 متن پیام پشتیبانی را بفرست. این متن فقط در صورت نیاز به هماهنگی تحویل برای مشتری ارسال می‌شود.\n\nمتن فعلی:\n" + load_gift_settings()["support_text"],
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو عملیات", callback_data="gift_input_cancel", style="danger")], [InlineKeyboardButton("🔙 بازگشت", callback_data="gift_admin_home")]])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو عملیات", callback_data="global_cancel", style="danger")], [InlineKeyboardButton("🔙 بازگشت", callback_data="gift_admin_home")]])
         )
         return True
 
@@ -5089,7 +5404,7 @@ async def handle_gift_support_callback(query, context):
             "🔗 افزودن گیفت سفارشی\n\n"
             "این بخش برای گیفت یا NFT سفارشی است که ربات آن را از کاتالوگ رسمی ارسال نمی‌کند؛ تحویل آن دستی خواهد بود.\n\n"
             "ابتدا لینک کامل گیفت را بفرست؛ نمونه: https://t.me/nft/MoodPack-134232\n\nبرای لغو /cancel را بزن.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو عملیات", callback_data="gift_custom_cancel", style="danger")]])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو عملیات", callback_data="global_cancel", style="danger")]])
         )
         return True
 
@@ -5127,7 +5442,7 @@ async def handle_gift_support_callback(query, context):
     if data == "gift_topup_custom":
         context.user_data["gift_admin_input"] = {"field": "topup_amount"}
         await query.edit_message_text("✍️ تعداد Stars موردنظر را فقط با عدد بفرست (۱ تا ۱۰۰٬۰۰۰). برای لغو /cancel را بزن.",
-                                      reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو عملیات", callback_data="gift_input_cancel")]]))
+                                      reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو عملیات", callback_data="global_cancel")]]))
         return True
 
     if data == "gift_orders":
@@ -5405,6 +5720,9 @@ def order_search_results_keyboard(rows):
 
 async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if query and query.data == "global_cancel":
+        await handle_global_cancel_callback(update, context)
+        return
     if query.data == "check_membership":
         context.application.create_task(_safe_callback_answer(query))
         result = await is_channel_member(update, context)
@@ -5492,65 +5810,162 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(premium_delivery_text(), reply_markup=premium_delivery_keyboard())
         return
     if data == "premium_auto_star_rate_toggle":
-        cfg = load_premium_manager_settings()
-        turning_on = not cfg["auto_star_rate_enabled"]
-        if turning_on:
-            await query.edit_message_text("🔄 در حال دریافت قیمت مرجع هر استارز و نرخ ارز...")
+        try:
+            cfg = load_premium_manager_settings()
+            turning_on = not bool(cfg.get("auto_star_rate_enabled"))
+            if not turning_on:
+                cfg["auto_star_rate_enabled"] = False
+                save_premium_manager_settings(cfg)
+                try:
+                    sync_premium_prices_in_db()
+                except Exception:
+                    logger.exception("Premium prices could not be synchronized after disabling automatic Stars rate")
+                await safe_callback_edit_or_reply(
+                    query,
+                    "✅ نرخ خودکار استارز خاموش شد؛ نرخ دستی پرمیوم فعال است.",
+                    safe_premium_admin_keyboard(),
+                )
+                return
+
+            await safe_callback_edit_or_reply(query, "🔄 در حال دریافت قیمت مرجع هر استارز و نرخ ارز...", None)
             await refresh_auto_pricing(force=True)
             auto_cfg = load_auto_pricing_config()
             feed, prices, catalog_ok, fx_ok = _premium_feed_parts(auto_cfg)
-            unit = _pricing_decimal(prices.get("stars_price_per_star_usd")) if catalog_ok else None
+            unit = _pricing_decimal((prices or {}).get("stars_price_per_star_usd")) if catalog_ok else None
             fx = _pricing_decimal(feed.get("fx_rate_toman")) if fx_ok else None
             if unit is None or fx is None:
-                await query.edit_message_text(premium_admin_text("⚠️ نرخ زنده از منبع معتبر و تازه دریافت نشد؛ حالت خودکار روشن نشد."), reply_markup=premium_admin_keyboard())
+                details = []
+                if not catalog_ok:
+                    details.append("قیمت مرجع استارز: " + str(feed.get("catalog_error") or "دادهٔ تازه پیدا نشد."))
+                if not fx_ok:
+                    details.append("نرخ ارز: " + str(feed.get("fx_error") or "دادهٔ تازه پیدا نشد."))
+                cfg["auto_star_rate_enabled"] = False
+                save_premium_manager_settings(cfg)
+                await safe_callback_edit_or_reply(
+                    query,
+                    "⚠️ نرخ خودکار استارز روشن نشد؛ تنظیم قبلی حفظ شد.\n\n" + "\n".join(details)[:2200],
+                    safe_premium_admin_keyboard(),
+                )
                 return
+
             value = (unit * fx).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
             cfg["auto_star_rate_enabled"] = True
             save_premium_manager_settings(cfg)
-            sync_premium_prices_in_db()
-            await query.edit_message_text(
-                f"⭐ بر اساس قیمت مرجع استارز و نرخ روز تتر/تومان، قیمت هر ⭐ حدود {toman(value)} تومان است (بدون سود).\n\n"
-                f"قیمت مرجع هر ⭐: {unit} USDT\nنرخ تتر: {toman(fx)} تومان\nمنبع قیمت: API واسطِ قیمت Fragment/Stars (غیررسمی)\nآخرین دریافت: {_pricing_time_text(feed.get('catalog_updated_at'))}\n\n"
-                "با روشن‌ماندن این گزینه، نرخ به‌صورت دوره‌ای به‌روزرسانی می‌شود.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ تأیید", callback_data="premium_admin_home")], [InlineKeyboardButton("🔙 بازگشت", callback_data="premium_admin_home")]])
+            sync_note = ""
+            try:
+                sync_premium_prices_in_db()
+            except Exception as sync_exc:
+                logger.exception("Premium product price sync failed after enabling Stars auto rate")
+                sync_note = f"\n⚠️ تنظیم ذخیره شد، اما همگام‌سازی فهرست محصولات نیازمند بررسی است ({type(sync_exc).__name__})."
+            result_text = (
+                f"⭐ قیمت مرجع هر استارز: {unit} USDT\n"
+                f"💱 نرخ ارز: {toman(fx)} تومان\n"
+                f"💰 هزینهٔ مرجع هر ⭐: حدود {toman(value)} تومان (بدون سود)\n"
+                f"🌐 منبع قیمت: {prices.get('catalog_source') or 'Fragment API عمومی'}\n"
+                f"🌐 منبع ارز: {feed.get('fx_source_name') or 'منبع عمومی بازار'} ({feed.get('fx_source_symbol') or '—'})\n"
+                f"🕒 زمان دریافت نرخ ارز: {_pricing_time_text(feed.get('fx_source_updated_at'))}\n\n"
+                "✅ نرخ خودکار استارز فعال شد. به‌روزرسانی دوره‌ای ادامه دارد."
+                + sync_note
             )
-            return
-        cfg["auto_star_rate_enabled"] = False
-        save_premium_manager_settings(cfg)
-        sync_premium_prices_in_db()
-        await query.edit_message_text(premium_admin_text("✅ نرخ خودکار استارز خاموش شد؛ نرخ دستی فعال است."), reply_markup=premium_admin_keyboard())
+            await safe_callback_edit_or_reply(query, result_text, safe_premium_admin_keyboard())
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("Premium auto Stars-rate action failed")
+            try:
+                cfg = load_premium_manager_settings()
+                cfg["auto_star_rate_enabled"] = False
+                save_premium_manager_settings(cfg)
+            except Exception:
+                logger.exception("Could not restore manual Stars-rate mode after failure")
+            await safe_callback_edit_or_reply(
+                query,
+                f"❌ نرخ خودکار استارز فعال نشد؛ حالت دستی حفظ شد.\nخطا: {type(exc).__name__}: {str(exc)[:500]}",
+                safe_premium_admin_keyboard(),
+            )
         return
+
     if data == "premium_auto_fragment_toggle":
-        cfg = load_premium_manager_settings()
-        turning_on = not cfg["auto_fragment_enabled"]
-        if turning_on:
-            await query.edit_message_text("🔄 در حال دریافت قیمت‌های ۳، ۶ و ۱۲ ماهه از منبع مرجع Fragment...")
+        try:
+            cfg = load_premium_manager_settings()
+            turning_on = not bool(cfg.get("auto_fragment_enabled"))
+            if not turning_on:
+                cfg["auto_fragment_enabled"] = False
+                save_premium_manager_settings(cfg)
+                try:
+                    sync_premium_prices_in_db()
+                except Exception:
+                    logger.exception("Premium prices could not be synchronized after disabling Fragment auto rate")
+                await safe_callback_edit_or_reply(
+                    query,
+                    "✅ نرخ خودکار فرگمنت خاموش شد؛ قیمت‌های دلاری دستی یا محاسبه بر اساس نرخ استارز استفاده می‌شوند.",
+                    safe_premium_admin_keyboard(),
+                )
+                return
+
+            await safe_callback_edit_or_reply(query, "🔄 در حال دریافت قیمت‌های ۳، ۶ و ۱۲ ماهه از منبع مرجع Fragment...", None)
             await refresh_auto_pricing(force=True)
             auto_cfg, prices, catalog_ok, fx_ok = _premium_feed_parts()
             premium_prices = prices.get("premium_usd") or {}
-            if not catalog_ok or not fx_ok or any(_pricing_decimal(premium_prices.get(str(m))) is None for m in (3, 6, 12)):
-                await query.edit_message_text(premium_admin_text("⚠️ قیمت هر سه پلن یا نرخ ارز از منبع تازه و معتبر دریافت نشد؛ حالت خودکار فرگمنت روشن نشد."), reply_markup=premium_admin_keyboard())
+            fresh_premium = _premium_catalog_is_fresh(auto_cfg)
+            missing = [str(m) for m in (3, 6, 12) if _pricing_decimal(premium_prices.get(str(m))) is None]
+            if not fresh_premium or not fx_ok or missing:
+                details = []
+                if not fresh_premium:
+                    details.append("قیمت‌های فرگمنت: " + str(auto_cfg.get("premium_catalog_error") or "دادهٔ تازه دریافت نشد."))
+                if not fx_ok:
+                    details.append("نرخ ارز: " + str(auto_cfg.get("fx_error") or "دادهٔ تازه دریافت نشد."))
+                if missing:
+                    details.append("پلن‌های فاقد قیمت: " + "، ".join(missing) + " ماهه")
+                cfg["auto_fragment_enabled"] = False
+                save_premium_manager_settings(cfg)
+                await safe_callback_edit_or_reply(
+                    query,
+                    "⚠️ نرخ خودکار فرگمنت روشن نشد؛ قیمت قبلی حفظ شد.\n\n" + "\n".join(details)[:2200],
+                    safe_premium_admin_keyboard(),
+                )
                 return
+
             cfg["auto_fragment_enabled"] = True
             save_premium_manager_settings(cfg)
-            sync_premium_prices_in_db()
+            sync_note = ""
+            try:
+                sync_premium_prices_in_db()
+            except Exception as sync_exc:
+                logger.exception("Premium product price sync failed after enabling Fragment auto rate")
+                sync_note = f"\n⚠️ تنظیم ذخیره شد، اما همگام‌سازی محصولات نیازمند بررسی است ({type(sync_exc).__name__})."
             show = []
-            for m in (3, 6, 12):
-                usd = _pricing_decimal(premium_prices.get(str(m)))
+            for months in (3, 6, 12):
+                usd = _pricing_decimal(premium_prices.get(str(months)))
                 base = _ceil_toman(usd * _pricing_decimal(auto_cfg.get("fx_rate_toman")))
-                final = premium_price_quote(m, cfg, auto_cfg)
-                show.append(f"• {m} ماهه: {usd} USDT ≈ {toman(base)} تومان هزینهٔ مرجع | با سود: {toman(final['sale_toman']) if final else 'نامشخص'} تومان")
-            await query.edit_message_text(
-                "💎 نرخ مرجع پرمیوم در Fragment (دریافت از API واسط و غیررسمی)\n\n"
-                + "\n".join(show)
-                + f"\n\nنرخ ارز: {toman(auto_cfg.get('fx_rate_toman'))} تومان\nآخرین دریافت: {_pricing_time_text(auto_cfg.get('catalog_updated_at'))}\n\nقیمت‌ها به‌صورت دوره‌ای به‌روزرسانی می‌شوند؛ این API قیمت مرجع ارائه می‌کند و خرید انجام نمی‌دهد.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ تأیید", callback_data="premium_admin_home")], [InlineKeyboardButton("🔙 بازگشت", callback_data="premium_admin_home")]])
+                final_quote = premium_price_quote(months, cfg, auto_cfg)
+                final_text = toman(final_quote["sale_toman"]) if final_quote else "نامشخص"
+                show.append(f"• {months} ماهه: {usd} USDT ≈ {toman(base)} تومان هزینهٔ مرجع | با سود: {final_text} تومان")
+            result_text = (
+                "💎 قیمت‌های مرجع تلگرام پرمیوم\n\n" + "\n".join(show)
+                + f"\n\nنرخ ارز: {toman(auto_cfg.get('fx_rate_toman'))} تومان"
+                + f"\nمنبع قیمت: {prices.get('catalog_source') or 'Fragment API عمومی'}"
+                + f"\nمنبع ارز: {auto_cfg.get('fx_source_name') or 'منبع عمومی بازار'} ({auto_cfg.get('fx_source_symbol') or '—'})"
+                + f"\nآخرین دریافت قیمت: {_pricing_time_text(auto_cfg.get('premium_catalog_updated_at') or auto_cfg.get('catalog_updated_at'))}"
+                + "\n\nقیمت‌ها صرفاً مرجع‌اند؛ این استعلام به‌تنهایی خرید یا تحویل انجام نمی‌دهد."
+                + sync_note
             )
-            return
-        cfg["auto_fragment_enabled"] = False
-        save_premium_manager_settings(cfg)
-        sync_premium_prices_in_db()
-        await query.edit_message_text(premium_admin_text("✅ نرخ خودکار فرگمنت خاموش شد؛ قیمت‌های دلاری دستی یا محاسبه بر اساس نرخ استارز استفاده می‌شوند."), reply_markup=premium_admin_keyboard())
+            await safe_callback_edit_or_reply(query, result_text, safe_premium_admin_keyboard())
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("Premium Fragment auto-price action failed")
+            try:
+                cfg = load_premium_manager_settings()
+                cfg["auto_fragment_enabled"] = False
+                save_premium_manager_settings(cfg)
+            except Exception:
+                logger.exception("Could not restore manual Fragment-price mode after failure")
+            await safe_callback_edit_or_reply(
+                query,
+                f"❌ نرخ خودکار فرگمنت فعال نشد؛ تنظیم قبلی حفظ شد.\nخطا: {type(exc).__name__}: {str(exc)[:500]}",
+                safe_premium_admin_keyboard(),
+            )
         return
     if data in {"premium_rate_toman", "premium_fragment_usd", "premium_base_usd_fx", "premium_margin", "premium_plan_price_3", "premium_plan_price_6", "premium_plan_price_12"}:
         cfg = load_premium_manager_settings()
@@ -5585,7 +6000,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                       "برای حذف قیمت شخصی و بازگشت به محاسبهٔ خودکار (نرخ × استارز × سود)، عدد 0 را بفرست.")
         context.user_data["premium_admin_input"] = {"field": field}
         await query.edit_message_text(prompt, reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ لغو عملیات", callback_data="premium_input_cancel", style="danger")],
+            [InlineKeyboardButton("❌ لغو عملیات", callback_data="global_cancel", style="danger")],
             [InlineKeyboardButton("🔙 بازگشت به مدیریت پرمیوم", callback_data="premium_admin_home")],
         ]))
         return
@@ -5960,9 +6375,6 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         price = int(live_quote["sale_toman"]) if live_quote else 0
         balance = int(user["balance"] or 0) if user else 0
 
-        def toman(value):
-            return f"{value:,}".replace(",", "٬")
-
         if price <= 0:
             detail = (
                 "🛒 جزئیات بسته انتخابی\n\n"
@@ -6055,8 +6467,6 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("stars_recipient_self_") or data.startswith("stars_recipient_other_"):
-        def toman(value):
-            return f"{int(value):,}".replace(",", "٬")
         is_self = data.startswith("stars_recipient_self_")
         try:
             amount = int(data.rsplit("_", 1)[-1])
@@ -7067,7 +7477,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⚠️ این صفحه فعلاً آزمایشی است و درگاه واقعی متصل نیست؛ پرداختی انجام نمی‌شود.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("💳 پرداخت آزمایشی", callback_data="config_gateway_demo", style="success")],
-                [InlineKeyboardButton("❌ لغو عملیات", callback_data="config_invoice_cancel", style="primary")],
+                [InlineKeyboardButton("❌ لغو عملیات", callback_data="global_cancel", style="primary")],
                 [InlineKeyboardButton("💰 شارژ کیف پول", callback_data="topup", style="primary")],
                 [InlineKeyboardButton("⬅️ بازگشت به جزئیات پلن", callback_data="config_back_details", style="primary")],
             ]),
@@ -7184,7 +7594,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("💳 پرداخت / محاسبه کسری", callback_data="vip_open_payment", style="success")],
             [InlineKeyboardButton("💰 شارژ کیف پول", callback_data="topup", style="primary")],
             [InlineKeyboardButton("⬅️ بازگشت به پلن‌های VIP", callback_data="config_vip", style="primary")],
-            [InlineKeyboardButton("❌ لغو عملیات", callback_data="vip_cancel", style="primary")],
+            [InlineKeyboardButton("❌ لغو عملیات", callback_data="global_cancel", style="primary")],
         ])
         await query.edit_message_text(
             "📋 جزئیات پلن :\n\n"
@@ -7210,7 +7620,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⏳ هر روز: ۰ تومان\n\n"
             "برای لغو، دکمهٔ لغو عملیات را بزن.",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("❌ لغو عملیات", callback_data="vip_cancel", style="primary")]
+                [InlineKeyboardButton("❌ لغو عملیات", callback_data="global_cancel", style="primary")]
             ]),
         )
         return
@@ -7229,7 +7639,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⚠️ این صفحه فعلاً آزمایشی است و درگاه واقعی متصل نیست؛ پرداختی انجام نمی‌شود.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("💳 پرداخت در درگاه", callback_data="vip_gateway_demo", style="success")],
-                [InlineKeyboardButton("❌ لغو عملیات", callback_data="vip_cancel", style="primary")],
+                [InlineKeyboardButton("❌ لغو عملیات", callback_data="global_cancel", style="primary")],
                 [InlineKeyboardButton("💰 شارژ کیف پول", callback_data="topup", style="primary")],
                 [InlineKeyboardButton("⬅️ بازگشت به جزئیات پلن", callback_data="vip_back_details", style="primary")],
             ]),
@@ -7275,7 +7685,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     [InlineKeyboardButton("💳 پرداخت / محاسبه کسری", callback_data="vip_open_payment", style="success")],
                     [InlineKeyboardButton("💰 شارژ کیف پول", callback_data="topup", style="primary")],
                     [InlineKeyboardButton("⬅️ بازگشت به پلن‌های VIP", callback_data="config_vip", style="primary")],
-                    [InlineKeyboardButton("❌ لغو عملیات", callback_data="vip_cancel", style="primary")],
+                    [InlineKeyboardButton("❌ لغو عملیات", callback_data="global_cancel", style="primary")],
                 ]),
             )
             return
@@ -7291,7 +7701,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "برای ادامه، پلن دلخواه را دوباره انتخاب کن.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🧮 پلن دلخواه", callback_data="vip_custom", style="primary")],
-                [InlineKeyboardButton("❌ لغو عملیات", callback_data="vip_cancel", style="primary")],
+                [InlineKeyboardButton("❌ لغو عملیات", callback_data="global_cancel", style="primary")],
             ]),
         )
         return
@@ -7304,7 +7714,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🧮 پلن دلخواه — تغییر حجم\n\n"
             "چند گیگ می‌خوای؟ عددی بین 10 تا 1000 گیگ بفرست.",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("❌ لغو عملیات", callback_data="vip_cancel", style="primary")]
+                [InlineKeyboardButton("❌ لغو عملیات", callback_data="global_cancel", style="primary")]
             ]),
         )
         return
@@ -7322,7 +7732,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📊 حجم انتخابی: {volume} گیگ\n\n"
             "چند روز می‌خوای؟ عددی بین 30 تا 90 روز بفرست.",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("❌ لغو عملیات", callback_data="vip_cancel", style="primary")]
+                [InlineKeyboardButton("❌ لغو عملیات", callback_data="global_cancel", style="primary")]
             ]),
         )
         return
@@ -9227,12 +9637,15 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _handler_started = time.perf_counter()
     try:
         await _text_message_impl(update, context)
-    except Exception:
+    except Exception as exc:
         logger.exception("Unhandled text-message failure; update_id=%s", getattr(update, "update_id", None))
         message = update.effective_message
         if message and update.effective_user and update.effective_user.id == ADMIN_ID:
             try:
-                await message.reply_text("❌ خطایی هنگام پردازش پیام رخ داد؛ جزئیات در لاگ ثبت شد. برای ادامه دوباره تلاش کن یا /cancel بزن.")
+                await message.reply_text(
+                    f"❌ خطایی هنگام پردازش پیام رخ داد ({type(exc).__name__})؛ جزئیات کامل در لاگ ثبت شد.\n"
+                    "تنظیم قبلی تغییر نکرده است. برای لغو ورودی معلق /cancel را بزن."
+                )
             except Exception:
                 logger.exception("Could not notify admin about text-message failure")
     finally:
@@ -9345,6 +9758,17 @@ async def cancel_coupon_creation(update: Update, context: ContextTypes.DEFAULT_T
         context.user_data.pop("admin_coupon_state", None)
         if message:
             await message.reply_text("❌ ساخت کد تخفیف لغو شد. هیچ کدی ساخته نشد.")
+        return
+
+    remaining = clear_active_operation_state(context)
+    if "support_form_active" in remaining and user:
+        try:
+            with db() as con:
+                con.execute("DELETE FROM support_form_sessions WHERE user_id=?", (user.id,))
+        except Exception:
+            logger.exception("Could not remove support session during /cancel")
+    if remaining and message:
+        await message.reply_text("❌ عملیات جاری لغو شد؛ هیچ مقدار ذخیره‌نشده‌ای ثبت نشد.")
     elif message:
         await message.reply_text("عملیات در حال انجامی برای لغو وجود ندارد.")
 
@@ -9806,7 +10230,7 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             custom_state["link"] = clean_link
             custom_state["step"] = "name"
             context.user_data["gift_custom_state"] = custom_state
-            await message.reply_text("✏️ نام کامل این گیفت را بنویس؛ همان نامی که مشتری در فروشگاه می‌بیند.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو عملیات", callback_data="gift_custom_cancel")]]))
+            await message.reply_text("✏️ نام کامل این گیفت را بنویس؛ همان نامی که مشتری در فروشگاه می‌بیند.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو عملیات", callback_data="global_cancel")]]))
             return
         if step == "name":
             if len(raw) < 2 or len(raw) > 100:
@@ -9815,7 +10239,7 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             custom_state["name"] = raw
             custom_state["step"] = "price"
             context.user_data["gift_custom_state"] = custom_state
-            await message.reply_text("💵 قیمت فروش این گیفت چند تومان است؟ فقط عدد مثبت بفرست.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو عملیات", callback_data="gift_custom_cancel")]]))
+            await message.reply_text("💵 قیمت فروش این گیفت چند تومان است؟ فقط عدد مثبت بفرست.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو عملیات", callback_data="global_cancel")]]))
             return
         if step == "price":
             clean = normalize_ascii_digits(raw).replace(",", "").replace("٬", "").replace("،", "").strip()
@@ -11036,7 +11460,7 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"📊 حجم انتخابی: {volume} گیگ\n\n"
             "چند روز می‌خوای؟ یک عدد بین 30 تا 90 روز بفرست.",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("❌ لغو عملیات", callback_data="vip_cancel", style="primary")]
+                [InlineKeyboardButton("❌ لغو عملیات", callback_data="global_cancel", style="primary")]
             ]),
         )
         return
@@ -11091,7 +11515,7 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     InlineKeyboardButton("📊 تغییر حجم", callback_data="vip_change_volume", style="primary"),
                     InlineKeyboardButton("⏳ تغییر مدت", callback_data="vip_change_duration", style="primary"),
                 ],
-                [InlineKeyboardButton("❌ لغو عملیات", callback_data="vip_cancel", style="primary")],
+                [InlineKeyboardButton("❌ لغو عملیات", callback_data="global_cancel", style="primary")],
                 [InlineKeyboardButton("⬅️ بازگشت به VIP", callback_data="config_vip", style="primary")],
             ]),
         )
