@@ -737,9 +737,16 @@ def product_details_prompt(product):
             "اگر برای خودت خرید می‌کنی، ID عددی و آیدی خودت را در قسمت گیرنده هم وارد کن.\n"
             "ID عددی برای بررسی و ارسال رسمی لازم است؛ آیدی @ اختیاری است."
         )
-    if category in ("premium", "stars"):
-        title = {"premium": "پرمیوم", "stars": "استارز"}[category]
-        return f"👈 لطفاً آیدی اکانتی که می‌خواهید {title} برای آن تهیه کنید را ارسال کنید.\n• مثال: @SeyedPro_AIA"
+    if category == "premium":
+        return (
+            "👑 اطلاعات گیرندهٔ تلگرام پرمیوم را در یک پیام بفرست:\n\n"
+            "ID عددی گیرنده: 123456789\n"
+            "آیدی تلگرام گیرنده: @username یا ندارم\n\n"
+            "برای تحویل خودکار، ID عددی گیرنده لازم است. اگر فقط آیدی @ را داری، آن را هم بنویس؛ در صورت شناخته‌شدن گیرنده در ربات، ID از سوابق واقعی پیدا می‌شود.\n"
+            "برای تحویل دستی، آیدی @ گیرنده کافی است."
+        )
+    if category == "stars":
+        return "👈 لطفاً آیدی اکانتی را که می‌خواهی استارز برای آن تهیه کنی ارسال کن.\nمثال: @SeyedPro_AIA"
     return "لطفاً اطلاعات موردنیاز سفارش را برای پشتیبانی ارسال کنید."
 
 
@@ -1162,6 +1169,31 @@ def init_db():
                 next_order += 10
             con.execute("INSERT INTO app_settings(key, value) VALUES ('premium_auto_packages_v1', 'done') ON CONFLICT(key) DO UPDATE SET value='done'")
 
+        # Keep only one active product for each Telegram-supported Premium duration.
+        # Legacy/duplicate products are deactivated, never deleted, so old order history remains intact.
+        premium_cleanup_marker = con.execute(
+            "SELECT value FROM app_settings WHERE key='premium_supported_plans_cleanup_v1'"
+        ).fetchone()
+        if not premium_cleanup_marker:
+            active_premium_rows = con.execute(
+                "SELECT id, name FROM products WHERE lower(category)='premium' AND active=1 ORDER BY id"
+            ).fetchall()
+            kept_premium_months = set()
+            for premium_row in active_premium_rows:
+                found = re.search(
+                    r"(?<!\d)(3|6|12)\s*(?:ماه(?:ه)?|months?|mo\b)",
+                    normalize_ascii_digits(str(premium_row["name"] or "")), re.IGNORECASE,
+                )
+                months = int(found.group(1)) if found else None
+                if months not in (3, 6, 12) or months in kept_premium_months:
+                    con.execute("UPDATE products SET active=0 WHERE id=?", (int(premium_row["id"]),))
+                else:
+                    kept_premium_months.add(months)
+            con.execute(
+                "INSERT INTO app_settings(key, value) VALUES ('premium_supported_plans_cleanup_v1', 'done') "
+                "ON CONFLICT(key) DO UPDATE SET value='done'"
+            )
+
         # One-time, additive migration for existing Stars products. This marker prevents
         # later restarts from overwriting an administrator's chosen icon, color or order.
         # The package migration fixes the requested glyph/order but keeps every saved button color.
@@ -1291,6 +1323,7 @@ def ensure_gift_support_schema(con):
         "payment_verified_at": "TEXT",
         "delivered_at": "TEXT",
         "delivery_error": "TEXT NOT NULL DEFAULT ''",
+        "delivery_started_at": "TEXT",
     }
     for name, ddl in order_migrations.items():
         if name not in order_columns:
@@ -1538,6 +1571,7 @@ async def telegram_bot_api_call(bot, method_name, **params):
         "getAvailableGifts": "get_available_gifts",
         "getMyStarBalance": "get_my_star_balance",
         "sendGift": "send_gift",
+        "giftPremiumSubscription": "gift_premium_subscription",
     }
     method = getattr(bot, method_map.get(method_name, ""), None)
     if callable(method):
@@ -2200,6 +2234,67 @@ async def try_deliver_official_gift(context, order_id):
     return {"ok": True, "manual": False, "delivered_at": delivered_at}
 
 
+async def try_deliver_official_premium(context, order_id):
+    """Gift Premium using Telegram's official Bot API, only once after verified payment."""
+    with db() as con:
+        order = con.execute(
+            "SELECT o.*,p.name AS product_name,p.category FROM orders o "
+            "LEFT JOIN products p ON p.id=o.product_id WHERE o.id=?", (order_id,)
+        ).fetchone()
+    if not order:
+        return {"ok": False, "manual": True, "reason": "سفارش پیدا نشد."}
+    if str(order["category"] or "").lower() != "premium":
+        return {"ok": False, "manual": True, "reason": "این سفارش از نوع پرمیوم نیست."}
+    if order["delivered_at"]:
+        return {"ok": True, "manual": False, "already_delivered": True, "delivered_at": order["delivered_at"]}
+    if not order["payment_verified_at"]:
+        return {"ok": False, "manual": True, "reason": "پرداخت هنوز توسط مدیر تأیید نشده است."}
+    if str(order["delivery_mode"] or "manual") != "auto":
+        return {"ok": False, "manual": True, "reason": "روش تحویل این سفارش دستی است."}
+    if not order["recipient_user_id"]:
+        return {"ok": False, "manual": True, "reason": "ID عددی گیرنده ثبت نشده است؛ تحویل خودکار ممکن نیست."}
+    months = premium_product_months(order["product_name"])
+    if months not in PREMIUM_PLAN_STARS:
+        return {"ok": False, "manual": True, "reason": "مدت پلن از نام محصول قابل تشخیص نیست."}
+    required_stars = PREMIUM_PLAN_STARS[months]
+    try:
+        # Check real balance before reserving the one-shot send attempt. A low balance
+        # must not permanently block the order after the admin tops up later.
+        balance = await get_real_bot_star_balance(context.bot)
+        if balance < required_stars:
+            reason = f"موجودی واقعی ربات کافی نیست؛ موجودی {balance} ⭐ و نیاز این پلن {required_stars} ⭐ است."
+            with db() as con:
+                con.execute("UPDATE orders SET status='پرداخت تأیید شد - در انتظار تحویل',delivery_error=? WHERE id=?", (reason, order_id))
+            return {"ok": False, "manual": False, "reason": reason}
+        # Reserve immediately before the network call. If the outcome is ambiguous
+        # (timeout/crash), no automatic duplicate send is attempted.
+        with db() as con:
+            latest = con.execute("SELECT delivery_started_at,delivered_at FROM orders WHERE id=?", (order_id,)).fetchone()
+            if not latest or latest["delivered_at"]:
+                return {"ok": bool(latest and latest["delivered_at"]), "manual": False, "already_delivered": bool(latest and latest["delivered_at"])}
+            if latest["delivery_started_at"]:
+                return {"ok": False, "manual": False, "reason": "برای جلوگیری از ارسال تکراری، تلاش قبلی نیازمند بررسی دستی است."}
+            cur = con.execute("UPDATE orders SET delivery_started_at=? WHERE id=? AND delivery_started_at IS NULL", (iran_timestamp_now(), order_id))
+            if cur.rowcount != 1:
+                return {"ok": False, "manual": False, "reason": "سفارش هم‌زمان در حال ارسال است؛ برای جلوگیری از ارسال تکراری بررسی دستی لازم است."}
+        result = await telegram_bot_api_call(
+            context.bot, "giftPremiumSubscription", user_id=int(order["recipient_user_id"]),
+            month_count=int(months), star_count=int(required_stars),
+        )
+        if result is not True and not bool(_extract_api_object_value(result, "ok", False)):
+            raise RuntimeError("Telegram Bot API ارسال پرمیوم را تأیید نکرد.")
+    except Exception as exc:
+        logger.exception("Official Telegram Premium delivery failed for order #%s", order_id)
+        reason = str(exc)[:400]
+        with db() as con:
+            con.execute("UPDATE orders SET status='پرداخت تأیید شد - نیازمند بررسی تحویل',delivery_error=? WHERE id=?", (reason, order_id))
+        return {"ok": False, "manual": False, "reason": reason}
+    delivered_at = iran_timestamp_now()
+    with db() as con:
+        con.execute("UPDATE orders SET status='تحویل‌شده',delivered_at=?,delivery_error='' WHERE id=?", (delivered_at, order_id))
+    return {"ok": True, "manual": False, "delivered_at": delivered_at}
+
+
 def gift_orders_page(page=1):
     page = max(1, int(page))
     with db() as con:
@@ -2541,6 +2636,304 @@ def premium_product_months(product):
     return int(match.group(1)) if match else None
 
 
+# ==========================================
+# مدیریت اختصاصی قیمت و تحویل پرمیوم
+# Independent from Gift and general Stars pricing settings.
+# ==========================================
+
+PREMIUM_MANAGER_KEY = "premium_manager_settings_v1"
+PREMIUM_PLAN_STARS = {3: 1000, 6: 1500, 12: 2500}
+PREMIUM_MANAGER_DEFAULTS = {
+    "delivery_modes": {"3": "manual", "6": "manual", "12": "manual"},
+    "star_rate_toman": 1000,
+    "auto_star_rate_enabled": False,
+    "auto_fragment_enabled": False,
+    "fragment_manual_usd": {},
+    "base_star_usd_manual": "",
+    "usd_toman_manual": 0,
+    "profit_percent": "20",
+    "plan_price_toman_manual": {},
+}
+
+
+def load_premium_manager_settings():
+    defaults = deepcopy(PREMIUM_MANAGER_DEFAULTS)
+    stored = None
+    try:
+        with db() as con:
+            row = con.execute("SELECT value FROM app_settings WHERE key=?", (PREMIUM_MANAGER_KEY,)).fetchone()
+        if row:
+            stored = json.loads(row["value"])
+    except (sqlite3.Error, ValueError, TypeError, KeyError):
+        logger.warning("Premium manager settings could not be loaded", exc_info=True)
+    cfg = deepcopy(defaults)
+    if isinstance(stored, dict):
+        cfg.update(stored)
+    for key in ("delivery_modes", "fragment_manual_usd", "plan_price_toman_manual"):
+        val = cfg.get(key)
+        cfg[key] = dict(defaults[key], **(val if isinstance(val, dict) else {}))
+    for months in ("3", "6", "12"):
+        if cfg["delivery_modes"].get(months) not in {"manual", "auto"}:
+            cfg["delivery_modes"][months] = "manual"
+    try:
+        rate = int(normalize_ascii_digits(str(cfg.get("star_rate_toman", 1000))).replace(",", "").replace("٬", ""))
+        cfg["star_rate_toman"] = rate if 1 <= rate <= 100_000_000 else 1000
+    except (TypeError, ValueError):
+        cfg["star_rate_toman"] = 1000
+    try:
+        cfg["usd_toman_manual"] = int(normalize_ascii_digits(str(cfg.get("usd_toman_manual", 0))).replace(",", "").replace("٬", ""))
+        if not 0 <= cfg["usd_toman_manual"] <= 100_000_000:
+            cfg["usd_toman_manual"] = 0
+    except (TypeError, ValueError):
+        cfg["usd_toman_manual"] = 0
+    for key, min_v, max_v in (("profit_percent", Decimal("0"), Decimal("1000")),):
+        try:
+            value = Decimal(str(cfg.get(key, defaults[key])))
+            if not value.is_finite() or value < min_v or value > max_v:
+                raise InvalidOperation
+            cfg[key] = str(value)
+        except (InvalidOperation, TypeError, ValueError):
+            cfg[key] = defaults[key]
+    for key in ("auto_star_rate_enabled", "auto_fragment_enabled"):
+        cfg[key] = bool(cfg.get(key))
+    cfg["base_star_usd_manual"] = str(cfg.get("base_star_usd_manual") or "").strip()
+    if cfg["base_star_usd_manual"] and _pricing_decimal(cfg["base_star_usd_manual"]) is None:
+        cfg["base_star_usd_manual"] = ""
+    for group in ("fragment_manual_usd", "plan_price_toman_manual"):
+        clean = {}
+        for months in ("3", "6", "12"):
+            value = cfg[group].get(months)
+            if value in (None, "", 0, "0"):
+                clean[months] = ""
+                continue
+            try:
+                d = Decimal(str(normalize_ascii_digits(str(value)).replace(",", "").replace("٬", "")))
+                clean[months] = str(d) if d.is_finite() and d > 0 else ""
+            except (InvalidOperation, TypeError, ValueError):
+                clean[months] = ""
+        cfg[group] = clean
+    return cfg
+
+
+def save_premium_manager_settings(cfg):
+    normalized = load_premium_manager_settings()
+    if isinstance(cfg, dict):
+        normalized.update(cfg)
+    for key in ("delivery_modes", "fragment_manual_usd", "plan_price_toman_manual"):
+        incoming = cfg.get(key) if isinstance(cfg, dict) else None
+        if isinstance(incoming, dict):
+            normalized[key] = dict(normalized[key], **incoming)
+    with db() as con:
+        con.execute(
+            "INSERT INTO app_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (PREMIUM_MANAGER_KEY, json.dumps(normalized, ensure_ascii=False)),
+        )
+    return normalized
+
+
+def _premium_feed_parts(auto_cfg=None):
+    cfg = auto_cfg or load_auto_pricing_config()
+    prices = cfg.get("catalog_prices") or {}
+    catalog_ok = bool(cfg.get("catalog_valid") and _pricing_timestamp_fresh(cfg.get("catalog_updated_at")))
+    fx_ok = bool(cfg.get("fx_valid") and _pricing_timestamp_fresh(cfg.get("fx_source_updated_at")) and _pricing_decimal(cfg.get("fx_rate_toman")))
+    return cfg, prices, catalog_ok, fx_ok
+
+
+def premium_effective_star_rate_toman(settings=None, auto_cfg=None):
+    settings = settings or load_premium_manager_settings()
+    auto_cfg, prices, catalog_ok, fx_ok = _premium_feed_parts(auto_cfg)
+    if settings.get("auto_star_rate_enabled"):
+        star_usd = _pricing_decimal(settings.get("base_star_usd_manual")) if settings.get("base_star_usd_manual") else None
+        if star_usd is None and catalog_ok:
+            star_usd = _pricing_decimal(prices.get("stars_price_per_star_usd"))
+        fx = _pricing_decimal(settings.get("usd_toman_manual")) or (_pricing_decimal(auto_cfg.get("fx_rate_toman")) if fx_ok else None)
+        if star_usd is None or fx is None:
+            return None
+        return (star_usd * fx).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
+    if settings.get("base_star_usd_manual"):
+        star_usd = _pricing_decimal(settings.get("base_star_usd_manual"))
+        fx = _pricing_decimal(settings.get("usd_toman_manual")) or (_pricing_decimal(auto_cfg.get("fx_rate_toman")) if fx_ok else None)
+        if star_usd is not None and fx is not None:
+            return (star_usd * fx).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
+    try:
+        value = Decimal(str(settings.get("star_rate_toman", 1000)))
+        return value if value.is_finite() and value > 0 else None
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def premium_price_quote(months, settings=None, auto_cfg=None):
+    """Compute a Premium sale quote from one selected cost source; never fabricate stale rates."""
+    try:
+        months = int(months)
+    except (TypeError, ValueError):
+        return None
+    if months not in PREMIUM_PLAN_STARS:
+        return None
+    settings = settings or load_premium_manager_settings()
+    auto_cfg, prices, catalog_ok, fx_ok = _premium_feed_parts(auto_cfg)
+    manual_final = _pricing_decimal(settings["plan_price_toman_manual"].get(str(months)))
+    if manual_final is not None:
+        amount = _ceil_toman(manual_final)
+        return {"product_type": "premium", "quantity": months, "cost_toman": amount, "sale_toman": amount,
+                "profit_toman": 0, "margin_percent": "0", "source": "قیمت اختصاصی مدیر", "manual_price": True}
+
+    fx = _pricing_decimal(settings.get("usd_toman_manual")) or (_pricing_decimal(auto_cfg.get("fx_rate_toman")) if fx_ok else None)
+    cost_toman = None
+    source = ""
+    if settings.get("auto_fragment_enabled"):
+        if not (catalog_ok and fx):
+            return None
+        fragment_usd = _pricing_decimal((prices.get("premium_usd") or {}).get(str(months)))
+        if fragment_usd is None:
+            return None
+        cost_toman = fragment_usd * fx
+        source = "قیمت زندهٔ مرجع Fragment از API واسط"
+    else:
+        manual_fragment = _pricing_decimal(settings["fragment_manual_usd"].get(str(months)))
+        if manual_fragment is not None:
+            if fx is None:
+                return None
+            cost_toman = manual_fragment * fx
+            source = "قیمت دلاری دستی فرگمنت"
+        else:
+            unit_toman = premium_effective_star_rate_toman(settings, auto_cfg)
+            if unit_toman is None:
+                return None
+            cost_toman = unit_toman * Decimal(PREMIUM_PLAN_STARS[months])
+            source = "نرخ هر استارز × تعداد استارز پلن"
+
+    try:
+        margin = Decimal(str(settings.get("profit_percent", "20")))
+        if not margin.is_finite() or margin < 0 or margin > 1000:
+            return None
+        cost = _ceil_toman(cost_toman)
+        sale = _ceil_toman(Decimal(cost) * (Decimal(100) + margin) / Decimal(100))
+        return {"product_type": "premium", "quantity": months, "cost_toman": cost,
+                "sale_toman": sale, "profit_toman": sale - cost, "margin_percent": str(margin),
+                "source": source, "manual_price": False,
+                "catalog_updated_at": auto_cfg.get("catalog_updated_at", ""),
+                "fx_source_updated_at": auto_cfg.get("fx_source_updated_at", "")}
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def sync_premium_prices_in_db():
+    settings = load_premium_manager_settings()
+    auto_cfg = load_auto_pricing_config()
+    changed = 0
+    with db() as con:
+        rows = con.execute("SELECT id,name FROM products WHERE lower(category)='premium'").fetchall()
+        for row in rows:
+            months = premium_product_months(row["name"])
+            quote = premium_price_quote(months, settings, auto_cfg) if months else None
+            if quote:
+                con.execute("UPDATE products SET price=?,currency='تومان' WHERE id=?", (int(quote["sale_toman"]), int(row["id"])))
+                changed += 1
+    return changed
+
+
+def premium_delivery_label(months, settings=None):
+    settings = settings or load_premium_manager_settings()
+    mode = settings["delivery_modes"].get(str(months), "manual")
+    return ("🔵 خودکار" if mode == "auto" else "🟢 دستی"), mode
+
+
+def premium_admin_text(note=""):
+    settings = load_premium_manager_settings()
+    auto_cfg, prices, catalog_ok, fx_ok = _premium_feed_parts()
+    effective_rate = premium_effective_star_rate_toman(settings)
+    if effective_rate is None:
+        rate_text = "دادهٔ معتبر در دسترس نیست"
+    elif settings.get("auto_star_rate_enabled"):
+        rate_text = f"{toman(effective_rate)} تومان (خودکار)"
+    else:
+        rate_text = f"{toman(effective_rate)} تومان (دستی/تنظیم مدیر)"
+    lines = [
+        "🌟 مدیریت تلگرام پرمیوم | SEYED PREMIUM",
+        "━━━━━━━━━━━━━━━━━━",
+        "در این بخش نرخ‌ها، سود، قیمت اختصاصی و روش تحویل هر پلن را مستقل مدیریت کن.",
+        "",
+        f"⭐ نرخ هر استارز: {rate_text}",
+        f"🔵 نرخ خودکار استارز: {'روشن' if settings['auto_star_rate_enabled'] else 'خاموش'}",
+        f"🔵 نرخ خودکار فرگمنت: {'روشن' if settings['auto_fragment_enabled'] else 'خاموش'}",
+        f"📈 درصد سود پرمیوم: {settings['profit_percent']}٪",
+        f"💵 نرخ دلار/تتر محاسباتی: {toman(settings['usd_toman_manual'] or (auto_cfg.get('fx_rate_toman') if fx_ok else 0))} تومان",
+        f"🕒 آخرین دریافت قیمت مرجع: {_pricing_time_text(auto_cfg.get('catalog_updated_at')) if catalog_ok else 'قیمت زنده تأیید نشده'}",
+        f"🕒 آخرین دریافت نرخ ارز: {_pricing_time_text(auto_cfg.get('fx_source_updated_at')) if fx_ok else 'نرخ زنده تأیید نشده'}",
+        "",
+    ]
+    for months, stars in PREMIUM_PLAN_STARS.items():
+        quote = premium_price_quote(months, settings, auto_cfg)
+        mode_label, _ = premium_delivery_label(months, settings)
+        manual_price = settings["plan_price_toman_manual"].get(str(months))
+        if quote:
+            price_text = f"{toman(quote['sale_toman'])} تومان"
+        else:
+            price_text = "قیمت زنده/معتبر در دسترس نیست"
+        lines.append(f"• پرمیوم {months} ماهه ({toman(stars)} ⭐): {price_text} | {mode_label}")
+        if manual_price:
+            lines.append("  └ قیمت اختصاصی مدیر")
+    lines.append("")
+    lines.append("قیمت Fragment از API واسط و غیررسمی دریافت می‌شود؛ منبع رسمی عمومی برای قیمت‌خوانی مستقیم Fragment تأیید نشده است.")
+    lines.append("تحویل خودکار فقط پس از تأیید پرداخت و کنترل موجودی واقعی Stars انجام می‌شود.")
+    if auto_cfg.get("catalog_error") and not catalog_ok:
+        lines.append("⚠️ وضعیت منبع قیمت: " + str(auto_cfg.get("catalog_error"))[:180])
+    if auto_cfg.get("fx_error") and not fx_ok:
+        lines.append("⚠️ وضعیت منبع ارز: " + str(auto_cfg.get("fx_error"))[:180])
+    if note:
+        lines.extend(["", note])
+    return "\n".join(lines)[:3900]
+
+
+def premium_admin_keyboard():
+    settings = load_premium_manager_settings()
+    star_state = "روشن" if settings["auto_star_rate_enabled"] else "خاموش"
+    fragment_state = "روشن" if settings["auto_fragment_enabled"] else "خاموش"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⭐ افزایش موجودی استارز ربات", callback_data="gift_star_topup", style="success")],
+        [InlineKeyboardButton("⚙️ مدیریت تحویل پلن‌های ۳، ۶ و ۱۲ ماهه", callback_data="premium_delivery_menu", style="primary")],
+        [InlineKeyboardButton(f"💱 نرخ (هر ⭐ = {toman(premium_effective_star_rate_toman(settings) or 0)} تومان)", callback_data="premium_rate_toman", style="primary")],
+        [InlineKeyboardButton(f"🔵 نرخ خودکار استارز: {star_state}", callback_data="premium_auto_star_rate_toggle", style="primary" if settings["auto_star_rate_enabled"] else "success")],
+        [InlineKeyboardButton(f"🔵 نرخ خودکار: فرگمنت {fragment_state}", callback_data="premium_auto_fragment_toggle", style="primary" if settings["auto_fragment_enabled"] else "success")],
+        [InlineKeyboardButton("💵 قیمت دلاری پرمیوم در فرگمنت", callback_data="premium_fragment_usd", style="primary")],
+        [InlineKeyboardButton("⚙️ قیمت پایه / نرخ دلار", callback_data="premium_base_usd_fx", style="primary")],
+        [InlineKeyboardButton(f"📈 درصد سود ({settings['profit_percent']}٪)", callback_data="premium_margin", style="primary")],
+        [InlineKeyboardButton("💰 قیمت شخصی برای ۳ ماهه", callback_data="premium_plan_price_3", style="primary")],
+        [InlineKeyboardButton("💰 قیمت شخصی برای ۶ ماهه", callback_data="premium_plan_price_6", style="primary")],
+        [InlineKeyboardButton("💰 قیمت شخصی برای ۱۲ ماهه", callback_data="premium_plan_price_12", style="primary")],
+        [InlineKeyboardButton("🔙 بازگشت به مدیریت قیمت‌گذاری", callback_data="admin_auto_prices", style="danger")],
+    ])
+
+
+def premium_delivery_keyboard():
+    settings = load_premium_manager_settings()
+    buttons = []
+    for months in (3, 6, 12):
+        label, mode = premium_delivery_label(months, settings)
+        color = "primary" if mode == "auto" else "success"
+        buttons.append([InlineKeyboardButton(f"{label} | پرمیوم {months} ماهه", callback_data=f"premium_delivery_toggle_{months}", style=color)])
+    buttons.extend([
+        [InlineKeyboardButton("🟢 همه دستی", callback_data="premium_delivery_all_manual", style="success"),
+         InlineKeyboardButton("🔵 همه خودکار", callback_data="premium_delivery_all_auto", style="primary")],
+        [InlineKeyboardButton("🔙 بازگشت به مدیریت پرمیوم", callback_data="premium_admin_home", style="danger")],
+    ])
+    return InlineKeyboardMarkup(buttons)
+
+
+def premium_delivery_text(note=""):
+    settings = load_premium_manager_settings()
+    lines = ["⚙️ مدیریت روش تحویل پرمیوم", "━━━━━━━━━━━━━━━━━━", "آبی = خودکار 🔵 | سبز = دستی 🟢", ""]
+    for months, stars in PREMIUM_PLAN_STARS.items():
+        label, mode = premium_delivery_label(months, settings)
+        lines.append(f"{label} — پلن {months} ماهه ({toman(stars)} ⭐)")
+    lines.extend(["", "انتخاب هر پلن فقط همان پلن را تغییر می‌دهد. دکمه‌های گروهی هر سه پلن را یکسان می‌کنند.",
+                  "⚠️ تحویل خودکار فقط با موجودی کافی Stars و ID عددی معتبر گیرنده انجام می‌شود."])
+    if note:
+        lines.extend(["", note])
+    return "\n".join(lines)
+
+
 def dynamic_product_quote(product, cfg=None):
     try:
         category = str(product["category"] or "").strip().lower()
@@ -2556,15 +2949,13 @@ def dynamic_product_quote(product, cfg=None):
             return None
     if category == "premium":
         months = premium_product_months(product)
-        return auto_pricing_quote("premium", months, cfg) if months else None
+        return premium_price_quote(months) if months else None
     return None
 
 
 def apply_auto_prices_to_products(cfg=None):
-    """Update only cached displayed prices after both live feeds pass freshness checks."""
+    """Sync only prices with a currently valid quote; Premium uses its isolated manager settings."""
     cfg = cfg or load_auto_pricing_config()
-    if not auto_pricing_ready(cfg):
-        return 0
     updated = 0
     with db() as con:
         rows = con.execute(
@@ -2572,6 +2963,9 @@ def apply_auto_prices_to_products(cfg=None):
             "WHERE active=1 AND lower(category) IN ('stars','premium')"
         ).fetchall()
         for row in rows:
+            category = str(row["category"] or "").lower()
+            if category == "stars" and not auto_pricing_ready(cfg):
+                continue
             quote = dynamic_product_quote(row, cfg)
             if quote:
                 con.execute("UPDATE products SET price=?, currency='تومان' WHERE id=?", (int(quote["sale_toman"]), int(row["id"])))
@@ -5039,7 +5433,165 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     data = query.data
 
+    if (data.startswith("premium_") or data == "admin_auto_prices" or data.startswith("admin_auto_cat|")) and user_id != ADMIN_ID:
+        await query.answer("این بخش فقط برای مدیر ربات در دسترس است.", show_alert=True)
+        return
+
     if await handle_gift_support_callback(query, context):
+        return
+
+    # Premium manager callbacks are intentionally isolated from Gift settings.
+    if data == "premium_admin_home":
+        await query.edit_message_text(premium_admin_text(), reply_markup=premium_admin_keyboard())
+        return
+    if data == "premium_delivery_menu":
+        await query.edit_message_text(premium_delivery_text(), reply_markup=premium_delivery_keyboard())
+        return
+    if data.startswith("premium_delivery_toggle_"):
+        months = int(data.rsplit("_", 1)[1])
+        if months not in PREMIUM_PLAN_STARS:
+            await query.answer("پلن معتبر نیست.", show_alert=True); return
+        cfg = load_premium_manager_settings()
+        cfg["delivery_modes"][str(months)] = "manual" if cfg["delivery_modes"].get(str(months)) == "auto" else "auto"
+        # Never activate auto for a plan unless Bot API delivery and current balance can be checked.
+        if cfg["delivery_modes"][str(months)] == "auto":
+            try:
+                balance = await get_real_bot_star_balance(context.bot)
+                if balance < PREMIUM_PLAN_STARS[months]:
+                    cfg["delivery_modes"][str(months)] = "manual"
+                    save_premium_manager_settings(cfg)
+                    await query.answer(f"موجودی فعلی {balance} ⭐ است؛ برای این پلن {PREMIUM_PLAN_STARS[months]} ⭐ لازم است. حالت دستی حفظ شد.", show_alert=True)
+                    await query.edit_message_text(premium_delivery_text(), reply_markup=premium_delivery_keyboard())
+                    return
+            except Exception as exc:
+                cfg["delivery_modes"][str(months)] = "manual"
+                save_premium_manager_settings(cfg)
+                await query.answer("موجودی واقعی تلگرام دریافت نشد؛ حالت دستی حفظ شد.", show_alert=True)
+                await query.edit_message_text(premium_delivery_text(), reply_markup=premium_delivery_keyboard())
+                return
+        save_premium_manager_settings(cfg)
+        await query.answer("روش تحویل پلن ذخیره شد.")
+        await query.edit_message_text(premium_delivery_text(), reply_markup=premium_delivery_keyboard())
+        return
+    if data in {"premium_delivery_all_manual", "premium_delivery_all_auto"}:
+        mode = "manual" if data.endswith("manual") else "auto"
+        cfg = load_premium_manager_settings()
+        if mode == "auto":
+            try:
+                balance = await get_real_bot_star_balance(context.bot)
+            except Exception:
+                await query.answer("موجودی واقعی تلگرام قابل دریافت نیست؛ هیچ پلنی خودکار نشد.", show_alert=True)
+                return
+            available = [m for m, required in PREMIUM_PLAN_STARS.items() if balance >= required]
+            if len(available) != 3:
+                await query.answer(f"موجودی {balance} ⭐ برای همه پلن‌ها کافی نیست؛ همه خودکار نشدند.", show_alert=True)
+                return
+        cfg["delivery_modes"] = {"3": mode, "6": mode, "12": mode}
+        save_premium_manager_settings(cfg)
+        await query.answer("روش تحویل هر سه پلن به‌روزرسانی شد.")
+        await query.edit_message_text(premium_delivery_text(), reply_markup=premium_delivery_keyboard())
+        return
+    if data == "premium_auto_star_rate_toggle":
+        cfg = load_premium_manager_settings()
+        turning_on = not cfg["auto_star_rate_enabled"]
+        if turning_on:
+            await query.edit_message_text("🔄 در حال دریافت قیمت مرجع هر استارز و نرخ ارز...")
+            await refresh_auto_pricing(force=True)
+            auto_cfg = load_auto_pricing_config()
+            feed, prices, catalog_ok, fx_ok = _premium_feed_parts(auto_cfg)
+            unit = _pricing_decimal(prices.get("stars_price_per_star_usd")) if catalog_ok else None
+            fx = _pricing_decimal(feed.get("fx_rate_toman")) if fx_ok else None
+            if unit is None or fx is None:
+                await query.edit_message_text(premium_admin_text("⚠️ نرخ زنده از منبع معتبر و تازه دریافت نشد؛ حالت خودکار روشن نشد."), reply_markup=premium_admin_keyboard())
+                return
+            value = (unit * fx).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
+            cfg["auto_star_rate_enabled"] = True
+            save_premium_manager_settings(cfg)
+            sync_premium_prices_in_db()
+            await query.edit_message_text(
+                f"⭐ بر اساس قیمت مرجع استارز و نرخ روز تتر/تومان، قیمت هر ⭐ حدود {toman(value)} تومان است (بدون سود).\n\n"
+                f"قیمت مرجع هر ⭐: {unit} USDT\nنرخ تتر: {toman(fx)} تومان\nمنبع قیمت: API واسطِ قیمت Fragment/Stars (غیررسمی)\nآخرین دریافت: {_pricing_time_text(feed.get('catalog_updated_at'))}\n\n"
+                "با روشن‌ماندن این گزینه، نرخ به‌صورت دوره‌ای به‌روزرسانی می‌شود.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ تأیید", callback_data="premium_admin_home")], [InlineKeyboardButton("🔙 بازگشت", callback_data="premium_admin_home")]])
+            )
+            return
+        cfg["auto_star_rate_enabled"] = False
+        save_premium_manager_settings(cfg)
+        sync_premium_prices_in_db()
+        await query.edit_message_text(premium_admin_text("✅ نرخ خودکار استارز خاموش شد؛ نرخ دستی فعال است."), reply_markup=premium_admin_keyboard())
+        return
+    if data == "premium_auto_fragment_toggle":
+        cfg = load_premium_manager_settings()
+        turning_on = not cfg["auto_fragment_enabled"]
+        if turning_on:
+            await query.edit_message_text("🔄 در حال دریافت قیمت‌های ۳، ۶ و ۱۲ ماهه از منبع مرجع Fragment...")
+            await refresh_auto_pricing(force=True)
+            auto_cfg, prices, catalog_ok, fx_ok = _premium_feed_parts()
+            premium_prices = prices.get("premium_usd") or {}
+            if not catalog_ok or not fx_ok or any(_pricing_decimal(premium_prices.get(str(m))) is None for m in (3, 6, 12)):
+                await query.edit_message_text(premium_admin_text("⚠️ قیمت هر سه پلن یا نرخ ارز از منبع تازه و معتبر دریافت نشد؛ حالت خودکار فرگمنت روشن نشد."), reply_markup=premium_admin_keyboard())
+                return
+            cfg["auto_fragment_enabled"] = True
+            save_premium_manager_settings(cfg)
+            sync_premium_prices_in_db()
+            show = []
+            for m in (3, 6, 12):
+                usd = _pricing_decimal(premium_prices.get(str(m)))
+                base = _ceil_toman(usd * _pricing_decimal(auto_cfg.get("fx_rate_toman")))
+                final = premium_price_quote(m, cfg, auto_cfg)
+                show.append(f"• {m} ماهه: {usd} USDT ≈ {toman(base)} تومان هزینهٔ مرجع | با سود: {toman(final['sale_toman']) if final else 'نامشخص'} تومان")
+            await query.edit_message_text(
+                "💎 نرخ مرجع پرمیوم در Fragment (دریافت از API واسط و غیررسمی)\n\n"
+                + "\n".join(show)
+                + f"\n\nنرخ ارز: {toman(auto_cfg.get('fx_rate_toman'))} تومان\nآخرین دریافت: {_pricing_time_text(auto_cfg.get('catalog_updated_at'))}\n\nقیمت‌ها به‌صورت دوره‌ای به‌روزرسانی می‌شوند؛ این API قیمت مرجع ارائه می‌کند و خرید انجام نمی‌دهد.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ تأیید", callback_data="premium_admin_home")], [InlineKeyboardButton("🔙 بازگشت", callback_data="premium_admin_home")]])
+            )
+            return
+        cfg["auto_fragment_enabled"] = False
+        save_premium_manager_settings(cfg)
+        sync_premium_prices_in_db()
+        await query.edit_message_text(premium_admin_text("✅ نرخ خودکار فرگمنت خاموش شد؛ قیمت‌های دلاری دستی یا محاسبه بر اساس نرخ استارز استفاده می‌شوند."), reply_markup=premium_admin_keyboard())
+        return
+    if data in {"premium_rate_toman", "premium_fragment_usd", "premium_base_usd_fx", "premium_margin", "premium_plan_price_3", "premium_plan_price_6", "premium_plan_price_12"}:
+        cfg = load_premium_manager_settings()
+        if data == "premium_rate_toman":
+            field = "star_rate_toman"
+            current = premium_effective_star_rate_toman(cfg)
+            prompt = f"💱 نرخ دستی هر یک استارز پرمیوم چند تومان باشد؟\nنرخ مؤثر فعلی: {toman(current) if current else 'نامشخص'} تومان\n\nفقط عدد تومان را بفرست؛ مثال: 1000"
+        elif data == "premium_fragment_usd":
+            field = "fragment_prices"
+            current = cfg["fragment_manual_usd"]
+            prompt = ("💎 تنظیم قیمت دلاری پرمیوم در Fragment\n\nقیمت دلاری هر سه پلن را به ترتیب ۳، ۶ و ۱۲ ماهه، در یک پیام و با فاصله بفرست.\n"
+                      f"قیمت‌های دستی فعلی: {current.get('3') or 'از منبع/محاسبه خودکار'} | {current.get('6') or 'از منبع/محاسبه خودکار'} | {current.get('12') or 'از منبع/محاسبه خودکار'}\n\n"
+                      "مثال: 11.99 15.99 28.99\nبرای پاک‌کردن هر سه قیمت دستی و برگشت به منبع پیش‌فرض، عدد 0 را بفرست.")
+        elif data == "premium_base_usd_fx":
+            field = "base_usd_fx"
+            auto_cfg = load_auto_pricing_config()
+            current_usd = cfg.get("base_star_usd_manual") or (auto_cfg.get("catalog_prices") or {}).get("stars_price_per_star_usd") or "دریافت نشده"
+            current_fx = cfg.get("usd_toman_manual") or (auto_cfg.get("fx_rate_toman") if auto_cfg.get("fx_valid") else "خودکار/نامشخص")
+            prompt = ("⚙️ قیمت پایه و نرخ دلار ویژهٔ پرمیوم\n\n"
+                      f"قیمت هر ⭐ به دلار: {current_usd}\nنرخ دلار/تتر: {current_fx}\n\n"
+                      "قیمت 0.0155 ← قیمت هر ⭐ به دلار\nدلار 165000 ← نرخ دستی دلار/تتر به تومان\nدلار 0 ← برگشت نرخ ارز به حالت خودکار")
+        elif data == "premium_margin":
+            field = "profit_percent"
+            prompt = f"📈 چند درصد سود روی قیمت پایهٔ پرمیوم اضافه شود؟\nدرصد فعلی: {cfg['profit_percent']}٪\n\nفقط عدد بفرست؛ مثال: 20"
+        else:
+            months = int(data.rsplit("_", 1)[1])
+            field = f"plan_price_{months}"
+            current = cfg["plan_price_toman_manual"].get(str(months))
+            current_text = f"{toman(current)} تومان" if current else "تنظیم‌نشده (محاسبهٔ خودکار)"
+            prompt = (f"💰 قیمت شخصی فعلی پلن {months} ماهه: {current_text}\n\n"
+                      "قیمت تومانی جدید را فقط به‌صورت عدد بفرست.\n"
+                      "برای حذف قیمت شخصی و بازگشت به محاسبهٔ خودکار (نرخ × استارز × سود)، عدد 0 را بفرست.")
+        context.user_data["premium_admin_input"] = {"field": field}
+        await query.edit_message_text(prompt, reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ لغو عملیات", callback_data="premium_input_cancel", style="danger")],
+            [InlineKeyboardButton("🔙 بازگشت به مدیریت پرمیوم", callback_data="premium_admin_home")],
+        ]))
+        return
+    if data == "premium_input_cancel":
+        context.user_data.pop("premium_admin_input", None)
+        await query.edit_message_text("❌ عملیات لغو شد؛ تنظیم قبلی حفظ شد.", reply_markup=premium_admin_keyboard())
         return
 
     if data == "cancel_public_request":
@@ -6973,6 +7525,19 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         product_category = str(product["category"] or "").strip().lower()
         dynamic_quote = None
+        if product_category == "premium":
+            months_for_order = premium_product_months(product["name"])
+            premium_settings_for_order = load_premium_manager_settings()
+            if months_for_order and premium_settings_for_order["delivery_modes"].get(str(months_for_order)) == "auto":
+                try:
+                    current_balance = await get_real_bot_star_balance(context.bot)
+                except Exception:
+                    await query.answer("موجودی واقعی Stars ربات قابل دریافت نیست؛ سفارش خودکار فعلاً پذیرفته نمی‌شود.", show_alert=True)
+                    return
+                required_balance = PREMIUM_PLAN_STARS.get(months_for_order, 10**9)
+                if current_balance < required_balance:
+                    await query.answer(f"موجودی ربات {current_balance} ⭐ است و برای پلن {months_for_order} ماهه {required_balance} ⭐ لازم است. فعلاً قابل سفارش نیست.", show_alert=True)
+                    return
         if product_category in {"stars", "premium"}:
             await refresh_auto_pricing(force=False)
             with db() as con:
@@ -7338,6 +7903,11 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             if token == "gifts":
                 await _show_gift_admin_home(query, context.bot)
+                return
+            if token == "premium":
+                await refresh_auto_pricing(force=False)
+                sync_premium_prices_in_db()
+                await query.edit_message_text(premium_admin_text(), reply_markup=premium_admin_keyboard())
                 return
             text_value, markup = auto_price_category_screen(context, token, page)
             await query.edit_message_text(text_value, reply_markup=markup)
@@ -8395,7 +8965,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(
                 f"📦 سفارش #{order['id']}\n\n"
                 f"👤 اطلاعات خریدار\nID عددی خریدار: {order['user_id']}\nآیدی تلگرام خریدار: {'@'+order['buyer_username'] if order['buyer_username'] else 'تنظیم نشده'}\n"
-                + (f"\n🎯 اطلاعات گیرنده\nID عددی گیرنده: {order['recipient_user_id'] or 'ثبت نشده'}\nآیدی تلگرام گیرنده: {order['recipient_username'] or 'ثبت نشده'}\n" if str(order['category'] or '').lower() == 'gifts' else "")
+                + (f"\n🎯 اطلاعات گیرنده\nID عددی گیرنده: {order['recipient_user_id'] or 'ثبت نشده'}\nآیدی تلگرام گیرنده: {order['recipient_username'] or 'ثبت نشده'}\n" if str(order['category'] or '').lower() in {'gifts', 'premium'} else "")
                 + f"\n🛍 محصول: {order['product_name_snapshot'] or order['name'] or ('محصول #' + str(order['product_id']))}\n"
                 + f"🧾 کد سفارش: {order['order_code'] or ('#'+str(order['id']))}\n"
                 + f"💰 مبلغ: {order['price']:,} {order['currency'] or 'تومان'}\n"
@@ -8520,7 +9090,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 customer_id = int(order["user_id"])
                 category = str(order["category"] or "").lower()
                 if approve:
-                    new_status = "پرداخت تأیید شد - در انتظار تحویل" if category == "gifts" else "تأیید شده"
+                    new_status = "پرداخت تأیید شد - در انتظار تحویل" if category in {"gifts", "premium"} else "تأیید شده"
                     con.execute("UPDATE orders SET status=?,payment_verified_at=?,delivery_error='' WHERE id=?",
                                 (new_status, iran_timestamp_now(), order_id))
                     con.execute("UPDATE coupon_usage SET status='used' WHERE order_id=? AND status='pending'", (order_id,))
@@ -8537,6 +9107,21 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     log_order_event(con, order_id, "payment_rejected", new_status, "پرداخت/رسید توسط مدیر رد شد.", ADMIN_ID)
 
             delivery_note = ""
+            if approve and category == "premium":
+                result = await try_deliver_official_premium(context, order_id)
+                if result.get("ok"):
+                    delivery_note = "\n✅ تلگرام ارسال اشتراک پرمیوم را با موفقیت تأیید کرد؛ زمان تحویل ثبت شد."
+                    with db() as con:
+                        log_order_event(con, order_id, "premium_delivered_auto", "تحویل‌شده", "ارسال اشتراک از طریق giftPremiumSubscription در Telegram Bot API موفق بود.", ADMIN_ID)
+                elif result.get("manual"):
+                    delivery_note = "\n✋ پرداخت تأیید شد؛ تحویل این سفارش دستی است و هنوز تحویل‌شده ثبت نشده."
+                    with db() as con:
+                        log_order_event(con, order_id, "awaiting_manual_delivery", "پرداخت تأیید شد - در انتظار تحویل", result.get("reason", ""), ADMIN_ID)
+                else:
+                    delivery_note = "\n⚠️ ارسال خودکار پرمیوم تأیید نشد؛ سفارش تحویل‌شده اعلام نشد و برای بررسی مدیر باقی ماند.\nخطا: " + str(result.get("reason", "نامشخص"))[:300]
+                    with db() as con:
+                        log_order_event(con, order_id, "premium_auto_delivery_failed", "پرداخت تأیید شد - نیازمند بررسی تحویل", result.get("reason", ""), ADMIN_ID)
+
             if approve and category == "gifts":
                 result = await try_deliver_official_gift(context, order_id)
                 if result.get("ok"):
@@ -8554,17 +9139,22 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             try:
                 customer_text = f"📦 وضعیت سفارش شما در SEYED PREMIUM تغییر کرد.\nکد سفارش: SP-{order_id:06d}\nوضعیت: {new_status}"
-                if approve and category == "gifts":
+                if approve and category in {"gifts", "premium"}:
                     with db() as con:
-                        delivered = con.execute("SELECT delivered_at,order_code,delivery_mode FROM orders WHERE id=?", (order_id,)).fetchone()
+                        delivered = con.execute("SELECT delivered_at,order_code,delivery_mode,status,delivery_error FROM orders WHERE id=?", (order_id,)).fetchone()
                     if delivered and delivered["delivered_at"]:
-                        customer_text = f"✅ گیفت سفارش شما با موفقیت ارسال شد.\nکد سفارش: {delivered['order_code'] or ('#'+str(order_id))}\nزمان تحویل: {format_iran_jalali_datetime(delivered['delivered_at'])}"
+                        product_label = "اشتراک پرمیوم" if category == "premium" else "گیفت"
+                        customer_text = f"✅ {product_label} سفارش شما با موفقیت ارسال شد.\nکد سفارش: {delivered['order_code'] or ('#'+str(order_id))}\nزمان تحویل: {format_iran_jalali_datetime(delivered['delivered_at'])}"
                     else:
                         order_code = delivered["order_code"] if delivered else ""
-                        customer_text = f"✅ پرداخت سفارش گیفت شما تأیید شد.\nکد سفارش: {order_code or ('#'+str(order_id))}\nوضعیت: در انتظار تحویل توسط مدیریت."
-                        cfg = load_gift_settings()
-                        if cfg.get("support_first"):
-                            customer_text += "\n\n" + cfg["support_text"]
+                        product_label = "پرمیوم" if category == "premium" else "گیفت"
+                        customer_text = f"✅ پرداخت سفارش {product_label} شما تأیید شد.\nکد سفارش: {order_code or ('#'+str(order_id))}\nوضعیت: در انتظار تحویل/بررسی مدیریت."
+                        if delivered and delivered["delivery_error"]:
+                            customer_text += "\nدر صورت نیاز، پشتیبانی وضعیت تحویل را پیگیری می‌کند."
+                        if category == "gifts":
+                            cfg = load_gift_settings()
+                            if cfg.get("support_first"):
+                                customer_text += "\n\n" + cfg["support_text"]
                 await context.bot.send_message(
                     chat_id=customer_id,
                     text=customer_text,
@@ -8655,7 +9245,7 @@ async def cancel_coupon_creation(update: Update, context: ContextTypes.DEFAULT_T
     message = update.effective_message
     if user and user.id == ADMIN_ID:
         cleared = False
-        for key in ("gift_admin_input", "gift_custom_state", "support_admin_reply_state", "support_admin_search_state", "gift_order_search_state"):
+        for key in ("gift_admin_input", "premium_admin_input", "gift_custom_state", "support_admin_reply_state", "support_admin_search_state", "gift_order_search_state"):
             if context.user_data.pop(key, None) is not None:
                 cleared = True
         if cleared and message:
@@ -9019,6 +9609,106 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await message.reply_text("\n".join(lines)[:3900], reply_markup=InlineKeyboardMarkup(buttons))
         else:
             await message.reply_text("برای این جست‌وجو سفارش گیفتی پیدا نشد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 سفارش‌های گیفت", callback_data="gift_orders")]]))
+        return
+
+    # Premium manager inputs; all values are isolated in premium_manager_settings_v1.
+    premium_input = context.user_data.get("premium_admin_input") if user and user.id == ADMIN_ID else None
+    if message and message.text and premium_input:
+        raw = message.text.strip()
+        if _is_customer_cancel_text(raw) or raw.lower() == "/cancel":
+            context.user_data.pop("premium_admin_input", None)
+            await message.reply_text("❌ عملیات لغو شد؛ تنظیم قبلی حفظ شد.", reply_markup=premium_admin_keyboard())
+            return
+        field = str(premium_input.get("field") or "")
+        cfg = load_premium_manager_settings()
+        clean = normalize_ascii_digits(raw).replace("٬", "").replace(",", "").replace("،", "").strip()
+        note = ""
+        if field == "star_rate_toman":
+            if not clean.isdigit() or not 1 <= int(clean) <= 100_000_000:
+                await message.reply_text("❌ نرخ باید عددی بین ۱ تا ۱۰۰٬۰۰۰٬۰۰۰ تومان باشد. دوباره بفرست یا /cancel را بزن.")
+                return
+            cfg["star_rate_toman"] = int(clean)
+            note = "✅ نرخ دستی هر استارز پرمیوم ذخیره شد."
+        elif field == "fragment_prices":
+            if clean == "0":
+                cfg["fragment_manual_usd"] = {"3": "", "6": "", "12": ""}
+                note = "✅ قیمت‌های دلاری دستی پاک شدند؛ قیمت خودکار/پیش‌فرض استفاده می‌شود."
+            else:
+                parts = clean.split()
+                if len(parts) != 3:
+                    await message.reply_text("❌ دقیقاً سه قیمت به ترتیب ۳، ۶ و ۱۲ ماهه بفرست. نمونه: 11.99 15.99 28.99")
+                    return
+                parsed = []
+                try:
+                    for part in parts:
+                        value = Decimal(part)
+                        if not value.is_finite() or value <= 0 or value > Decimal("10000"):
+                            raise InvalidOperation
+                        parsed.append(str(value))
+                except (InvalidOperation, ValueError):
+                    await message.reply_text("❌ هر سه قیمت باید عدد دلاری معتبر و مثبت باشند. نمونه: 11.99 15.99 28.99")
+                    return
+                cfg["fragment_manual_usd"] = dict(zip(("3", "6", "12"), parsed))
+                note = "✅ قیمت دلاری دستی هر سه پلن ذخیره شد."
+        elif field == "base_usd_fx":
+            normalized = normalize_ascii_digits(raw).strip()
+            price_match = re.fullmatch(r"قیمت\s+([0-9]+(?:\.[0-9]+)?)", normalized, re.IGNORECASE)
+            dollar_match = re.fullmatch(r"دلار\s+([0-9,٬،]+)", normalized, re.IGNORECASE)
+            if price_match:
+                value = _pricing_decimal(price_match.group(1))
+                if value is None or value > Decimal("100"):
+                    await message.reply_text("❌ قیمت دلاری معتبر نیست. نمونه: قیمت 0.0155")
+                    return
+                cfg["base_star_usd_manual"] = str(value)
+                note = "✅ قیمت پایهٔ دلاری پرمیوم ذخیره شد."
+            elif dollar_match:
+                amount = int(re.sub(r"[,٬،]", "", dollar_match.group(1)) or "0")
+                if amount == 0:
+                    cfg["usd_toman_manual"] = 0
+                    note = "✅ نرخ دلار/تتر به حالت خودکار برگشت."
+                elif 1000 <= amount <= 100_000_000:
+                    cfg["usd_toman_manual"] = amount
+                    note = "✅ نرخ دستی دلار/تتر ویژهٔ پرمیوم ذخیره شد."
+                else:
+                    await message.reply_text("❌ نرخ دلار باید ۰ یا عددی بین ۱٬۰۰۰ تا ۱۰۰٬۰۰۰٬۰۰۰ تومان باشد.")
+                    return
+            else:
+                await message.reply_text("❌ دستور معتبر نیست. نمونه‌ها:\nقیمت 0.0155\nدلار 165000\nدلار 0")
+                return
+        elif field == "profit_percent":
+            try:
+                value = Decimal(clean)
+                if not value.is_finite() or value < 0 or value > 1000:
+                    raise InvalidOperation
+            except (InvalidOperation, ValueError):
+                await message.reply_text("❌ درصد سود باید عددی بین ۰ تا ۱۰۰۰ باشد.")
+                return
+            cfg["profit_percent"] = str(value)
+            note = "✅ درصد سود پرمیوم ذخیره شد."
+        elif field.startswith("plan_price_"):
+            months = field.rsplit("_", 1)[1]
+            if months not in {"3", "6", "12"}:
+                context.user_data.pop("premium_admin_input", None)
+                await message.reply_text("❌ پلن معتبر نیست.", reply_markup=premium_admin_keyboard())
+                return
+            if not clean.isdigit():
+                await message.reply_text("❌ قیمت را فقط به‌صورت عدد صحیح تومان بفرست؛ برای حذف، 0 وارد کن.")
+                return
+            amount = int(clean)
+            if amount < 0 or amount > 10_000_000_000:
+                await message.reply_text("❌ مبلغ خارج از محدودهٔ مجاز است.")
+                return
+            cfg["plan_price_toman_manual"][months] = "" if amount == 0 else str(amount)
+            note = (f"✅ قیمت اختصاصی پلن {months} ماهه حذف شد و محاسبهٔ خودکار فعال شد." if amount == 0
+                    else f"✅ قیمت اختصاصی پلن {months} ماهه ذخیره شد.")
+        else:
+            context.user_data.pop("premium_admin_input", None)
+            await message.reply_text("❌ نوع تنظیم مشخص نیست؛ چیزی تغییر نکرد.", reply_markup=premium_admin_keyboard())
+            return
+        save_premium_manager_settings(cfg)
+        sync_premium_prices_in_db()
+        context.user_data.pop("premium_admin_input", None)
+        await message.reply_text(note + "\n\n" + premium_admin_text(), reply_markup=premium_admin_keyboard())
         return
 
     # Gift pricing/settings editor and owner top-up custom amount.
@@ -10573,7 +11263,39 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     if requested_mode == "auto" and (product["source_type"] != "official" or not product["telegram_gift_id"]):
                         requested_mode = "manual"
                     context.user_data["pending_gift_delivery_mode"] = requested_mode
-                elif category in ("premium", "stars"):
+                elif category == "premium":
+                    premium_months = premium_product_months(product["name"])
+                    premium_cfg_now = load_premium_manager_settings()
+                    premium_mode_now = premium_cfg_now["delivery_modes"].get(str(premium_months), "manual") if premium_months else "manual"
+                    id_match = re.search(r"(?im)^\s*ID\s*عددی\s*گیرنده\s*[:：]\s*(\d{5,20})\s*$", normalize_ascii_digits(details))
+                    uname_match = re.search(r"(?im)^\s*آیدی\s*تلگرام\s*گیرنده\s*[:：]\s*(.*)$", details)
+                    raw_detail = details.strip()
+                    if id_match:
+                        recipient_user_id = int(id_match.group(1))
+                    elif raw_detail.isdigit() and 5 <= len(raw_detail) <= 20:
+                        recipient_user_id = int(raw_detail)
+                    if uname_match:
+                        recipient_username = normalize_optional_username(uname_match.group(1)) or ""
+                    elif raw_detail.startswith("@"):
+                        recipient_username = normalize_optional_username(raw_detail) or ""
+                    if raw_detail.startswith("@") and not recipient_username:
+                        await message.reply_text("❌ آیدی تلگرام معتبر نیست. نمونه: @SeyedPro_AIA")
+                        return
+                    if recipient_user_id is None and recipient_username:
+                        if user.username and user.username.casefold() == recipient_username.casefold():
+                            recipient_user_id = int(user.id)
+                        else:
+                            with db() as lookup_con:
+                                known_recipient = lookup_con.execute("SELECT user_id FROM users WHERE lower(username)=? LIMIT 1", (recipient_username.casefold(),)).fetchone()
+                            if known_recipient:
+                                recipient_user_id = int(known_recipient["user_id"])
+                    if not recipient_username and not recipient_user_id:
+                        await message.reply_text("❌ اطلاعات گیرنده کامل نیست. ID عددی یا آیدی @ گیرنده را بفرست.")
+                        return
+                    if premium_mode_now == "auto" and not recipient_user_id:
+                        await message.reply_text("⚠️ این پلن روی تحویل خودکار تنظیم شده است. برای ارسال رسمی تلگرام، ID عددی گیرنده لازم است. لطفاً پیام را با قالب زیر دوباره بفرست:\nID عددی گیرنده: 123456789\nآیدی تلگرام گیرنده: @username")
+                        return
+                elif category == "stars":
                     if not details.startswith("@") or len(details) < 2:
                         await message.reply_text("لطفاً آیدی تلگرام را با @ ارسال کنید.\nمثال: @SeyedPro_AIA")
                         return
@@ -10613,6 +11335,10 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 payment_method = "کارت‌به‌کارت" if order_price > 0 and payment_ready else "نیازمند هماهنگی مدیر"
                 chosen_delivery_mode = "manual"
                 saved_gift_id = ""
+                if category == "premium":
+                    premium_months = premium_product_months(product["name"])
+                    premium_cfg_now = load_premium_manager_settings()
+                    chosen_delivery_mode = premium_cfg_now["delivery_modes"].get(str(premium_months), "manual") if premium_months else "manual"
                 if category == "gifts":
                     gift_cfg_now = load_gift_settings()
                     chosen_delivery_mode = str(context.user_data.get("pending_gift_delivery_mode") or product["delivery_mode"] or "manual")
