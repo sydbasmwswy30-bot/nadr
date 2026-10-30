@@ -3383,10 +3383,77 @@ def _extract_nobitex_fx_rate_toman(payload, reference_rate=None):
         ((abs(candidate - reference) / reference, candidate, label) for candidate, label in candidates),
         key=lambda item: item[0],
     )
-    if not ranked or ranked[0][0] > Decimal("0.08"):
+    if not ranked or ranked[0][0] > Decimal("0.03"):
         raise ValueError("مقیاس ریال/تومان نرخ نوبیتکس با منبع مرجع هم‌خوانی ندارد؛ نرخ مستقیم پذیرفته نشد.")
     _difference, normalized_rate, unit_note = ranked[0]
     return normalized_rate, updated_at, "USDTIRT", unit_note
+
+
+async def _fetch_arzdigital_tether_quote(client):
+    """Extract ArzDigital's labelled USDT/Toman quote and mark fetch time as observed_at.
+
+    ArzDigital exposes a public HTML converter, not a documented public JSON API.
+    Its page currently labels the target value as "قیمت امروز USDT به تومان".
+    Because the page does not expose a dependable publisher timestamp, the quote
+    is never trusted alone: the caller must corroborate it with a fresh Toman feed.
+    """
+    import html as _html
+
+    response = await client.get(
+        "https://arzdigital.com/convert/tether/ir-toman/",
+        headers={
+            "Accept": "text/html,application/xhtml+xml",
+            "User-Agent": "Mozilla/5.0 (compatible; SEYED-PREMIUM-FX/2.0)",
+        },
+    )
+    response.raise_for_status()
+    page = _html.unescape(response.text)
+    text_value = re.sub(r"<[^>]+>", " ", page)
+    text_value = re.sub(r"\s+", " ", normalize_ascii_digits(text_value))
+
+    def parse_toman_number(raw):
+        try:
+            value = Decimal(str(raw).replace(",", "").replace("٬", "").strip())
+        except (InvalidOperation, TypeError, ValueError):
+            return None
+        return value if Decimal("1000") <= value <= Decimal("100000000") else None
+
+    rate = None
+    marker = "قیمت امروز USDT به تومان"
+    pos = text_value.find(marker)
+    if pos >= 0:
+        # The labelled converter field is the preferred value. Skip percentage
+        # changes (e.g. 0.86%) and take the first plausible Toman amount nearby.
+        section = text_value[pos + len(marker):pos + len(marker) + 180]
+        for match in re.finditer(r"(?<![\w.])([0-9][0-9,٬]*(?:\.[0-9]+)?)", section):
+            token = match.group(1)
+            tail = section[match.end():match.end() + 5]
+            if "%" in tail:
+                continue
+            rate = parse_toman_number(token)
+            if rate is not None:
+                break
+
+    # Resilient fallbacks if the converter's visible layout changes.
+    if rate is None:
+        match = re.search(r"نرخ تتر\s*[:：]?\s*([0-9][0-9,٬]*)\s*تومان", text_value)
+        if match:
+            rate = parse_toman_number(match.group(1))
+    if rate is None:
+        match = re.search(r"1\s*USDT\s*(?:\||:)\s*([0-9][0-9,٬]*)\s*IRT", text_value, re.IGNORECASE)
+        if match:
+            rate = parse_toman_number(match.group(1))
+    if rate is None:
+        raise ValueError("نرخ تتر از بخش مشخص صفحهٔ ارزدیجیتال استخراج نشد؛ ساختار صفحه ممکن است تغییر کرده باشد.")
+
+    observed_at = utc_now().isoformat(timespec="seconds")
+    return {
+        "rate": rate,
+        "updated_at": observed_at,
+        "observed_at": observed_at,
+        "symbol": "ARZDIGITAL_USDT_IRT",
+        "source": "ارزدیجیتال (نرخ بخش «قیمت امروز USDT به تومان»؛ زمان دریافت صفحه، نه زمان انتشار سایت)",
+    }
 
 
 async def _fetch_live_fx_bundle(client):
@@ -3403,8 +3470,9 @@ async def _fetch_live_fx_bundle(client):
     # Independent, keyless Tehran-market reference. Its timestamps are Jalali/Tehran,
     # and its public documentation explicitly defines all values as Toman.
     nerkh_task = asyncio.create_task(get_json("https://nerkh.jahankhahan.shop/data/live.json", "Nerkhsanj"))
-    direct_result, market_result, nerkh_result = await asyncio.gather(
-        direct_task, market_task, nerkh_task, return_exceptions=True
+    arzdigital_task = asyncio.create_task(_fetch_arzdigital_tether_quote(client))
+    direct_result, market_result, nerkh_result, arzdigital_result = await asyncio.gather(
+        direct_task, market_task, nerkh_task, arzdigital_task, return_exceptions=True
     )
     for source_result in (direct_result, market_result, nerkh_result):
         if isinstance(source_result, asyncio.CancelledError):
@@ -3454,8 +3522,8 @@ async def _fetch_live_fx_bundle(client):
             nerkh_usd_age = _pricing_timestamp_age(nerkh_usd_time)
             if usd_market is not None:
                 reference_usd = _pricing_decimal(usd_market.get("rate"))
-                if reference_usd and abs(nerkh_usd_rate - reference_usd) / reference_usd > Decimal("0.08"):
-                    raise ValueError("اختلاف نرخ دلار نرخ‌سنج با مرجع مستقل بیش از ۸٪ است؛ نرخ مشکوک پذیرفته نشد.")
+                if reference_usd and abs(nerkh_usd_rate - reference_usd) / reference_usd > Decimal("0.03"):
+                    raise ValueError("اختلاف نرخ دلار نرخ‌سنج با مرجع مستقل بیش از ۳٪ است؛ نرخ مشکوک پذیرفته نشد.")
             if usd_market is None or current_usd_age is None or (nerkh_usd_age is not None and nerkh_usd_age < current_usd_age):
                 usd_market = nerkh_usd
                 usd_error = ""
@@ -3474,8 +3542,8 @@ async def _fetch_live_fx_bundle(client):
             nerkh_tether_age = _pricing_timestamp_age(nerkh_usdt_time)
             if market_tether is not None:
                 reference_tether = _pricing_decimal(market_tether.get("rate"))
-                if reference_tether and abs(nerkh_usdt_rate - reference_tether) / reference_tether > Decimal("0.08"):
-                    raise ValueError("اختلاف نرخ تتر نرخ‌سنج با مرجع مستقل بیش از ۸٪ است؛ نرخ مشکوک پذیرفته نشد.")
+                if reference_tether and abs(nerkh_usdt_rate - reference_tether) / reference_tether > Decimal("0.03"):
+                    raise ValueError("اختلاف نرخ تتر نرخ‌سنج با مرجع مستقل بیش از ۳٪ است؛ نرخ مشکوک پذیرفته نشد.")
             if market_tether is None or current_tether_age is None or (nerkh_tether_age is not None and nerkh_tether_age < current_tether_age):
                 market_tether = nerkh_tether
         except Exception as exc:
@@ -3484,13 +3552,42 @@ async def _fetch_live_fx_bundle(client):
     elif not usd_market:
         usd_error = f"Nerkhsanj: {type(nerkh_result).__name__}: {str(nerkh_result)[:180]}"
 
+    # ArzDigital is a webpage rather than a documented API. Use its extracted
+    # quote only after it agrees with an independently timestamped Toman source;
+    # never let a changed page layout or a lone scrape set live prices.
+    arzdigital_accepted = False
+    if isinstance(arzdigital_result, dict) and market_tether is not None:
+        try:
+            arz_rate = _pricing_decimal(arzdigital_result.get("rate"))
+            reference_rate = _pricing_decimal(market_tether.get("rate"))
+            if arz_rate is None or reference_rate is None:
+                raise ValueError("نرخ ارزدیجیتال یا نرخ مرجع معتبر نیست.")
+            difference = abs(arz_rate - reference_rate) / reference_rate
+            if difference <= Decimal("0.03"):
+                # Make ArzDigital the selected source when it matches a fresh,
+                # separately timestamped Toman feed. Store fetch time only as
+                # observation time; never mislabel it as the site's publication time.
+                arzdigital_result["source"] = (
+                    str(arzdigital_result.get("source") or "ارزدیجیتال")
+                    + f"؛ کنترل تطبیقی با {market_tether.get('source') or 'مرجع مستقل'}"
+                )
+                market_tether = arzdigital_result
+                arzdigital_accepted = True
+                logger.info("ArzDigital Tether quote accepted after cross-check (difference %.2f%%)", float(difference * 100))
+            else:
+                logger.warning("ArzDigital quote rejected: difference from fresh Toman reference exceeds 3%%")
+        except Exception as exc:
+            logger.warning("ArzDigital quote could not be corroborated: %s", exc)
+    elif isinstance(arzdigital_result, BaseException):
+        logger.warning("ArzDigital webpage quote unavailable; continuing with independent sources: %s", arzdigital_result)
+
     tether = None
     if market_tether is not None:
-        # The feed names its price unit (Toman) and its USDT row source. It is
-        # the scale reference; a fresher raw Nobitex orderbook is preferred only
-        # after checking whether its numeric values are Rial or Toman.
+        # Use the explicitly requested ArzDigital quote when it passed the fresh
+        # cross-check. Otherwise use a timestamped Toman feed and prefer the direct
+        # Nobitex orderbook only after validating its Rial/Toman scale.
         tether = market_tether
-        if isinstance(direct_result, dict):
+        if isinstance(direct_result, dict) and not arzdigital_accepted:
             try:
                 direct_rate, direct_time, symbol, unit_note = _extract_nobitex_fx_rate_toman(
                     direct_result, market_tether["rate"]
