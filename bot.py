@@ -50,7 +50,12 @@ from telegram.ext import (
 ADMIN_ID = 8762160338
 
 def toman(value):
-    return f"{int(value or 0):,}".replace(",", "٬")
+    """Format a toman amount without letting malformed stored prices crash a menu."""
+    try:
+        number = int(Decimal(str(value or 0)))
+    except (InvalidOperation, TypeError, ValueError, OverflowError):
+        return "—"
+    return f"{number:,}".replace(",", "٬")
 
 
 def normalize_ascii_digits(value):
@@ -1625,12 +1630,14 @@ def gift_admin_home_text(catalog_count, active_count, balance_text, note=""):
     fx_ok = bool(auto_cfg.get("fx_valid") and _pricing_timestamp_fresh(auto_cfg.get("fx_source_updated_at"), _PRICING_FX_MAX_AGE_SECONDS))
     fx_fresh = bool(fx_ok and _pricing_timestamp_fresh(auto_cfg.get("fx_source_updated_at"), _PRICING_MAX_AGE_SECONDS))
     fx_label = "✅ تازه" if fx_fresh else ("⚠️ آخرین نرخ تأییدشده (پشتیبان)" if fx_ok else "❌ نرخ معتبر نیست")
+    fx_rate_value = _pricing_decimal(auto_cfg.get("fx_rate_toman"))
+    fx_rate_display = f"{toman(fx_rate_value)} تومان" if fx_rate_value is not None else "ثبت نشده/نامعتبر"
     lines = [
         "🎁 مدیریت گیفت تلگرام | SEYED PREMIUM",
         "━━━━━━━━━━━━━━━━━━",
         f"📚 تعداد گیفت‌های شناسایی‌شده: {catalog_count}",
         f"✅ گیفت‌های فعال برای فروش: {active_count}",
-        f"💱 نرخ تتر مرکزی: {toman(auto_cfg.get('fx_rate_toman') or 0)} تومان | {fx_label}",
+        f"💱 نرخ تتر مرکزی: {fx_rate_display} | {fx_label}",
         f"📈 سود مرکزی: {auto_cfg.get('margin_percent')}٪ | کارمزد: {auto_cfg.get('fee_percent')}٪",
         f"💵 قیمت نهایی محاسباتی هر ⭐: {unit_text}",
         f"🌐 منبع نرخ: {auto_cfg.get('fx_source_name') or 'تأیید نشده'}",
@@ -2488,6 +2495,20 @@ def load_auto_pricing_config():
     price_defaults = defaults["catalog_prices"]
     price_stored = cfg.get("catalog_prices")
     cfg["catalog_prices"] = dict(price_defaults, **(price_stored if isinstance(price_stored, dict) else {}))
+    # Sanitize values used by the admin pricing screens. Older provider responses
+    # may store a decimal/text max-order field; never let that crash a menu.
+    try:
+        raw_max = Decimal(str(cfg["catalog_prices"].get("stars_max_per_order") or 50000))
+        max_order = int(raw_max) if raw_max.is_finite() else 50000
+        if not 50 <= max_order <= 1_000_000:
+            max_order = 50000
+    except (InvalidOperation, TypeError, ValueError, OverflowError):
+        max_order = 50000
+    cfg["catalog_prices"]["stars_max_per_order"] = max_order
+    # A malformed cached FX value is not a usable rate. Keep it out of price math
+    # and show an unavailable marker instead of raising ValueError in the gift menu.
+    normalized_fx = _pricing_decimal(cfg.get("fx_rate_toman"))
+    cfg["fx_rate_toman"] = str(normalized_fx) if normalized_fx is not None else ""
     # The product owner requested a fixed 30-minute refresh; normalize legacy values.
     cfg["refresh_interval_minutes"] = 30
     cfg["fx_rate_mode"] = "manual" if str(cfg.get("fx_rate_mode") or "auto").lower() == "manual" else "auto"
@@ -2633,7 +2654,13 @@ def auto_pricing_quote(product_type, quantity, cfg=None, allow_stale=False):
         if unit_usd is None:
             return None
         cost_usd = unit_usd * Decimal(quantity)
-        upstream_max = int(prices.get("stars_max_per_order") or 50000)
+        try:
+            raw_upstream_max = Decimal(str(prices.get("stars_max_per_order") or 50000))
+            upstream_max = int(raw_upstream_max) if raw_upstream_max.is_finite() else 50000
+            if not 50 <= upstream_max <= 1_000_000:
+                upstream_max = 50000
+        except (InvalidOperation, TypeError, ValueError, OverflowError):
+            upstream_max = 50000
     elif product_type == "premium":
         if quantity not in (3, 6, 12):
             return None
@@ -10423,7 +10450,12 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await _text_message_impl(update, context)
     except Exception as exc:
-        logger.exception("Unhandled text-message failure; update_id=%s", getattr(update, "update_id", None))
+        state = getattr(context, "user_data", None)
+        active_states = sorted(k for k, v in state.items() if v is not None) if isinstance(state, dict) else []
+        logger.exception(
+            "Unhandled text-message failure; update_id=%s; active_state_keys=%s",
+            getattr(update, "update_id", None), active_states,
+        )
         message = update.effective_message
         if message and update.effective_user and update.effective_user.id == ADMIN_ID:
             try:
