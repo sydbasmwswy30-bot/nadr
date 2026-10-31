@@ -3227,113 +3227,44 @@ async def _finish_admin_pricing_refresh(query, status_prefix="", context=None):
 
 
 async def _fetch_public_price_catalog(client):
-    """Read-only Fragment price quotes through an independent mirror; never creates a purchase.
-
-    Fragment does not publish a public developer price API. This adapter uses a
-    third-party quote mirror that documents prices as live Fragment quotes. It
-    must never receive wallet seeds, Fragment cookies, or purchase credentials.
-    """
+    """Read public, no-credential Fragment reference quotes; never creates a purchase."""
     async def get_quote(product, amount):
         response = await client.get(
             _PUBLIC_PRICE_API_BASE,
             params={"product": product, "amount": int(amount)},
-            headers={"Accept": "application/json", "User-Agent": "SEYED-PREMIUM-price-check/3.0"},
+            headers={"Accept": "application/json", "User-Agent": "SEYED-PREMIUM-price-check/2.0"},
         )
         response.raise_for_status()
         payload = response.json()
         if not isinstance(payload, dict):
-            raise ValueError("پاسخ مرجع قیمت ساختار JSON معتبر ندارد.")
-
-        # Keep all known response envelopes so status/metadata checks cannot be
-        # bypassed merely because a field is nested one level deeper.
-        envelopes = [payload]
-        current = payload
+            raise ValueError("پاسخ سرویس قیمت ساختار JSON معتبر ندارد.")
+        quote = payload
         for key in ("data", "result", "quote"):
-            candidate = current.get(key) if isinstance(current, dict) else None
+            candidate = quote.get(key) if isinstance(quote, dict) else None
             if isinstance(candidate, dict):
-                envelopes.append(candidate)
-                current = candidate
-
-        for envelope in envelopes:
-            meta = envelope.get("meta") if isinstance(envelope.get("meta"), dict) else {}
-            status = str(envelope.get("source_status") or meta.get("source_status") or "").lower()
-            if (envelope.get("stale") is True or envelope.get("unavailable") is True
-                    or meta.get("stale") is True or status in {"stale", "unavailable", "offline"}):
-                raise ValueError("منبع مرجع، قیمت را قدیمی یا ناموجود اعلام کرده است.")
-
-        quote = envelopes[-1]
-        # Reject a quote for the wrong product/quantity when the server returns
-        # identifying fields. Exact total quote is preferred over unit price.
-        returned_product = str(quote.get("product") or "").strip().lower()
-        if returned_product and returned_product != product:
-            raise ValueError("نوع محصول در پاسخ قیمت با درخواست هماهنگ نیست.")
-        returned_amount = quote.get("amount", quote.get("quantity"))
-        if returned_amount is not None:
-            try:
-                if int(returned_amount) != int(amount):
-                    raise ValueError("تعداد/مدت پاسخ قیمت با درخواست هماهنگ نیست.")
-            except (TypeError, ValueError):
-                raise ValueError("تعداد/مدت پاسخ قیمت معتبر نیست.")
-
-        # Enforce any age supplied by the API. A missing age is accepted only
-        # when the source itself has not marked the quote stale/unavailable.
-        for envelope in reversed(envelopes):
-            age = envelope.get("age_sec")
-            if age is not None:
-                try:
-                    age_seconds = float(age)
-                except (TypeError, ValueError):
-                    raise ValueError("سن قیمت مرجع قابل‌تشخیص نیست.")
-                if age_seconds < 0 or age_seconds > 3600:
-                    raise ValueError("قیمت مرجع بیش از یک ساعت عمر دارد.")
-                break
-            stamp = envelope.get("quoted_at") or envelope.get("updated_at") or envelope.get("timestamp")
-            if stamp:
-                parsed = None
-                if isinstance(stamp, (int, float)) or (isinstance(stamp, str) and stamp.strip().isdigit()):
-                    try:
-                        epoch = float(stamp)
-                        if epoch > 10_000_000_000:  # milliseconds -> seconds
-                            epoch /= 1000.0
-                        parsed = datetime.fromtimestamp(epoch, tz=timezone.utc)
-                    except (OverflowError, OSError, TypeError, ValueError):
-                        parsed = None
-                else:
-                    parsed = _pricing_time(stamp)
-                if parsed is None:
-                    raise ValueError("زمان ثبت قیمت مرجع قابل‌تشخیص نیست.")
-                age_seconds = (utc_now() - parsed).total_seconds()
-                if age_seconds < -60 or age_seconds > 3600:
-                    raise ValueError("زمان قیمت مرجع معتبر یا تازه نیست.")
-                break
-
-        prices = quote.get("prices") if isinstance(quote.get("prices"), dict) else quote
+                quote = candidate
+        stale = quote.get("stale", payload.get("stale", False))
+        if stale is True or quote.get("unavailable") is True or payload.get("unavailable") is True:
+            raise ValueError("منبع قیمت، دادهٔ قدیمی یا ناموجود اعلام کرد.")
+        prices = quote.get("prices")
+        if not isinstance(prices, dict):
+            prices = quote
         value = None
-        # These keys represent the complete quote for the requested amount.
-        for key in ("usdt", "price_usdt", "priceUsdt", "usd", "price_usd", "priceUsd"):
+        for key in ("usdt", "price_usdt", "unit_usdt", "priceUsdt", "usd"):
             value = _pricing_decimal(prices.get(key))
             if value is not None:
                 break
-
-        # Some compatible quote feeds expose only unit_usdt. It is per Star or
-        # per Premium month, so multiply it by the requested amount; never treat
-        # a unit price as the entire order price.
-        if value is None:
-            for key in ("unit_usdt", "unit_usd", "unitUsdt", "unitUsd"):
-                unit_value = _pricing_decimal(prices.get(key))
-                if unit_value is not None:
-                    value = unit_value * Decimal(int(amount))
-                    break
-
         if value is None or value <= 0:
-            raise ValueError("قیمت کل به USDT/USD در پاسخ مرجع موجود یا معتبر نیست.")
-        if product == "stars":
-            unit_price = value / Decimal(int(amount))
-            if unit_price < Decimal("0.001") or unit_price > Decimal("1"):
-                raise ValueError("قیمت هر استارز خارج از محدودهٔ منطقی است.")
-        elif product == "premium":
-            if value < Decimal("1") or value > Decimal("500"):
-                raise ValueError("قیمت پلن پرمیوم خارج از محدودهٔ منطقی است.")
+            raise ValueError("قیمت USDT در پاسخ مرجع موجود یا معتبر نیست.")
+        # If the API provides a quote age, reject old prices even when stale is omitted.
+        age = quote.get("age_sec", payload.get("age_sec"))
+        if age is not None:
+            try:
+                age_seconds = float(age)
+            except (TypeError, ValueError):
+                raise ValueError("سن قیمت مرجع قابل‌تشخیص نیست.")
+            if age_seconds < 0 or age_seconds > 3600:
+                raise ValueError("قیمت مرجع بیش از یک ساعت عمر دارد.")
         return value
 
     requests = [("stars", 50), ("premium", 3), ("premium", 6), ("premium", 12)]
@@ -3345,7 +3276,7 @@ async def _fetch_public_price_catalog(client):
     stars_error = ""
     if isinstance(stars_result, Exception):
         stars_error = f"{type(stars_result).__name__}: {str(stars_result)[:180]}"
-        logger.warning("Fragment reference Stars quote unavailable: %s", stars_error)
+        logger.warning("Public Fragment Stars quote unavailable: %s", stars_error)
         stars_price_per_star = ""
     else:
         stars_price_per_star = str(stars_result / Decimal(50))
@@ -3355,7 +3286,7 @@ async def _fetch_public_price_catalog(client):
     for months, result in zip((3, 6, 12), results[1:]):
         if isinstance(result, Exception):
             premium_errors[str(months)] = f"{type(result).__name__}: {str(result)[:180]}"
-            logger.warning("Fragment reference Premium quote unavailable for %s months: %s", months, premium_errors[str(months)])
+            logger.warning("Public Fragment Premium quote unavailable for %s months: %s", months, premium_errors[str(months)])
         else:
             premium_prices[str(months)] = str(result)
     return {
@@ -3364,7 +3295,7 @@ async def _fetch_public_price_catalog(client):
         "premium_usd": premium_prices,
         "stars_quote_error": stars_error,
         "premium_quote_errors": premium_errors,
-        "catalog_source": "قیمت مرجع Fragment از سرویس مستقلِ غیررسمی (فقط‌خواندنی؛ بدون کلید و بدون خرید)",
+        "catalog_source": "سرویس مرجع غیررسمی قیمت Fragment (خواندن قیمت عمومی؛ بدون کلید و بدون خرید)",
     }
 
 
@@ -4188,33 +4119,34 @@ async def refresh_auto_pricing(force=False, background=False):
             follow_redirects=True,
         ) as client:
             async def fetch_catalog():
-                # Fragment reference quotes are the PRIMARY base-price source.
-                # A configured supplier catalog is only a secondary gap-filler;
-                # it must never overwrite a valid Fragment quote.
-                public_task = asyncio.create_task(_fetch_public_price_catalog(client))
+                # Fetch independent sources concurrently. If a supplier key exists, its
+                # wholesale/partner amounts take precedence; the public quote only fills gaps.
                 supplier_task = (
                     asyncio.create_task(_fetch_tgsuperstars_price_catalog(client, api_key))
                     if api_key else None
                 )
-                tasks_to_wait = [public_task] + ([supplier_task] if supplier_task is not None else [])
-                fetched = await asyncio.gather(*tasks_to_wait, return_exceptions=True)
-                public_result = fetched[0]
-                supplier_result = fetched[1] if supplier_task is not None else None
-                public_catalog = public_result if isinstance(public_result, dict) else None
+                public_task = asyncio.create_task(_fetch_public_price_catalog(client))
+                supplier_result = None
+                if supplier_task is not None:
+                    supplier_result = (await asyncio.gather(supplier_task, return_exceptions=True))[0]
+                public_result = (await asyncio.gather(public_task, return_exceptions=True))[0]
                 supplier_catalog = supplier_result if isinstance(supplier_result, dict) else None
-                for label, result in (("Fragment reference", public_result), ("Supplier fallback", supplier_result)):
-                    if isinstance(result, asyncio.CancelledError):
-                        raise result
-                    if isinstance(result, BaseException):
-                        logger.warning("%s catalog unavailable: %s", label, result)
-                if public_catalog and supplier_catalog:
-                    return _merge_quote_catalog(public_catalog, supplier_catalog)
+                public_catalog = public_result if isinstance(public_result, dict) else None
+                if isinstance(supplier_result, asyncio.CancelledError):
+                    raise supplier_result
+                if isinstance(public_result, asyncio.CancelledError):
+                    raise public_result
+                if isinstance(supplier_result, BaseException):
+                    logger.warning("Supplier catalog unavailable; public reference may be used: %s", supplier_result)
+                if isinstance(public_result, BaseException):
+                    logger.warning("Public reference catalog unavailable: %s", public_result)
+                if supplier_catalog and public_catalog:
+                    return _merge_quote_catalog(supplier_catalog, public_catalog)
+                if supplier_catalog:
+                    return supplier_catalog
                 if public_catalog:
                     return public_catalog
-                if supplier_catalog:
-                    logger.warning("Using configured supplier catalog only because Fragment reference quotes were unavailable.")
-                    return supplier_catalog
-                raise RuntimeError("قیمت مرجع Fragment و منبع پشتیبان هیچ قیمت معتبری ارائه نکردند.")
+                raise RuntimeError("کاتالوگ تأمین‌کننده و منبع عمومی هیچ قیمت معتبری ارائه نکردند.")
 
             tasks = []
             if catalog_due:
@@ -12855,14 +12787,12 @@ def main():
     print("SEYED PREMIUM روشن شد. برای توقف Ctrl+C را بزن.")
     # Keep polling resilient to transient Telegram Bad Gateway / network errors.
     # Pending updates are preserved so orders and receipts are not silently dropped.
+    # Timeouts belong to Application.builder() above, not run_polling().
+    # Passing timeout kwargs here raises TypeError and causes the host crash loop.
     app.run_polling(
         poll_interval=0.5,
         timeout=25,
         bootstrap_retries=-1,
-        read_timeout=45,
-        write_timeout=20,
-        connect_timeout=15,
-        pool_timeout=15,
         drop_pending_updates=False,
     )
 
