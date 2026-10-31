@@ -1,5 +1,6 @@
 import logging
 import asyncio
+import base64
 from copy import deepcopy
 import sqlite3
 import time
@@ -2441,6 +2442,10 @@ def _auto_pricing_defaults():
     return {
         "enabled": True,
         "provider_api_key": "",
+        # Nobitex API Key v2: public key + one-time private signing key (READ only).
+        "nobitex_api_public_key": "",
+        "nobitex_api_private_key": "",
+        "nobitex_api_verified_at": "",
         # Optional administrator-supplied public FX JSON endpoint (no key needed by default).
         "fx_custom_api_url": "",
         "fx_custom_json_path": "auto",
@@ -2537,6 +2542,9 @@ def save_auto_pricing_config(cfg):
     catalog_prices = normalized.get("catalog_prices")
     normalized["catalog_prices"] = dict(defaults["catalog_prices"], **(catalog_prices if isinstance(catalog_prices, dict) else {}))
     normalized["provider_api_key"] = str(normalized.get("provider_api_key") or "").strip()
+    normalized["nobitex_api_public_key"] = str(normalized.get("nobitex_api_public_key") or "").strip()
+    normalized["nobitex_api_private_key"] = str(normalized.get("nobitex_api_private_key") or "").strip()
+    normalized["nobitex_api_verified_at"] = str(normalized.get("nobitex_api_verified_at") or "").strip()
     normalized["fx_custom_api_url"] = str(normalized.get("fx_custom_api_url") or "").strip()
     normalized["fx_custom_json_path"] = str(normalized.get("fx_custom_json_path") or "auto").strip() or "auto"
     normalized["fx_custom_unit"] = str(normalized.get("fx_custom_unit") or "TOMAN").strip().upper()
@@ -3121,74 +3129,142 @@ def pricing_customer_status_text(cfg=None):
     return ""
 
 
+def _catalog_source_names(value):
+    """Return a compact, de-duplicated list of catalogue source labels."""
+    raw_parts = str(value or "").split(" + ")
+    labels = []
+    seen = set()
+    for raw in raw_parts:
+        part = str(raw or "").strip()
+        if not part:
+            continue
+        low = part.casefold()
+        if "tgsuperstars" in low:
+            label = "TgSuperstars"
+        elif "fragment" in low:
+            label = "Fragment (مرجع عمومی)"
+        else:
+            label = part.split("؛", 1)[0][:48]
+        key = label.casefold()
+        if key not in seen:
+            seen.add(key)
+            labels.append(label)
+    return " + ".join(labels[:3]) or "منبع عمومی مرجع"
+
+
+def _fx_source_short(value):
+    """Keep long upstream source descriptions out of the admin status message."""
+    raw = str(value or "")
+    low = raw.casefold()
+    if "میانه" in raw or "median" in low:
+        return "میانهٔ بازارهای معتبر"
+    for token, label in (
+        ("wallex", "Wallex"), ("tabdeal", "Tabdeal"), ("nobitex", "Nobitex"),
+        ("exir", "Exir"), ("nerkhsanj", "نرخ‌سنج"), ("arzdigital", "ارزدیجیتال"),
+        ("iran market", "Iran Market"), ("custom fx", "API مدیر"),
+    ):
+        if token in low:
+            return label
+    return (raw.split("؛", 1)[0][:52] if raw else "منبع عمومی بازار")
+
+
+def _nobitex_api_signature_headers(public_key, private_key, method="GET", full_path="/users/profile", raw_body=""):
+    """Build the official Nobitex API-Key v2 Ed25519 signature headers."""
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    except ImportError as exc:
+        raise RuntimeError("کتابخانهٔ cryptography نصب نیست؛ دستور pip install cryptography را اجرا کن.") from exc
+
+    public_key = str(public_key or "").strip()
+    private_key = str(private_key or "").strip()
+    if not public_key or not private_key:
+        raise ValueError("کلید عمومی و خصوصی نوبیتکس هر دو لازم‌اند.")
+    try:
+        private_bytes = base64.urlsafe_b64decode(private_key + "=" * (-len(private_key) % 4))
+    except Exception as exc:
+        raise ValueError("قالب Private Key معتبر نیست؛ مقدار Base64 اصلی را وارد کن.") from exc
+    if len(private_bytes) != 32:
+        raise ValueError("طول Private Key معتبر نیست؛ کلید خصوصی اصلی Ed25519 را وارد کن.")
+
+    timestamp = str(int(time.time()))
+    method = str(method).upper()
+    payload = f"{timestamp}{method}{full_path}{raw_body}".encode("utf-8")
+    signer = Ed25519PrivateKey.from_private_bytes(private_bytes)
+    signature = base64.urlsafe_b64encode(signer.sign(payload)).decode("ascii")
+    return {
+        "Nobitex-Key": public_key,
+        "Nobitex-Signature": signature,
+        "Nobitex-Timestamp": timestamp,
+        "Accept": "application/json",
+        "User-Agent": "SEYED-PREMIUM-READONLY/1.0",
+    }
+
+
+async def _verify_nobitex_readonly_key(client, public_key, private_key):
+    """Verify a read-only key through the documented authenticated profile endpoint."""
+    path = "/users/profile"
+    headers = _nobitex_api_signature_headers(public_key, private_key, "GET", path, "")
+    response = await client.get("https://apiv2.nobitex.ir" + path, headers=headers)
+    response.raise_for_status()
+    try:
+        payload = response.json()
+    except Exception as exc:
+        raise ValueError("نوبیتکس پاسخ JSON معتبر برنگرداند.") from exc
+    if not isinstance(payload, dict) or str(payload.get("status", "")).lower() != "ok":
+        raise ValueError("نوبیتکس کلید را تأیید نکرد؛ دسترسی READ و جفت‌بودن کلیدها را بررسی کن.")
+    # Do not return or log profile contents; only the authentication result is needed.
+    return True
+
+
 def pricing_panel_text(cfg=None, note=""):
     cfg = cfg or load_auto_pricing_config()
     ready = auto_pricing_ready(cfg)
-    key_state = "✅ تنظیم شده" if str(cfg.get("provider_api_key") or "").strip() else "❌ تنظیم نشده"
-    catalog_state = "✅ معتبر" if cfg.get("catalog_valid") and _pricing_timestamp_fresh(cfg.get("catalog_updated_at"), _PRICING_CATALOG_MAX_AGE_SECONDS) else "❌ نامعتبر/منقضی"
-    fx_age = _pricing_timestamp_age(cfg.get("fx_source_updated_at"))
+    catalog_state = "✅ تازه/معتبر" if cfg.get("catalog_valid") and _pricing_timestamp_fresh(cfg.get("catalog_updated_at"), _PRICING_CATALOG_MAX_AGE_SECONDS) else "⚠️ نامعتبر/منقضی"
     fx_fresh = bool(cfg.get("fx_valid") and _pricing_timestamp_fresh(cfg.get("fx_source_updated_at"), _PRICING_MAX_AGE_SECONDS))
     fx_grace = bool(cfg.get("fx_valid") and _pricing_timestamp_fresh(cfg.get("fx_source_updated_at"), _PRICING_FX_MAX_AGE_SECONDS))
-    fx_state = "✅ تازه" if fx_fresh else ("⚠️ نرخ قبلی حفظ‌شده" if fx_grace else "❌ نامعتبر/منقضی")
+    fx_state = "✅ تازه" if fx_fresh else ("⚠️ آخرین نرخ تأییدشده" if fx_grace else "❌ نامعتبر")
     stored_fx = _pricing_decimal(cfg.get("fx_rate_toman"))
-    fx_text = f"{toman(stored_fx)} تومان" if stored_fx is not None else "هنوز ثبت نشده"
-    usd_market_ok = bool(cfg.get("usd_market_valid") and _pricing_timestamp_fresh(cfg.get("usd_market_source_updated_at"), 3600))
-    usd_market_text = (f"{toman(_pricing_decimal(cfg.get('usd_market_rate_toman')) or 0)} تومان"
-                       if usd_market_ok else "دادهٔ تازهٔ مستقل در دسترس نیست")
-    fx_ready = bool(cfg.get("enabled") and cfg.get("fx_valid") and _pricing_timestamp_fresh(cfg.get("fx_source_updated_at"), _PRICING_FX_MAX_AGE_SECONDS) and _pricing_decimal(cfg.get("fx_rate_toman")))
+    fx_text = f"{toman(stored_fx)} تومان" if stored_fx is not None else "دریافت نشده"
+    fx_ready = bool(cfg.get("enabled") and fx_grace and stored_fx is not None)
     stars_ready = bool(ready)
     premium_terms = (cfg.get("catalog_prices") or {}).get("premium_usd") or {}
-    premium_ready = bool(
-        fx_ready and _premium_catalog_is_fresh(cfg)
-        and all(_pricing_decimal(premium_terms.get(str(m))) is not None for m in (3, 6, 12))
-    )
-    status = (
-        f"⭐ استارز: {'✅ آماده' if stars_ready else '⚠️ غیرفعال/فاقد نرخ معتبر'}\n"
-        f"💎 پرمیوم: {'✅ آماده' if premium_ready else '⚠️ فاقد کاتالوگ/نرخ معتبر'}"
-    )
-    premium_terms_text = "، ".join(f"{term}ماهه" for term in ("3", "6", "12") if _pricing_decimal(premium_terms.get(term))) or "هنوز از منبع دریافت نشده"
+    premium_terms_text = "، ".join(f"{term}ماهه" for term in ("3", "6", "12") if _pricing_decimal(premium_terms.get(term))) or "دریافت نشده"
+    premium_ready = bool(fx_ready and _premium_catalog_is_fresh(cfg) and all(_pricing_decimal(premium_terms.get(str(m))) is not None for m in (3, 6, 12)))
+    nobitex_key_ready = bool(cfg.get("nobitex_api_public_key") and cfg.get("nobitex_api_private_key") and cfg.get("nobitex_api_verified_at"))
+    catalog_source = _catalog_source_names((cfg.get("catalog_prices") or {}).get("catalog_source"))
+    fx_source = _fx_source_short(cfg.get("fx_source_name"))
+    usd_market_ok = bool(cfg.get("usd_market_valid") and _pricing_timestamp_fresh(cfg.get("usd_market_source_updated_at"), 3600))
+    usd_market_rate = _pricing_decimal(cfg.get("usd_market_rate_toman"))
+    usd_market_text = f"{toman(usd_market_rate)} تومان" if usd_market_ok and usd_market_rate is not None else "در دسترس نیست"
     lines = [
         "💹 قیمت‌گذاری خودکار | SEYED PREMIUM",
         "━━━━━━━━━━━━━━━━━━",
-        status,
-        f"وضعیت سیستم: {'روشن' if cfg.get('enabled') else 'خاموش'}",
-        f"کلید تأمین‌کننده: {key_state}",
-        f"منبع کاتالوگ واقعی/مرجع: {(cfg.get('catalog_prices') or {}).get('catalog_source') or ('TgSuperstars (کلید مدیر)' if str(cfg.get('provider_api_key') or '').strip() else 'API عمومی مرجع (غیررسمی)')} — {catalog_state}",
-        f"آخرین دریافت کاتالوگ: {_pricing_time_text(cfg.get('catalog_updated_at'))}",
-        f"بسته‌های پرمیوم دریافتی: {premium_terms_text}",
-        f"نرخ بازار تتر USDT→تومان: {fx_text} — {fx_state}",
-        f"حالت نرخ ارز: {'دستی' if str(cfg.get('fx_rate_mode') or 'auto') == 'manual' else 'خودکار'} | نرخ دستی ذخیره‌شده: {toman(cfg.get('fx_manual_rate_toman') or 0)} تومان",
-        f"منبع نرخ تتر: {cfg.get('fx_source_name') or 'هنوز تأیید نشده'} ({cfg.get('fx_source_symbol') or '—'})",
-        f"آخرین زمان دادهٔ تتر: {_pricing_time_text(cfg.get('fx_source_updated_at'))}",
-        f"منابع موفق/ناموفق آخرین بررسی: {cfg.get('fx_sources_ok', '—')} / {cfg.get('fx_sources_failed', '—')}",
-        f"دلار بازار آزاد (اطلاعاتی، مستقل از محاسبهٔ تتر): {usd_market_text}",
-        f"منبع دلار آزاد: {cfg.get('usd_market_source_name') or 'هنوز تأیید نشده'} | {_pricing_time_text(cfg.get('usd_market_source_updated_at'))}",
-        f"وضعیت دلار آزاد: {'✅ دادهٔ تازه' if usd_market_ok else '⚠️ نرخ مستقل تازه موجود نیست'}",
-        f"API پشتیبان مدیر: {'✅ تنظیم شده' if cfg.get('fx_custom_api_url') else 'اختیاری/تنظیم نشده'}",
-        f"درصد سود: {cfg.get('margin_percent')}٪",
-        f"درصد کارمزد/هزینهٔ اضافی تنظیم‌شده: {cfg.get('fee_percent')}٪",
-        "بررسی نرخ تتر: هر ۳۰ ثانیه از بازارهای عمومی؛ کاتالوگ استارز/پرمیوم هر ۳۰ دقیقه؛ هنگام خطا تلاش مجدد خودکار.",
+        f"⭐ استارز: {'✅ آماده' if stars_ready else '⚠️ نیازمند بررسی'}  |  💎 پرمیوم: {'✅ آماده' if premium_ready else '⚠️ نیازمند بررسی'}",
+        f"⚙️ سیستم: {'روشن' if cfg.get('enabled') else 'خاموش'}",
+        f"🔐 کلید API نوبیتکس: {'✅ تأیید شده (READ)' if nobitex_key_ready else '❌ ثبت نشده'}",
+        "━━━━━━━━━━━━━━━━━━",
+        f"💱 نرخ تتر: {fx_text}  |  {fx_state}",
+        f"🌐 منبع نرخ: {fx_source}",
+        f"📊 منابع نرخ: {cfg.get('fx_sources_ok', '—')} موفق / {cfg.get('fx_sources_failed', '—')} ناموفق",
+        f"💵 دلار آزاد (اطلاعاتی): {usd_market_text}",
+        "━━━━━━━━━━━━━━━━━━",
+        f"📦 کاتالوگ: {catalog_source}  |  {catalog_state}",
+        f"🕒 آخرین دریافت کاتالوگ: {_pricing_time_text(cfg.get('catalog_updated_at'))}",
+        f"💎 پلن‌های پرمیوم: {premium_terms_text}",
+        f"📈 سود: {cfg.get('margin_percent')}٪  |  🧾 کارمزد: {cfg.get('fee_percent')}٪",
+        "⏱️ بروزرسانی: نرخ تتر هر ۳۰ ثانیه؛ کاتالوگ هر ۳۰ دقیقه",
+        "ℹ️ کلید نوبیتکس برای احراز اتصال READ است؛ نرخ بازار از اردربوک عمومی نوبیتکس و منابع بازار دریافت می‌شود.",
     ]
     if fx_grace and not fx_fresh:
-        lines.append("⚠️ همهٔ منابع در آخرین تلاش پاسخ ندادند؛ آخرین نرخ تأییدشده موقتاً حفظ شده است و زمان واقعی آن در بالا مشخص است.")
-    if not usd_market_ok and cfg.get("usd_market_error"):
-        lines.append("\nدلیل نامعتبر بودن نرخ مستقل دلار: " + str(cfg.get("usd_market_error"))[:180])
-    if not cfg.get("provider_api_key"):
-        lines.append("\nمنبع رایگان فقط قیمت مرجع را می‌خواند و خرید انجام نمی‌دهد. این منبع شخص ثالث و غیررسمی است؛ اگر قیمت تازه/معتبر برنگردد، فروش قیمت‌گذاری‌شده متوقف می‌ماند.")
-    sample_stars = auto_pricing_quote("stars", 100, cfg) if stars_ready else None
-    sample_premium = auto_pricing_quote("premium", 3, cfg) if premium_ready else None
-    if sample_stars:
-        lines.extend(["", "نمونهٔ شفاف محاسبه (۱۰۰ استارز):", quote_breakdown_text(sample_stars)])
-    if sample_premium:
-        lines.extend(["", "نمونهٔ پرمیوم ۳ماهه:", quote_breakdown_text(sample_premium)])
+        lines.append("⚠️ نرخ تازه موقتاً در دسترس نیست؛ آخرین نرخ تأییدشده تا پایان مهلت اعتبار نگه داشته شده است.")
     if not ready:
         errors = []
         if cfg.get("catalog_error"):
-            errors.append("کاتالوگ: " + str(cfg["catalog_error"])[:250])
+            errors.append("کاتالوگ: " + str(cfg["catalog_error"])[:140])
         if cfg.get("fx_error"):
-            errors.append("ارز: " + str(cfg["fx_error"])[:250])
+            errors.append("ارز: " + str(cfg["fx_error"])[:140])
         if errors:
-            lines.append("\n" + "\n".join(errors))
+            lines.append("\n⚠️ " + " | ".join(errors))
     if note:
         lines.extend(["", note])
     return "\n".join(lines)
@@ -3202,9 +3278,8 @@ def pricing_panel_keyboard(cfg=None):
         [InlineKeyboardButton("⭐ شارژ موجودی واقعی Stars ربات (مشترک خدمات پشتیبانی‌شده)", callback_data="gift_star_topup", style="success")],
         [InlineKeyboardButton("📈 تنظیم درصد سود", callback_data="admin_pricing_margin", style="primary"),
          InlineKeyboardButton("🧾 تنظیم کارمزد", callback_data="admin_pricing_fee", style="primary")],
-        [InlineKeyboardButton("🔑 ثبت/تغییر کلید تأمین‌کننده", callback_data="admin_pricing_api_key", style="primary"),
-         InlineKeyboardButton("🗑 حذف کلید", callback_data="admin_pricing_clear_key", style="danger")],
-        [InlineKeyboardButton("🧩 API پشتیبان نرخ تتر (اختیاری)", callback_data="admin_fx_api_menu", style="primary")],
+        [InlineKeyboardButton("🔐 ثبت/تغییر کلید API نوبیتکس", callback_data="admin_nobitex_api_setup", style="primary"),
+         InlineKeyboardButton("🗑 حذف کلید نوبیتکس", callback_data="admin_nobitex_api_clear", style="danger")],
         [InlineKeyboardButton("✍️ ثبت نرخ دستی تتر (تومان)", callback_data="admin_fx_manual_rate", style="primary"),
          InlineKeyboardButton("🔄 استفاده از نرخ خودکار", callback_data="admin_fx_auto_mode", style="success")],
         [InlineKeyboardButton("💰 ورود/ویرایش دستی قیمت همهٔ خدمات", callback_data="admin_products", style="primary")],
@@ -3392,7 +3467,7 @@ def _merge_quote_catalog(primary, fallback):
         if _pricing_decimal(premium.get(month)) is None and _pricing_decimal(fallback_premium.get(month)) is not None:
             premium[month] = fallback_premium[month]
     result["premium_usd"] = premium
-    result["catalog_source"] = " + ".join(x for x in (result.get("catalog_source"), fallback.get("catalog_source")) if x)
+    result["catalog_source"] = _catalog_source_names(" + ".join(x for x in (result.get("catalog_source"), fallback.get("catalog_source")) if x))
     return result
 
 
@@ -3895,6 +3970,8 @@ async def _fetch_live_fx_bundle(client):
         return quote_record(raw_rate, "API پشتیبان مدیر", "CUSTOM_USDT_TOMAN", source_time or observed, note)
 
     async def fetch_nobitex_orderbook():
+        # Official Nobitex docs classify this orderbook as public/no-token; API Key v2
+        # is validated separately against /users/profile with signed READ headers.
         payload = await get_json("https://apiv2.nobitex.ir/v3/orderbook/USDTIRT", "Nobitex orderbook")
         if not isinstance(payload, dict) or str(payload.get("status", "")).lower() != "ok":
             raise ValueError("پاسخ دفتر سفارش نوبیتکس معتبر نیست.")
@@ -9058,6 +9135,30 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(pricing_panel_text(), reply_markup=pricing_panel_keyboard())
             return
 
+        if data == "admin_nobitex_api_setup":
+            context.user_data["pricing_admin_state"] = {"field": "nobitex_api_setup", "step": "public"}
+            await query.edit_message_text(
+                "🔐 اتصال API نوبیتکس | فقط READ\n\n"
+                "ابتدا کلید عمومی API (Nobitex-Key) را بفرست. سپس Private Key را جداگانه می‌پرسم.\n"
+                "در پنل نوبیتکس دسترسی کلید را فقط روی READ بگذار؛ TRADE و WITHDRAW لازم نیست.\n"
+                "کلیدها در پیام خصوصی ربات دریافت و پیام‌ها حذف می‌شوند. برای لغو /cancel را بفرست.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="admin_auto_pricing", style="danger")]]),
+            )
+            return
+
+        if data == "admin_nobitex_api_clear":
+            cfg = load_auto_pricing_config()
+            cfg["nobitex_api_public_key"] = ""
+            cfg["nobitex_api_private_key"] = ""
+            cfg["nobitex_api_verified_at"] = ""
+            save_auto_pricing_config(cfg)
+            context.user_data.pop("pricing_admin_state", None)
+            await query.edit_message_text(
+                pricing_panel_text(cfg, "✅ کلید API نوبیتکس از تنظیمات ربات حذف شد."),
+                reply_markup=pricing_panel_keyboard(cfg),
+            )
+            return
+
         if data == "admin_fx_manual_rate":
             context.user_data["pricing_admin_state"] = {"field": "fx_manual_rate_toman"}
             await query.edit_message_text("✍️ نرخ دستی هر ۱ تتر را به تومان وارد کن. فقط عدد صحیح؛ نمونه: ۲۷۳۵۰۰\nاین نرخ ذخیره می‌شود و تا انتخاب دوبارهٔ حالت خودکار تغییر نمی‌کند. برای لغو /cancel را بزن.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="admin_auto_pricing", style="danger")]]))
@@ -9137,11 +9238,18 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        if data in {"admin_pricing_margin", "admin_pricing_fee", "admin_pricing_api_key"}:
+        if data == "admin_pricing_api_key":
+            context.user_data["pricing_admin_state"] = {"field": "nobitex_api_setup", "step": "public"}
+            await query.edit_message_text(
+                "🔐 ابتدا کلید عمومی API نوبیتکس (Nobitex-Key) را بفرست. دسترسی کلید باید فقط READ باشد. برای لغو /cancel را بزن.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="admin_auto_pricing", style="danger")]]),
+            )
+            return
+
+        if data in {"admin_pricing_margin", "admin_pricing_fee"}:
             state_map = {
                 "admin_pricing_margin": ("margin_percent", "درصد سود را بین ۰ تا ۵۰۰ وارد کن؛ نمونه: ۴۰"),
                 "admin_pricing_fee": ("fee_percent", "درصد کارمزد/هزینهٔ اضافی را بین ۰ تا ۱۰۰ وارد کن؛ نمونه: ۲ یا ۰"),
-                "admin_pricing_api_key": ("provider_api_key", "کلید API فعال TgSuperstars را در همین گفت‌وگو بفرست. کلید در دیتابیس موجود فروشگاه ذخیره می‌شود؛ آن را با کسی به اشتراک نگذار. برای لغو /cancel را بزن."),
             }
             field, prompt = state_map[data]
             context.user_data["pricing_admin_state"] = {"field": field}
@@ -11097,6 +11205,68 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await message.reply_text(pricing_panel_text(), reply_markup=pricing_panel_keyboard())
             return
         cfg = load_auto_pricing_config()
+        if field == "nobitex_api_setup":
+            step = str(pricing_state.get("step") or "public")
+            try:
+                await message.delete()
+            except Exception:
+                logger.debug("Could not delete Nobitex API credential message", exc_info=True)
+
+            if step == "public":
+                public_key = raw_value.strip()
+                if len(public_key) < 12 or len(public_key) > 512 or any(ch.isspace() for ch in public_key):
+                    await message.reply_text("❌ کلید عمومی معتبر به نظر نمی‌رسد. مقدار Nobitex-Key را دوباره بفرست یا /cancel بزن.")
+                    return
+                user_data["pricing_admin_state"] = {"field": "nobitex_api_setup", "step": "private", "public_key": public_key}
+                await message.reply_text("✅ کلید عمومی دریافت شد. حالا Private Key خصوصیِ همان API Key را بفرست. پیام پس از دریافت حذف می‌شود.")
+                return
+
+            if step == "private":
+                public_key = str(pricing_state.get("public_key") or "").strip()
+                private_key = raw_value.strip()
+                if len(private_key) < 30 or len(private_key) > 512 or any(ch.isspace() for ch in private_key):
+                    await message.reply_text("❌ قالب Private Key معتبر نیست. همان Private Key اصلیِ زمان ساخت کلید را دوباره بفرست یا /cancel بزن.")
+                    return
+                try:
+                    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0), follow_redirects=False) as client:
+                        await _verify_nobitex_readonly_key(client, public_key, private_key)
+                except RuntimeError as exc:
+                    await message.reply_text("❌ " + str(exc))
+                    return
+                except httpx.HTTPStatusError as exc:
+                    status_code = exc.response.status_code if exc.response is not None else 0
+                    if status_code in (401, 403):
+                        error_text = "❌ نوبیتکس کلید را نپذیرفت. مطمئن شو public/private از یک جفت‌اند و دسترسی READ فعال است."
+                    elif status_code == 429:
+                        error_text = "⚠️ محدودیت درخواست نوبیتکس فعال شد؛ چند دقیقه بعد دوباره تلاش کن. کلید قبلی دست‌نخورده ماند."
+                    else:
+                        error_text = f"⚠️ اعتبارسنجی نوبیتکس ناموفق بود (HTTP {status_code}). کلید قبلی دست‌نخورده ماند."
+                    await message.reply_text(error_text)
+                    return
+                except (httpx.HTTPError, ValueError) as exc:
+                    await message.reply_text("❌ اعتبارسنجی انجام نشد: " + str(exc)[:220] + "\nکلید قبلی دست‌نخورده ماند.")
+                    return
+                except Exception:
+                    logger.exception("Nobitex API key validation failed")
+                    await message.reply_text("❌ خطای غیرمنتظره در بررسی کلید نوبیتکس؛ کلید قبلی دست‌نخورده ماند.")
+                    return
+
+                cfg["nobitex_api_public_key"] = public_key
+                cfg["nobitex_api_private_key"] = private_key
+                cfg["nobitex_api_verified_at"] = utc_now().isoformat(timespec="seconds")
+                save_auto_pricing_config(cfg)
+                user_data.pop("pricing_admin_state", None)
+                cfg = load_auto_pricing_config()
+                await message.reply_text(
+                    pricing_panel_text(cfg, "✅ کلید نوبیتکس با موفقیت از مسیر رسمی READ تأیید و ذخیره شد."),
+                    reply_markup=pricing_panel_keyboard(cfg),
+                )
+                return
+
+            user_data.pop("pricing_admin_state", None)
+            await message.reply_text("⚠️ مرحلهٔ ثبت کلید نامعتبر بود؛ دوباره از دکمهٔ ثبت کلید نوبیتکس شروع کن.", reply_markup=pricing_panel_keyboard())
+            return
+
         if field == "provider_api_key":
             try:
                 await message.delete()
