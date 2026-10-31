@@ -1,6 +1,5 @@
 import logging
 import asyncio
-import base64
 from copy import deepcopy
 import sqlite3
 import time
@@ -2427,14 +2426,13 @@ _AUTO_PRICING_REFRESH_LOCK = None
 _PROVIDER_PRODUCTS_URL = "https://pay.tgsuperstars.com/api/partner/v1/products"
 # Free, read-only public price quote endpoint; no API key and no purchase requests are made.
 _PUBLIC_PRICE_API_BASE = "https://api-stars.duckdns.org/api/v1/prices/quote"
-_FX_DATA_URL = "https://raw.githubusercontent.com/iran-market/iran-market.github.io/main/data/popular.json"
 _PROVIDER_REFRESH_COOLDOWN_SECONDS = 1800  # Stars/Premium reference catalog: every 30 minutes.
 _PROVIDER_FORCE_REFRESH_COOLDOWN_SECONDS = 5
-_FX_REFRESH_COOLDOWN_SECONDS = 30  # Poll independent exchange feeds every 30 seconds.
-_PRICING_MAX_AGE_SECONDS = 120  # Label a quote as live only for two minutes.
+_FX_REFRESH_COOLDOWN_SECONDS = 30 * 60  # Official Nobitex public FX API: refresh every 30 minutes.
+_PRICING_MAX_AGE_SECONDS = 35 * 60  # A scheduled 30-minute quote remains fresh until the next cycle.
 # A brief exchange/API outage must not erase the last good value, but never use
 # an old FX quote for new orders after this short safety grace window.
-_PRICING_FX_MAX_AGE_SECONDS = 10 * 60
+_PRICING_FX_MAX_AGE_SECONDS = 40 * 60
 _PRICING_CATALOG_MAX_AGE_SECONDS = 24 * 3600
 
 
@@ -2442,15 +2440,6 @@ def _auto_pricing_defaults():
     return {
         "enabled": True,
         "provider_api_key": "",
-        # Nobitex API Key v2: public key + one-time private signing key (READ only).
-        "nobitex_api_public_key": "",
-        "nobitex_api_private_key": "",
-        "nobitex_api_verified_at": "",
-        # Optional administrator-supplied public FX JSON endpoint (no key needed by default).
-        "fx_custom_api_url": "",
-        "fx_custom_json_path": "auto",
-        "fx_custom_unit": "TOMAN",
-        "fx_custom_api_key": "",
         "margin_percent": "40",
         "fee_percent": "0",
         "refresh_interval_minutes": 30,
@@ -2463,8 +2452,6 @@ def _auto_pricing_defaults():
         "catalog_attempted_at": "",
         "catalog_error": "قیمت عمومی هنوز دریافت نشده است.",
         "fx_rate_toman": "",
-        "fx_rate_mode": "auto",
-        "fx_manual_rate_toman": "",
         "fx_valid": False,
         "fx_source_updated_at": "",
         "fx_source_name": "",
@@ -2497,6 +2484,12 @@ def load_auto_pricing_config():
     cfg = dict(defaults)
     if isinstance(stored, dict):
         cfg.update(stored)
+    # Discard obsolete signed Nobitex credentials from older bot versions.
+    for obsolete_key in (
+        "nobitex_api_public_key", "nobitex_api_private_key", "nobitex_api_verified_at",
+        "fx_custom_api_url", "fx_custom_json_path", "fx_custom_unit", "fx_custom_api_key",
+    ):
+        cfg.pop(obsolete_key, None)
     price_defaults = defaults["catalog_prices"]
     price_stored = cfg.get("catalog_prices")
     cfg["catalog_prices"] = dict(price_defaults, **(price_stored if isinstance(price_stored, dict) else {}))
@@ -2516,9 +2509,12 @@ def load_auto_pricing_config():
     cfg["fx_rate_toman"] = str(normalized_fx) if normalized_fx is not None else ""
     # The product owner requested a fixed 30-minute refresh; normalize legacy values.
     cfg["refresh_interval_minutes"] = 30
-    cfg["fx_rate_mode"] = "manual" if str(cfg.get("fx_rate_mode") or "auto").lower() == "manual" else "auto"
-    manual_fx = _pricing_decimal(cfg.get("fx_manual_rate_toman"))
-    cfg["fx_manual_rate_toman"] = str(manual_fx) if manual_fx else ""
+    # The store's USDT rate is API-only; older manual-rate settings are ignored.
+    legacy_pricing_keys = {
+        "nobitex_api_public_key", "nobitex_api_private_key", "nobitex_api_verified_at",
+        "fx_custom_api_url", "fx_custom_json_path", "fx_custom_unit", "fx_custom_api_key",
+    }
+    legacy_was_present = isinstance(stored, dict) and any(key in stored for key in legacy_pricing_keys)
     for name, lower, upper in (("margin_percent", Decimal("0"), Decimal("500")), ("fee_percent", Decimal("0"), Decimal("100"))):
         try:
             value = Decimal(str(cfg.get(name, "0")))
@@ -2528,7 +2524,7 @@ def load_auto_pricing_config():
         except (InvalidOperation, ValueError, TypeError):
             cfg[name] = defaults[name]
     _AUTO_PRICING_CACHE = cfg
-    if stored is None:
+    if stored is None or legacy_was_present:
         save_auto_pricing_config(cfg)
     return deepcopy(cfg)
 
@@ -2542,19 +2538,12 @@ def save_auto_pricing_config(cfg):
     catalog_prices = normalized.get("catalog_prices")
     normalized["catalog_prices"] = dict(defaults["catalog_prices"], **(catalog_prices if isinstance(catalog_prices, dict) else {}))
     normalized["provider_api_key"] = str(normalized.get("provider_api_key") or "").strip()
-    normalized["nobitex_api_public_key"] = str(normalized.get("nobitex_api_public_key") or "").strip()
-    normalized["nobitex_api_private_key"] = str(normalized.get("nobitex_api_private_key") or "").strip()
-    normalized["nobitex_api_verified_at"] = str(normalized.get("nobitex_api_verified_at") or "").strip()
-    normalized["fx_custom_api_url"] = str(normalized.get("fx_custom_api_url") or "").strip()
-    normalized["fx_custom_json_path"] = str(normalized.get("fx_custom_json_path") or "auto").strip() or "auto"
-    normalized["fx_custom_unit"] = str(normalized.get("fx_custom_unit") or "TOMAN").strip().upper()
-    if normalized["fx_custom_unit"] not in {"TOMAN", "RIAL"}:
-        normalized["fx_custom_unit"] = "TOMAN"
-    normalized["fx_custom_api_key"] = str(normalized.get("fx_custom_api_key") or "").strip()
     normalized["refresh_interval_minutes"] = 30
-    normalized["fx_rate_mode"] = "manual" if str(normalized.get("fx_rate_mode") or "auto").lower() == "manual" else "auto"
-    manual_fx = _pricing_decimal(normalized.get("fx_manual_rate_toman"))
-    normalized["fx_manual_rate_toman"] = str(manual_fx) if manual_fx else ""
+    for obsolete_key in (
+        "nobitex_api_public_key", "nobitex_api_private_key", "nobitex_api_verified_at",
+        "fx_custom_api_url", "fx_custom_json_path", "fx_custom_unit", "fx_custom_api_key",
+    ):
+        normalized.pop(obsolete_key, None)
     for name, lower, upper in (("margin_percent", Decimal("0"), Decimal("500")), ("fee_percent", Decimal("0"), Decimal("100"))):
         try:
             value = Decimal(str(normalized.get(name, "0")))
@@ -2611,16 +2600,16 @@ def _pricing_timestamp_age(value):
 
 def _effective_fx_rate(cfg=None):
     cfg = cfg or load_auto_pricing_config()
-    if str(cfg.get("fx_rate_mode") or "auto").lower() == "manual":
-        return _pricing_decimal(cfg.get("fx_manual_rate_toman"))
     return _pricing_decimal(cfg.get("fx_rate_toman"))
 
 
 def _effective_fx_is_usable(cfg=None):
     cfg = cfg or load_auto_pricing_config()
-    if str(cfg.get("fx_rate_mode") or "auto").lower() == "manual":
-        return _effective_fx_rate(cfg) is not None
-    return bool(cfg.get("fx_valid") and _pricing_timestamp_fresh(cfg.get("fx_source_updated_at"), _PRICING_FX_MAX_AGE_SECONDS) and _effective_fx_rate(cfg))
+    return bool(
+        cfg.get("fx_valid")
+        and _pricing_timestamp_fresh(cfg.get("fx_source_updated_at"), _PRICING_FX_MAX_AGE_SECONDS)
+        and _effective_fx_rate(cfg)
+    )
 
 
 def auto_pricing_ready(cfg=None):
@@ -2642,9 +2631,8 @@ def auto_pricing_quote(product_type, quantity, cfg=None, allow_stale=False):
     """Return a quote; allow_stale is only for clearly labelled display previews, never orders."""
     cfg = cfg or load_auto_pricing_config()
     fx_rate = _effective_fx_rate(cfg)
-    fx_is_manual = str(cfg.get("fx_rate_mode") or "auto").lower() == "manual"
     fx_is_fresh = _effective_fx_is_usable(cfg)
-    fx_ready = bool(cfg.get("enabled") and fx_rate and (fx_is_manual or fx_is_fresh or allow_stale))
+    fx_ready = bool(cfg.get("enabled") and fx_rate and (fx_is_fresh or allow_stale))
     if not fx_ready:
         return None
     try:
@@ -3168,54 +3156,6 @@ def _fx_source_short(value):
     return (raw.split("؛", 1)[0][:52] if raw else "منبع عمومی بازار")
 
 
-def _nobitex_api_signature_headers(public_key, private_key, method="GET", full_path="/users/profile", raw_body=""):
-    """Build the official Nobitex API-Key v2 Ed25519 signature headers."""
-    try:
-        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-    except ImportError as exc:
-        raise RuntimeError("کتابخانهٔ cryptography نصب نیست؛ دستور pip install cryptography را اجرا کن.") from exc
-
-    public_key = str(public_key or "").strip()
-    private_key = str(private_key or "").strip()
-    if not public_key or not private_key:
-        raise ValueError("کلید عمومی و خصوصی نوبیتکس هر دو لازم‌اند.")
-    try:
-        private_bytes = base64.urlsafe_b64decode(private_key + "=" * (-len(private_key) % 4))
-    except Exception as exc:
-        raise ValueError("قالب Private Key معتبر نیست؛ مقدار Base64 اصلی را وارد کن.") from exc
-    if len(private_bytes) != 32:
-        raise ValueError("طول Private Key معتبر نیست؛ کلید خصوصی اصلی Ed25519 را وارد کن.")
-
-    timestamp = str(int(time.time()))
-    method = str(method).upper()
-    payload = f"{timestamp}{method}{full_path}{raw_body}".encode("utf-8")
-    signer = Ed25519PrivateKey.from_private_bytes(private_bytes)
-    signature = base64.urlsafe_b64encode(signer.sign(payload)).decode("ascii")
-    return {
-        "Nobitex-Key": public_key,
-        "Nobitex-Signature": signature,
-        "Nobitex-Timestamp": timestamp,
-        "Accept": "application/json",
-        "User-Agent": "SEYED-PREMIUM-READONLY/1.0",
-    }
-
-
-async def _verify_nobitex_readonly_key(client, public_key, private_key):
-    """Verify a read-only key through the documented authenticated profile endpoint."""
-    path = "/users/profile"
-    headers = _nobitex_api_signature_headers(public_key, private_key, "GET", path, "")
-    response = await client.get("https://apiv2.nobitex.ir" + path, headers=headers)
-    response.raise_for_status()
-    try:
-        payload = response.json()
-    except Exception as exc:
-        raise ValueError("نوبیتکس پاسخ JSON معتبر برنگرداند.") from exc
-    if not isinstance(payload, dict) or str(payload.get("status", "")).lower() != "ok":
-        raise ValueError("نوبیتکس کلید را تأیید نکرد؛ دسترسی READ و جفت‌بودن کلیدها را بررسی کن.")
-    # Do not return or log profile contents; only the authentication result is needed.
-    return True
-
-
 def pricing_panel_text(cfg=None, note=""):
     cfg = cfg or load_auto_pricing_config()
     ready = auto_pricing_ready(cfg)
@@ -3230,30 +3170,26 @@ def pricing_panel_text(cfg=None, note=""):
     premium_terms = (cfg.get("catalog_prices") or {}).get("premium_usd") or {}
     premium_terms_text = "، ".join(f"{term}ماهه" for term in ("3", "6", "12") if _pricing_decimal(premium_terms.get(term))) or "دریافت نشده"
     premium_ready = bool(fx_ready and _premium_catalog_is_fresh(cfg) and all(_pricing_decimal(premium_terms.get(str(m))) is not None for m in (3, 6, 12)))
-    nobitex_key_ready = bool(cfg.get("nobitex_api_public_key") and cfg.get("nobitex_api_private_key") and cfg.get("nobitex_api_verified_at"))
     catalog_source = _catalog_source_names((cfg.get("catalog_prices") or {}).get("catalog_source"))
     fx_source = _fx_source_short(cfg.get("fx_source_name"))
-    usd_market_ok = bool(cfg.get("usd_market_valid") and _pricing_timestamp_fresh(cfg.get("usd_market_source_updated_at"), 3600))
-    usd_market_rate = _pricing_decimal(cfg.get("usd_market_rate_toman"))
-    usd_market_text = f"{toman(usd_market_rate)} تومان" if usd_market_ok and usd_market_rate is not None else "در دسترس نیست"
     lines = [
         "💹 قیمت‌گذاری خودکار | SEYED PREMIUM",
         "━━━━━━━━━━━━━━━━━━",
         f"⭐ استارز: {'✅ آماده' if stars_ready else '⚠️ نیازمند بررسی'}  |  💎 پرمیوم: {'✅ آماده' if premium_ready else '⚠️ نیازمند بررسی'}",
         f"⚙️ سیستم: {'روشن' if cfg.get('enabled') else 'خاموش'}",
-        f"🔐 کلید API نوبیتکس: {'✅ تأیید شده (READ)' if nobitex_key_ready else '❌ ثبت نشده'}",
+        "🔗 اتصال نرخ: API عمومی رسمی نوبیتکس | بدون API Key و Private Key",
         "━━━━━━━━━━━━━━━━━━",
         f"💱 نرخ تتر: {fx_text}  |  {fx_state}",
         f"🌐 منبع نرخ: {fx_source}",
-        f"📊 منابع نرخ: {cfg.get('fx_sources_ok', '—')} موفق / {cfg.get('fx_sources_failed', '—')} ناموفق",
-        f"💵 دلار آزاد (اطلاعاتی): {usd_market_text}",
+        f"📊 مسیرهای API نوبیتکس: {cfg.get('fx_sources_ok', '—')} موفق / {cfg.get('fx_sources_failed', '—')} ناموفق",
+        "💵 مبنای محاسبهٔ قیمت محصولات: نرخ تتر/تومان نوبیتکس",
         "━━━━━━━━━━━━━━━━━━",
         f"📦 کاتالوگ: {catalog_source}  |  {catalog_state}",
         f"🕒 آخرین دریافت کاتالوگ: {_pricing_time_text(cfg.get('catalog_updated_at'))}",
         f"💎 پلن‌های پرمیوم: {premium_terms_text}",
         f"📈 سود: {cfg.get('margin_percent')}٪  |  🧾 کارمزد: {cfg.get('fee_percent')}٪",
-        "⏱️ بروزرسانی: نرخ تتر هر ۳۰ ثانیه؛ کاتالوگ هر ۳۰ دقیقه",
-        "ℹ️ کلید نوبیتکس برای احراز اتصال READ است؛ نرخ بازار از اردربوک عمومی نوبیتکس و منابع بازار دریافت می‌شود.",
+        "⏱️ بروزرسانی: نرخ تتر از API نوبیتکس هر ۳۰ دقیقه؛ کاتالوگ قیمت هر ۳۰ دقیقه",
+        "ℹ️ منبع نرخ فقط API عمومی نوبیتکس است؛ هیچ کلید خصوصی یا دسترسی حساب استفاده نمی‌شود.",
     ]
     if fx_grace and not fx_fresh:
         lines.append("⚠️ نرخ تازه موقتاً در دسترس نیست؛ آخرین نرخ تأییدشده تا پایان مهلت اعتبار نگه داشته شده است.")
@@ -3274,34 +3210,14 @@ def pricing_panel_keyboard(cfg=None):
     cfg = cfg or load_auto_pricing_config()
     enabled_label = "⏸ توقف قیمت‌گذاری" if cfg.get("enabled") else "▶️ فعال‌کردن قیمت‌گذاری"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 دریافت/اعتبارسنجی قیمت‌ها", callback_data="admin_pricing_refresh", style="success")],
+        [InlineKeyboardButton("💱 دریافت نرخ تتر از API عمومی نوبیتکس", callback_data="admin_pricing_refresh", style="success")],
         [InlineKeyboardButton("⭐ شارژ موجودی واقعی Stars ربات (مشترک خدمات پشتیبانی‌شده)", callback_data="gift_star_topup", style="success")],
         [InlineKeyboardButton("📈 تنظیم درصد سود", callback_data="admin_pricing_margin", style="primary"),
          InlineKeyboardButton("🧾 تنظیم کارمزد", callback_data="admin_pricing_fee", style="primary")],
-        [InlineKeyboardButton("🔐 ثبت/تغییر کلید API نوبیتکس", callback_data="admin_nobitex_api_setup", style="primary"),
-         InlineKeyboardButton("🗑 حذف کلید نوبیتکس", callback_data="admin_nobitex_api_clear", style="danger")],
-        [InlineKeyboardButton("✍️ ثبت نرخ دستی تتر (تومان)", callback_data="admin_fx_manual_rate", style="primary"),
-         InlineKeyboardButton("🔄 استفاده از نرخ خودکار", callback_data="admin_fx_auto_mode", style="success")],
         [InlineKeyboardButton("💰 ورود/ویرایش دستی قیمت همهٔ خدمات", callback_data="admin_products", style="primary")],
         [InlineKeyboardButton(enabled_label, callback_data="admin_pricing_toggle", style="danger" if cfg.get("enabled") else "success")],
         [InlineKeyboardButton("⬅️ بازگشت به مدیریت قیمت‌گذاری", callback_data="admin_auto_prices", style="primary")],
     ])
-
-
-async def _finish_custom_fx_api_test(application, chat_id):
-    """Validate a newly saved optional FX API without blocking the admin message handler."""
-    try:
-        await refresh_auto_pricing(force=True, background=True)
-        cfg = load_auto_pricing_config()
-        note = "✅ بررسی API پشتیبان انجام شد؛ وضعیت منبع و نرخ را در گزارش زیر ببین." if cfg.get("fx_source_symbol") == "CUSTOM_USDT_TOMAN" else "⚠️ API ذخیره شد، اما در این چرخه نرخ معتبر از آن دریافت نشد؛ منابع دیگر همچنان فعال‌اند."
-        await application.bot.send_message(chat_id=chat_id, text=pricing_panel_text(cfg, note), reply_markup=pricing_panel_keyboard(cfg))
-    except Exception:
-        logger.exception("Optional custom FX API validation failed")
-        try:
-            cfg = load_auto_pricing_config()
-            await application.bot.send_message(chat_id=chat_id, text=pricing_panel_text(cfg, "⚠️ بررسی API پشتیبان کامل نشد؛ تنظیم ذخیره شده و منابع عمومی دیگر همچنان فعال‌اند."), reply_markup=pricing_panel_keyboard(cfg))
-        except Exception:
-            logger.exception("Could not send custom FX API validation result")
 
 
 async def _finish_admin_pricing_refresh(query, status_prefix="", context=None):
@@ -3309,10 +3225,14 @@ async def _finish_admin_pricing_refresh(query, status_prefix="", context=None):
     try:
         ready = await refresh_auto_pricing(force=True)
         cfg = load_auto_pricing_config()
-        note = (status_prefix + "\n" if status_prefix else "") + (
-            "✅ داده‌های تازه دریافت و اعتبارسنجی شدند." if ready
-            else "⚠️ همهٔ نرخ‌های لازم تازه و معتبر نیستند؛ فروش با قیمت قدیمی مجاز نمی‌شود."
-        )
+        if not cfg.get("enabled") and _effective_fx_is_usable(cfg):
+            refresh_note = "✅ نرخ عمومی تتر از API نوبیتکس دریافت و ذخیره شد؛ چون محاسبهٔ خودکار خاموش است، قیمت محصولات تغییر نکرد."
+        else:
+            refresh_note = (
+                "✅ داده‌های تازه دریافت و اعتبارسنجی شدند." if ready
+                else "⚠️ همهٔ نرخ‌های لازم تازه و معتبر نیستند؛ فروش با قیمت قدیمی مجاز نمی‌شود."
+            )
+        note = (status_prefix + "\n" if status_prefix else "") + refresh_note
         await safe_callback_edit_or_reply(query, pricing_panel_text(cfg, note), pricing_panel_keyboard(cfg))
     except asyncio.CancelledError:
         raise
@@ -3471,255 +3391,11 @@ def _merge_quote_catalog(primary, fallback):
     return result
 
 
-def _extract_iran_market_quote(payload, symbol, max_age_seconds=3600):
-    """Extract one independently timestamped quote from the Iran Market aggregation feed."""
-    if not isinstance(payload, dict):
-        raise ValueError("پاسخ منبع بازار ساختار JSON معتبر ندارد.")
-    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
-    if meta.get("stale") is True or str(meta.get("source_status", "")).lower() in {"stale", "unavailable"}:
-        raise ValueError("خوراک بازار دادهٔ قدیمی یا ناموجود اعلام کرده است.")
-    rows = payload.get("data")
-    if isinstance(rows, dict):
-        rows = list(rows.values())
-    if not isinstance(rows, list):
-        raise ValueError("فهرست قیمت‌های منبع بازار قابل‌شناسایی نیست.")
-    row = next((item for item in rows if isinstance(item, dict) and str(item.get("symbol") or "").upper() == symbol), None)
-    if row is None:
-        raise ValueError(f"نماد {symbol} در خوراک بازار پیدا نشد.")
-    if row.get("stale") is True or str(row.get("source_status", "")).lower() in {"stale", "unavailable"}:
-        raise ValueError(f"دادهٔ {symbol} قدیمی یا ناموجود اعلام شده است.")
-    rate = _pricing_decimal(row.get("price"))
-    if rate is None or rate < Decimal("1000") or rate > Decimal("100000000"):
-        raise ValueError(f"قیمت {symbol} خارج از محدودهٔ معتبر است.")
-    # In the current feed row.unit describes the asset unit ("unit"); meta.unit is the price unit.
-    price_unit = str(row.get("price_unit") or meta.get("unit") or "").strip().lower()
-    if price_unit in {"rial", "riyal", "irr", "ریال"}:
-        rate = rate / Decimal(10)
-    elif price_unit not in {"toman", "تومان", "tmn", "irt", "تومان ایران"}:
-        raise ValueError(f"واحد قیمت {symbol} مشخص نیست؛ نرخ برای جلوگیری از خطا پذیرفته نشد.")
-    source_time = (
-        row.get("timestamp") or row.get("updated_at") or row.get("last_updated")
-        or meta.get("updated_at") or meta.get("published_at") or meta.get("generated_at")
-        or payload.get("_observed_at")
-    )
-    if isinstance(source_time, (int, float)):
-        source_time = datetime.fromtimestamp(float(source_time), tz=timezone.utc).isoformat(timespec="seconds")
-    if not source_time or not _pricing_timestamp_fresh(source_time, max_age_seconds):
-        raise ValueError(f"زمان دادهٔ {symbol} موجود نیست یا از حد تازگی مجاز قدیمی‌تر است.")
-    source_name = str(row.get("source") or meta.get("source") or "Iran Market feed")
-    return rate, str(source_time), symbol, source_name
-
-
-def _extract_fx_rate_toman(payload):
-    """Compatibility parser: only accept a distinct, fresh USDT quote (never substitute USD)."""
-    rate, source_time, symbol, _source = _extract_iran_market_quote(payload, "USDT_IRR", 3600)
-    return rate, source_time, symbol
-
-
-def _extract_nerkhsanj_rate_toman(payload, series_key, max_age_seconds=3600):
-    """Parse Nerkhsanj's live rate only when its Jalali date/time proves freshness.
-
-    Nerkhsanj documents values in Toman and an empty market time as a last-close
-    snapshot. We reject an empty time instead of presenting a closed-market close
-    as a live quote.
-    """
-    if not isinstance(payload, dict) or not isinstance(payload.get("rates"), dict):
-        raise ValueError("پاسخ نرخ‌سنج ساختار JSON معتبر ندارد.")
-    raw_rate = _pricing_decimal(payload["rates"].get(series_key))
-    if raw_rate is None or raw_rate < Decimal("1000") or raw_rate > Decimal("100000000"):
-        raise ValueError(f"نرخ‌سنج قیمت معتبر برای {series_key} ارائه نکرد.")
-    date_text = str(payload.get("date") or "").strip()
-    time_text = str(payload.get("time") or "").strip()
-    if not time_text:
-        raise ValueError("بازار بسته است یا زمان زنده منتشر نشده؛ نرخ پایانی به‌عنوان نرخ لحظه‌ای پذیرفته نشد.")
-    date_match = re.fullmatch(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})", date_text)
-    time_match = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)(?::([0-5]\d))?", time_text)
-    if not date_match or not time_match:
-        raise ValueError("تاریخ شمسی یا ساعت تهران در پاسخ نرخ‌سنج معتبر نیست.")
-    local_dt = jalali_to_gregorian(*[int(part) for part in date_match.groups()])
-    second = int(time_match.group(3) or 0)
-    local_dt = local_dt.replace(
-        hour=int(time_match.group(1)), minute=int(time_match.group(2)), second=second
-    )
-    source_time = local_dt.astimezone(timezone.utc).isoformat(timespec="seconds")
-    if not _pricing_timestamp_fresh(source_time, max_age_seconds):
-        raise ValueError("نرخ‌سنج نرخ زندهٔ تازه ارائه نکرد؛ زمان بازار قدیمی است.")
-    return raw_rate, source_time, str(series_key).upper(), "Nerkhsanj (نرخ‌سنج؛ بازار آزاد تهران، تومان)"
-
-
-def _extract_nobitex_fx_rate_toman(payload, reference_rate=None):
-    """Extract Nobitex USDT/IRT and verify its Rial/Toman scale against a labelled quote.
-
-    Nobitex's market-data docs identify IRT and provide raw prices but do not
-    explicitly declare the display unit in this endpoint. We therefore do not
-    guess: compare raw and raw/10 with a separately labelled Toman quote.
-    """
-    if not isinstance(payload, dict) or str(payload.get("status", "")).lower() != "ok":
-        raise ValueError("پاسخ بازار نوبیتکس معتبر نیست.")
-    updated_ms = payload.get("lastUpdate")
-    try:
-        updated_dt = datetime.fromtimestamp(float(updated_ms) / 1000.0, tz=timezone.utc)
-    except (TypeError, ValueError, OverflowError, OSError):
-        raise ValueError("زمان به‌روزرسانی بازار نوبیتکس موجود نیست.")
-    updated_at = updated_dt.isoformat(timespec="seconds")
-    if not _pricing_timestamp_fresh(updated_at, 300):
-        raise ValueError("دادهٔ بازار نوبیتکس بیش از ۵ دقیقه قدیمی است.")
-    raw_rate = _pricing_decimal(payload.get("lastTradePrice"))
-    if raw_rate is None:
-        bids, asks = payload.get("bids") or [], payload.get("asks") or []
-        bid = _pricing_decimal(bids[0][0]) if bids and isinstance(bids[0], (list, tuple)) and bids[0] else None
-        ask = _pricing_decimal(asks[0][0]) if asks and isinstance(asks[0], (list, tuple)) and asks[0] else None
-        if bid is not None and ask is not None and bid <= ask:
-            raw_rate = (bid + ask) / Decimal(2)
-    if raw_rate is None or raw_rate < Decimal("1000") or raw_rate > Decimal("100000000"):
-        raise ValueError("قیمت خام USDT در بازار نوبیتکس معتبر نیست.")
-    reference = _pricing_decimal(reference_rate)
-    if reference is None:
-        raise ValueError("واحد قیمت نوبیتکس بدون نرخ مرجعِ مشخص‌شده قابل‌تأیید نیست.")
-    candidates = ((raw_rate, "واحد خام با مرجع تطبیق داشت"), (raw_rate / Decimal(10), "تبدیل ریال به تومان (تقسیم بر ۱۰)"))
-    ranked = sorted(
-        ((abs(candidate - reference) / reference, candidate, label) for candidate, label in candidates),
-        key=lambda item: item[0],
-    )
-    if not ranked or ranked[0][0] > Decimal("0.03"):
-        raise ValueError("مقیاس ریال/تومان نرخ نوبیتکس با منبع مرجع هم‌خوانی ندارد؛ نرخ مستقیم پذیرفته نشد.")
-    _difference, normalized_rate, unit_note = ranked[0]
-    return normalized_rate, updated_at, "USDTIRT", unit_note
-
-
-async def _fetch_arzdigital_tether_quote(client):
-    """Try both ArzDigital's converter and Tether coin page for a labelled Toman quote.
-
-    These are public HTML pages, not documented JSON endpoints. The response
-    observation time is recorded separately from any publisher timestamp.
-    """
-    import html as _html
-
-    urls = (
-        "https://arzdigital.com/convert/tether/ir-toman/",
-        "https://arzdigital.com/coins/tether/",
-    )
-    errors = []
-
-    def parse_toman_number(raw):
-        try:
-            value = Decimal(str(raw).replace(",", "").replace("٬", "").replace("٫", ".").strip())
-        except (InvalidOperation, TypeError, ValueError):
-            return None
-        return value if Decimal("1000") <= value <= Decimal("100000000") else None
-
-    for url in urls:
-        try:
-            response = await client.get(
-                url,
-                headers={
-                    "Accept": "text/html,application/xhtml+xml",
-                    "User-Agent": "Mozilla/5.0 (compatible; SEYED-PREMIUM-FX/4.1)",
-                    "Cache-Control": "no-cache, no-store, max-age=0",
-                    "Pragma": "no-cache",
-                },
-            )
-            response.raise_for_status()
-            cache_age = response.headers.get("Age")
-            if cache_age:
-                try:
-                    if int(cache_age) > 900:
-                        raise ValueError("پاسخ کش‌شدهٔ ارزدیجیتال بیش از ۱۵ دقیقه عمر دارد.")
-                except ValueError as exc:
-                    if "عمر دارد" in str(exc):
-                        raise
-            page = _html.unescape(response.text)
-            text_value = re.sub(r"<[^>]+>", " ", page)
-            text_value = re.sub(r"\s+", " ", normalize_ascii_digits(text_value))
-
-            rate = None
-            # ArzDigital's converter/coin pages use this explicit label.
-            markers = (
-                "قیمت امروز USDT به تومان",
-                "قیمت لحظه ای تتر",
-                "قیمت لحظه‌ای تتر",
-                "قیمت لحظه ای USDT",
-                "قیمت لحظه‌ای USDT",
-                "قیمت تتر به تومان",
-            )
-            for marker in markers:
-                pos = text_value.find(marker)
-                if pos < 0:
-                    continue
-                section = text_value[pos + len(marker):pos + len(marker) + 220]
-                for match in re.finditer(r"(?<![\w.])([0-9][0-9,٬]*(?:\.[0-9]+)?)", section):
-                    tail = section[match.end():match.end() + 8]
-                    if "%" in tail:
-                        continue
-                    rate = parse_toman_number(match.group(1))
-                    if rate is not None:
-                        break
-                if rate is not None:
-                    break
-
-            # Text-layout fallback for the coin page if its heading changes.
-            if rate is None:
-                patterns = (
-                    r"(?:قیمت\s*(?:امروز|لحظه.?ای)?\s*(?:USDT|تتر)|(?:USDT|تتر)\s*به\s*تومان)\s*[:：\-]?\s*([0-9][0-9,٬]*)\s*(?:تومان|IRT|ت)?",
-                    r"1\s*USDT\s*(?:\||:)\s*([0-9][0-9,٬]*)\s*IRT",
-                )
-                for pattern in patterns:
-                    match = re.search(pattern, text_value, re.IGNORECASE)
-                    if match:
-                        rate = parse_toman_number(match.group(1))
-                        if rate is not None:
-                            break
-            if rate is None:
-                raise ValueError("نرخ تتر با برچسب معتبر از این صفحه استخراج نشد.")
-
-            observed_at = utc_now().isoformat(timespec="seconds")
-            page_name = "مبدل تتر به تومان" if "/convert/" in url else "صفحهٔ ارز تتر"
-            return {
-                "rate": rate,
-                "updated_at": observed_at,
-                "observed_at": observed_at,
-                "symbol": "ARZDIGITAL_USDT_IRT",
-                "source": f"ارزدیجیتال ({page_name}؛ زمان دریافت صفحه، نه زمان انتشار نرخ)",
-            }
-        except Exception as exc:
-            errors.append(f"{url}: {type(exc).__name__}: {str(exc)[:100]}")
-    raise RuntimeError("هر دو صفحهٔ ارزدیجیتال ناموفق بودند: " + " | ".join(errors))
-
-
-def _fx_custom_api_url_is_safe(url):
-    """Accept only public HTTPS JSON endpoints; block local/private-network URLs."""
-    try:
-        parsed = urlsplit(str(url).strip())
-        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
-            return False
-        host = parsed.hostname.rstrip(".").lower()
-        if host in {"localhost", "localhost.localdomain"} or ".local" in host:
-            return False
-        # Keep secrets out of query strings: HTTP errors can echo full request URLs
-        # into logs/admin status. Enter credentials in the dedicated key field.
-        sensitive_query_names = {"key", "api_key", "apikey", "token", "access_token", "secret", "authorization"}
-        if any(str(name).lower() in sensitive_query_names for name, _value in parse_qsl(parsed.query, keep_blank_values=True)):
-            return False
-        try:
-            address = ipaddress.ip_address(host)
-            if not address.is_global:
-                return False
-        except ValueError:
-            if "." not in host:
-                return False
-        return len(str(url)) <= 500
-    except Exception:
-        return False
-
-
 async def _fetch_live_fx_bundle(client):
-    """Get USDT/Toman from multiple independent public markets.
+    """Get the USDT/Toman rate only from Nobitex's documented public REST API.
 
-    A source is accepted on its own when it returns a plausible value in a
-    documented Toman market with a recent trade/order book. Sources are not
-    required to all be online. ArzDigital is treated as an observed page quote
-    because it has no documented publisher timestamp. When several sources
-    agree, use their median; when they disagree, use a direct exchange first.
+    The order book is primary; the public market-stats endpoint is a fallback.
+    Neither endpoint requires an API token, API Key, or Private Key.
     """
     request_headers = {
         "Accept": "application/json",
@@ -3758,220 +3434,8 @@ async def _fetch_live_fx_bundle(client):
             "source": str(source) + (f"؛ {note}" if note else ""),
         }
 
-    async def fetch_wallex():
-        payload = await get_json("https://api.wallex.ir/v1/markets", "Wallex")
-        if not isinstance(payload, dict) or payload.get("success") is False:
-            raise ValueError("پاسخ بازارهای والکس معتبر نیست.")
-        symbols = ((payload.get("result") or {}).get("symbols") or {})
-        if not isinstance(symbols, dict):
-            raise ValueError("فهرست بازارهای والکس پیدا نشد.")
-        market = symbols.get("USDTTMN") or symbols.get("USDTIRT")
-        symbol = "USDTTMN" if symbols.get("USDTTMN") else "USDTIRT"
-        if not isinstance(market, dict):
-            for key, item in symbols.items():
-                if not isinstance(item, dict):
-                    continue
-                base = str(item.get("baseAsset") or "").upper()
-                quote = str(item.get("quoteAsset") or "").upper()
-                if base == "USDT" and quote in {"TMN", "IRT", "TOMAN"}:
-                    market, symbol = item, str(key)
-                    break
-        if not isinstance(market, dict):
-            raise ValueError("بازار تتر به تومان در والکس موجود نیست.")
-        quote_asset = str(market.get("quoteAsset") or "").upper()
-        if quote_asset and quote_asset not in {"TMN", "IRT", "TOMAN"}:
-            raise ValueError(f"واحد بازار والکس تومان نیست: {quote_asset}")
-        stats = market.get("stats") if isinstance(market.get("stats"), dict) else {}
-        bid = _pricing_decimal(stats.get("bidPrice"))
-        ask = _pricing_decimal(stats.get("askPrice"))
-        last = _pricing_decimal(stats.get("lastPrice"))
-        if bid is not None and ask is not None and ask >= bid:
-            spread = (ask - bid) / ((ask + bid) / Decimal(2))
-            if spread > Decimal("0.08"):
-                raise ValueError("فاصلهٔ خرید و فروش بازار والکس غیرعادی است.")
-            rate = (bid + ask) / Decimal(2)
-            note = "میانگین بهترین سفارش خرید و فروش؛ واحد بازار تومان"
-        elif last is not None:
-            rate = last
-            note = "آخرین معامله؛ واحد بازار تومان"
-        else:
-            raise ValueError("قیمت خرید/فروش یا آخرین معاملهٔ والکس موجود نیست.")
-        return quote_record(rate, "Wallex (بازار عمومی USDT/TMN)", symbol, payload.get("_observed_at"), note)
-
-    async def fetch_tabdeal_trade():
-        last_error = None
-        for params in ({"symbol": "USDTIRT", "limit": 1}, {"tabdealSymbol": "USDT_IRT", "limit": 1}):
-            try:
-                payload = await get_json("https://api1.tabdeal.org/r/api/v1/trades", "Tabdeal", params=params)
-                rows = payload if isinstance(payload, list) else (payload.get("data") or payload.get("trades") or [])
-                if not rows or not isinstance(rows[0], dict):
-                    raise ValueError("معاملهٔ تازهٔ تتر در تبدیل پیدا نشد.")
-                row = rows[0]
-                rate = _pricing_decimal(row.get("price"))
-                raw_time = row.get("time") or row.get("timestamp")
-                try:
-                    timestamp = float(raw_time)
-                    if timestamp > 10_000_000_000:
-                        timestamp /= 1000.0
-                    source_time = datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat(timespec="seconds")
-                except (TypeError, ValueError, OverflowError, OSError):
-                    raise ValueError("زمان آخرین معاملهٔ تبدیل موجود نیست.")
-                if not _pricing_timestamp_fresh(source_time, 15 * 60):
-                    raise ValueError("آخرین معاملهٔ تبدیل قدیمی‌تر از ۱۵ دقیقه است.")
-                return quote_record(rate, "Tabdeal (آخرین معاملهٔ بازار USDT/IRT؛ واحد تومان)", "USDTIRT", source_time)
-            except Exception as exc:
-                last_error = exc
-        raise last_error or ValueError("بازار تتر تبدیل در دسترس نیست.")
-
-    async def fetch_tabdeal_depth():
-        last_error = None
-        for params in ({"symbol": "USDTIRT", "limit": 5}, {"tabdealSymbol": "USDT_IRT", "limit": 5}):
-            try:
-                payload = await get_json("https://api1.tabdeal.org/r/api/v1/depth", "Tabdeal", params=params)
-                bids = payload.get("bids") if isinstance(payload, dict) else None
-                asks = payload.get("asks") if isinstance(payload, dict) else None
-                bid = _pricing_decimal(bids[0][0]) if bids and isinstance(bids[0], (list, tuple)) and bids[0] else None
-                ask = _pricing_decimal(asks[0][0]) if asks and isinstance(asks[0], (list, tuple)) and asks[0] else None
-                if bid is None or ask is None or ask < bid:
-                    raise ValueError("دفتر سفارش تبدیل قیمت خرید/فروش معتبر ندارد.")
-                spread = (ask - bid) / ((ask + bid) / Decimal(2))
-                if spread > Decimal("0.08"):
-                    raise ValueError("فاصلهٔ سفارش‌های بازار تبدیل غیرعادی است.")
-                return quote_record((bid + ask) / Decimal(2), "Tabdeal (دفتر سفارش زندهٔ USDT/IRT؛ واحد تومان)", "USDTIRT", payload.get("_observed_at"), "میانگین بهترین خرید و فروش")
-            except Exception as exc:
-                last_error = exc
-        raise last_error or ValueError("دفتر سفارش تبدیل در دسترس نیست.")
-
-    async def fetch_exir():
-        """Read Exir's public USDT/IRT market; use its official IRT quote unit and timestamp."""
-        constants = await get_json("https://api.exir.io/v2/constants", "Exir market constants")
-        pairs = constants.get("pairs") if isinstance(constants, dict) else None
-        if not isinstance(pairs, dict):
-            raise ValueError("فهرست جفت‌ارزهای عمومی اکسیر دریافت نشد.")
-        pair_symbol = None
-        for key, item in pairs.items():
-            if not isinstance(item, dict):
-                continue
-            base = str(item.get("pair_base") or "").lower()
-            quote = str(item.get("pair_2") or "").lower()
-            active = item.get("active", True) is not False
-            public = item.get("is_public", True) is not False
-            if base == "usdt" and quote in {"irt", "tmn", "toman"} and active and public:
-                pair_symbol = str(item.get("name") or key).lower()
-                break
-        if not pair_symbol:
-            raise ValueError("اکسیر در فهرست عمومی خود بازار USDT/IRT فعال و عمومی اعلام نکرد.")
-        book = await get_json("https://api.exir.io/v2/orderbook", "Exir USDT/IRT orderbook", params={"symbol": pair_symbol})
-        row = book.get(pair_symbol) if isinstance(book, dict) and isinstance(book.get(pair_symbol), dict) else book
-        if not isinstance(row, dict):
-            raise ValueError("دفتر سفارش اکسیر ساختار معتبر ندارد.")
-        bids, asks = row.get("bids") or [], row.get("asks") or []
-        bid = _pricing_decimal(bids[0][0]) if bids and isinstance(bids[0], (list, tuple)) and bids[0] else None
-        ask = _pricing_decimal(asks[0][0]) if asks and isinstance(asks[0], (list, tuple)) and asks[0] else None
-        if bid is None or ask is None or ask < bid:
-            raise ValueError("دفتر سفارش اکسیر قیمت خرید/فروش معتبر ندارد.")
-        spread = (ask - bid) / ((ask + bid) / Decimal(2))
-        if spread > Decimal("0.08"):
-            raise ValueError("فاصلهٔ خرید و فروش اکسیر غیرعادی است.")
-        raw_time = row.get("timestamp")
-        if not raw_time and isinstance(book, dict):
-            raw_time = book.get("timestamp")
-        if raw_time is None:
-            raise ValueError("زمان آخرین به‌روزرسانی دفتر سفارش اکسیر موجود نیست.")
-        source_time = str(raw_time)
-        if isinstance(raw_time, (int, float)):
-            ts = float(raw_time) / (1000.0 if float(raw_time) > 10_000_000_000 else 1.0)
-            source_time = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(timespec="seconds")
-        if not _pricing_timestamp_fresh(source_time, 180):
-            raise ValueError("دفتر سفارش اکسیر بیش از ۳ دقیقه قدیمی است.")
-        return quote_record((bid + ask) / Decimal(2), f"Exir ({pair_symbol.upper()}؛ واحد بومی IRT/تومان)", pair_symbol.upper(), source_time)
-
-    async def fetch_custom_api():
-        """Optional admin-configured JSON FX source. No key is required unless its API needs one."""
-        cfg_now = load_auto_pricing_config()
-        url = str(cfg_now.get("fx_custom_api_url") or "").strip()
-        if not url:
-            raise ValueError("API پشتیبان مدیر تنظیم نشده است.")
-        if not _fx_custom_api_url_is_safe(url):
-            raise ValueError("آدرس API پشتیبان باید HTTPS عمومی و معتبر باشد.")
-        headers = {"Accept": "application/json"}
-        secret = str(cfg_now.get("fx_custom_api_key") or "").strip()
-        if secret:
-            headers["Authorization"] = "Bearer " + secret
-            headers["X-API-KEY"] = secret
-        payload = await get_json(url, "Custom FX API", extra_headers=headers, follow_redirects=False)
-        if not isinstance(payload, dict):
-            raise ValueError("پاسخ API سفارشی باید JSON object باشد.")
-
-        path = str(cfg_now.get("fx_custom_json_path") or "auto").strip()
-        raw_rate = None
-        def walk_objects(node):
-            if isinstance(node, dict):
-                yield node
-                for child in node.values():
-                    yield from walk_objects(child)
-            elif isinstance(node, list):
-                for child in node:
-                    yield from walk_objects(child)
-        if path.lower() != "auto":
-            current = payload
-            for part in path.split("."):
-                if isinstance(current, dict):
-                    current = current.get(part)
-                elif isinstance(current, list) and part.isdigit() and int(part) < len(current):
-                    current = current[int(part)]
-                else:
-                    current = None
-                    break
-            raw_rate = _pricing_decimal(current)
-        else:
-            preferred = ("price", "rate", "lastPrice", "last_price", "last", "close", "toman", "usdt_irt", "usdtirt", "USDT_IRT")
-            for key in preferred:
-                for obj in walk_objects(payload):
-                    value = obj.get(key) if isinstance(obj, dict) else None
-                    parsed = _pricing_decimal(value)
-                    if parsed is not None:
-                        raw_rate = parsed
-                        break
-                if raw_rate is not None:
-                    break
-        if raw_rate is None:
-            raise ValueError("قیمت در API پشتیبان پیدا نشد؛ مسیر JSON را در تنظیمات مشخص کن.")
-        unit = str(cfg_now.get("fx_custom_unit") or "TOMAN").upper()
-        if unit == "RIAL":
-            raw_rate = raw_rate / Decimal(10)
-        elif unit != "TOMAN":
-            raise ValueError("واحد API پشتیبان باید TOMAN یا RIAL باشد.")
-
-        raw_time = None
-        time_keys = {"timestamp", "updated_at", "updatedAt", "lastUpdate", "time", "datetime", "date", "serverTime"}
-        for obj in walk_objects(payload):
-            if isinstance(obj, dict):
-                for key in time_keys:
-                    if obj.get(key) not in (None, ""):
-                        raw_time = obj.get(key)
-                        break
-            if raw_time is not None:
-                break
-        source_time = None
-        if isinstance(raw_time, (int, float)) or (isinstance(raw_time, str) and raw_time.strip().isdigit()):
-            number = float(raw_time)
-            if number > 10_000_000_000:
-                number /= 1000.0
-            source_time = datetime.fromtimestamp(number, tz=timezone.utc).isoformat(timespec="seconds")
-        elif raw_time:
-            parsed_time = _pricing_time(raw_time)
-            if parsed_time:
-                source_time = parsed_time.isoformat(timespec="seconds")
-            else:
-                raise ValueError("قالب زمان در API پشتیبان معتبر نیست.")
-        observed = utc_now().isoformat(timespec="seconds")
-        note = "زمان دادهٔ خود API" if source_time else "زمان مشاهدهٔ پاسخ؛ API زمان انتشار نداده است"
-        return quote_record(raw_rate, "API پشتیبان مدیر", "CUSTOM_USDT_TOMAN", source_time or observed, note)
-
     async def fetch_nobitex_orderbook():
-        # Official Nobitex docs classify this orderbook as public/no-token; API Key v2
-        # is validated separately against /users/profile with signed READ headers.
+        # Official Nobitex public orderbook endpoint; no token or signature is required.
         payload = await get_json("https://apiv2.nobitex.ir/v3/orderbook/USDTIRT", "Nobitex orderbook")
         if not isinstance(payload, dict) or str(payload.get("status", "")).lower() != "ok":
             raise ValueError("پاسخ دفتر سفارش نوبیتکس معتبر نیست.")
@@ -3989,8 +3453,9 @@ async def _fetch_live_fx_bundle(client):
         spread = (ask - bid) / ((ask + bid) / Decimal(2))
         if spread > Decimal("0.08"):
             raise ValueError("فاصلهٔ دفتر سفارش نوبیتکس غیرعادی است.")
-        # The official Nobitex docs show USDTIRT order-book prices in Toman.
-        return quote_record((bid + ask) / Decimal(2), "Nobitex (دفتر سفارش USDTIRT؛ تومان)", "USDTIRT", source_time)
+        # Nobitex API prices for IRT/RLS markets are returned in Rials.
+        # Normalize to Toman before the central pricing engine consumes the quote.
+        return quote_record(((bid + ask) / Decimal(2)) / Decimal(10), "Nobitex (دفتر سفارش USDTIRT؛ ریال ÷ ۱۰ = تومان)", "USDTIRT", source_time)
 
     async def fetch_nobitex_stats():
         payload = await get_json(
@@ -4016,160 +3481,43 @@ async def _fetch_live_fx_bundle(client):
             raise ValueError("قیمت خرید/فروش یا آخرین معاملهٔ نوبیتکس موجود نیست.")
         return quote_record(rial_rate / Decimal(10), "Nobitex (آمار بازار USDT/RLS)", "USDT-RLS", payload.get("_observed_at"), note)
 
-    async def fetch_iran_market():
-        payload = await get_json(_FX_DATA_URL, "Iran Market")
-        rate, source_time, symbol, source = _extract_iran_market_quote(payload, "USDT_IRR", 45 * 60)
-        return quote_record(rate, f"Iran Market ({source}; واحد تومان)", symbol, source_time)
+    # Only official Nobitex public REST endpoints are permitted to supply the FX rate.
+    # Call the market-stats endpoint only when the primary order book is unavailable.
+    errors = []
+    selected = None
+    try:
+        selected = await fetch_nobitex_orderbook()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        errors.append(f"Nobitex orderbook API: {type(exc).__name__}: {str(exc)[:130]}")
+        logger.warning("Nobitex public orderbook unavailable; trying official public stats fallback: %s", exc)
 
-    async def fetch_nerkh_usdt():
-        payload = await get_json("https://nerkh.jahankhahan.shop/data/live.json", "Nerkhsanj")
-        rate, source_time, symbol, source = _extract_nerkhsanj_rate_toman(payload, "tether", 15 * 60)
-        return quote_record(rate, source, symbol, source_time)
-
-    async def safe_source(label, coroutine):
+    if selected is None:
         try:
-            return await coroutine
+            selected = await fetch_nobitex_stats()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.warning("USDT/Toman source %s unavailable: %s", label, exc)
-            return exc
+            errors.append(f"Nobitex market-stats API: {type(exc).__name__}: {str(exc)[:130]}")
+            logger.warning("Nobitex public market-stats fallback unavailable: %s", exc)
 
-    source_specs = [
-        ("Wallex", fetch_wallex()),
-        ("Tabdeal trade", fetch_tabdeal_trade()),
-        ("Tabdeal orderbook", fetch_tabdeal_depth()),
-        ("Exir", fetch_exir()),
-        ("Nobitex orderbook", fetch_nobitex_orderbook()),
-        ("Nobitex stats", fetch_nobitex_stats()),
-        ("Iran Market", fetch_iran_market()),
-        ("Nerkhsanj", fetch_nerkh_usdt()),
-        ("ArzDigital", _fetch_arzdigital_tether_quote(client)),
-    ]
-    if str(load_auto_pricing_config().get("fx_custom_api_url") or "").strip():
-        source_specs.append(("Custom FX API", fetch_custom_api()))
-    source_results = await asyncio.gather(
-        *(safe_source(label, task) for label, task in source_specs),
-        return_exceptions=True,
-    )
-
-    candidates = []
-    errors = []
-    for (label, _task), result in zip(source_specs, source_results):
-        if isinstance(result, dict):
-            try:
-                candidates.append(quote_record(
-                    result.get("rate"), result.get("source") or label,
-                    result.get("symbol") or label, result.get("updated_at") or result.get("observed_at"),
-                ))
-            except Exception as exc:
-                errors.append(f"{label}: {type(exc).__name__}: {str(exc)[:130]}")
-        elif isinstance(result, BaseException):
-            if isinstance(result, asyncio.CancelledError):
-                raise result
-            errors.append(f"{label}: {type(result).__name__}: {str(result)[:130]}")
-
-    if not candidates:
-        raise RuntimeError("هیچ‌یک از منابع مستقل نرخ زندهٔ تتر را ارائه نکردند. " + " | ".join(errors[:8]))
-
-    # Avoid overweighting an exchange just because both its trades and orderbook
-    # endpoints responded. Each independent venue gets one vote in the median.
-    def venue_key(item):
-        source = str(item.get("source") or "").lower()
-        if "wallex" in source:
-            return "wallex"
-        if "tabdeal" in source:
-            return "tabdeal"
-        if "nobitex" in source:
-            return "nobitex"
-        if "exir" in source or "اکسیر" in source:
-            return "exir"
-        if "api پشتیبان مدیر" in source or "custom fx api" in source:
-            return "custom-api"
-        if "arzdigital" in source or "ارزدیجیتال" in source:
-            return "arzdigital"
-        if "iran market" in source:
-            return "iran-market"
-        if "nerkh" in source or "نرخ" in source:
-            return "nerkh"
-        return source or str(item.get("symbol") or "unknown")
-
-    def endpoint_priority(item):
-        source = str(item.get("source") or "").lower()
-        if "tabdeal" in source:
-            return 0 if "دفتر سفارش" in source else 1
-        if "nobitex" in source:
-            return 0 if "دفتر سفارش" in source else 1
-        return 0
-
-    one_per_venue = {}
-    for item in candidates:
-        key = venue_key(item)
-        existing = one_per_venue.get(key)
-        if existing is None or endpoint_priority(item) < endpoint_priority(existing):
-            one_per_venue[key] = item
-    candidates = list(one_per_venue.values())
-
-    # Prefer a central estimate when sources agree. A single healthy source is
-    # sufficient; a disagreement does not take the shop offline.
-    ordered_rates = sorted(item["rate"] for item in candidates)
-    middle = len(ordered_rates) // 2
-    if len(ordered_rates) % 2:
-        center = ordered_rates[middle]
-    else:
-        center = (ordered_rates[middle - 1] + ordered_rates[middle]) / Decimal(2)
-    close = [item for item in candidates if abs(item["rate"] - center) / center <= Decimal("0.05")]
-    if len(close) >= 2:
-        close_rates = sorted(item["rate"] for item in close)
-        idx = len(close_rates) // 2
-        selected_rate = close_rates[idx] if len(close_rates) % 2 else (close_rates[idx - 1] + close_rates[idx]) / Decimal(2)
-        selected_items = close
-        source_label = "میانهٔ منابع هم‌خوان: " + " + ".join(dict.fromkeys(item["source"].split("؛")[0] for item in close))
-        symbol_label = "+".join(dict.fromkeys(item["symbol"] for item in close))
-        newest = min(close, key=lambda item: _pricing_timestamp_age(item["updated_at"]) if _pricing_timestamp_age(item["updated_at"]) is not None else 10**12)
-        updated_at = newest["updated_at"]
-    else:
-        priority = ("Wallex", "Tabdeal", "Exir", "Nobitex", "API پشتیبان مدیر", "ارزدیجیتال", "ArzDigital", "Iran Market", "Nerkhsanj")
-        def rank(item):
-            source = (str(item.get("source") or "")).lower()
-            for number, name in enumerate(priority):
-                if name.lower() in source:
-                    return number
-            return len(priority)
-        chosen = min(candidates, key=rank)
-        selected_rate = chosen["rate"]
-        selected_items = [chosen]
-        source_label = chosen["source"]
-        symbol_label = chosen["symbol"]
-        updated_at = chosen["updated_at"]
-        if len(candidates) > 1:
-            logger.warning("USDT/Toman sources disagreed by more than 5%%; selected %s and kept pricing online", source_label)
+    if selected is None:
+        raise RuntimeError("API عمومی نوبیتکس نرخ معتبر تتر برنگرداند. " + " | ".join(errors[:4]))
 
     tether = {
-        "rate": selected_rate,
-        "updated_at": updated_at,
-        "symbol": symbol_label,
-        "source": source_label + " (همهٔ نرخ‌ها به تومان؛ زمان منبع یا زمان مشاهدهٔ پاسخ)",
-        "sources_ok": len(candidates),
+        "rate": selected["rate"],
+        "updated_at": selected["updated_at"],
+        "symbol": selected["symbol"],
+        "source": selected["source"] + " (API عمومی نوبیتکس؛ تومان)",
+        "sources_ok": 1,
         "sources_failed": len(errors),
     }
 
-    # Keep USD/IRR informational only. It never participates in USDT calculations.
+    # The shop uses the verified USDT/IRT quote as its single FX base.
+    # A separate free-market USD quote is not mixed into this API-only mode.
     usd_market = None
-    usd_error = "نرخ مستقل دلار آزاد در این چرخه دریافت نشد."
-    try:
-        market_payload = await get_json(_FX_DATA_URL, "Iran Market USD")
-        usd_rate, usd_time, usd_symbol, usd_source = _extract_iran_market_quote(
-            market_payload, "USD_IRR_FREE", 60 * 60
-        )
-        usd_market = {
-            "rate": usd_rate, "updated_at": usd_time,
-            "symbol": usd_symbol, "source": f"{usd_source} (دلار بازار آزاد؛ تومان)",
-        }
-        usd_error = ""
-    except Exception as exc:
-        usd_error = f"Iran Market USD: {type(exc).__name__}: {str(exc)[:160]}"
-
+    usd_error = "نرخ مستقل دلار آزاد در مسیر API انتخاب‌شده استفاده نمی‌شود؛ مبنای قیمت‌گذاری نرخ USDT/IRT نوبیتکس است."
     return tether, usd_market, usd_error
 
 
@@ -4180,7 +3528,7 @@ async def _fetch_live_fx_toman(client):
 
 
 async def refresh_auto_pricing(force=False, background=False):
-    """Refresh live sources; interactive paths stay cache-only, scheduler/admin refresh does network I/O."""
+    """Refresh the Nobitex public FX API and product reference catalog."""
     global _AUTO_PRICING_REFRESH_LOCK
     if not force and not background:
         # Customer/admin navigation and checkout callbacks only read the last
@@ -4190,7 +3538,10 @@ async def refresh_auto_pricing(force=False, background=False):
         _AUTO_PRICING_REFRESH_LOCK = asyncio.Lock()
     async with _AUTO_PRICING_REFRESH_LOCK:
         cfg = load_auto_pricing_config()
-        if not cfg.get("enabled"):
+        # A manual admin refresh may still fetch and display the public exchange
+        # rate while automatic price calculation is paused. Background polling
+        # remains disabled until the admin re-enables automatic pricing.
+        if not cfg.get("enabled") and not force:
             return False
         now_iso = utc_now().isoformat(timespec="seconds")
         api_key = str(cfg.get("provider_api_key") or "").strip()
@@ -4200,7 +3551,7 @@ async def refresh_auto_pricing(force=False, background=False):
         force_allowed = bool(force) and (catalog_age is None or catalog_age >= _PROVIDER_FORCE_REFRESH_COOLDOWN_SECONDS
                                          or fx_age is None or fx_age >= _PROVIDER_FORCE_REFRESH_COOLDOWN_SECONDS)
         catalog_due = catalog_age is None or catalog_age >= _PROVIDER_REFRESH_COOLDOWN_SECONDS or force_allowed
-        fx_due = (str(cfg.get("fx_rate_mode") or "auto").lower() != "manual") and (fx_age is None or fx_age >= _FX_REFRESH_COOLDOWN_SECONDS or force_allowed)
+        fx_due = fx_age is None or fx_age >= _FX_REFRESH_COOLDOWN_SECONDS or force_allowed
 
         if catalog_due:
             cfg["catalog_attempted_at"] = now_iso
@@ -4312,14 +3663,14 @@ async def refresh_auto_pricing(force=False, background=False):
                 if isinstance(result, asyncio.CancelledError):
                     raise result
                 if isinstance(result, BaseException):
-                    logger.error("All live FX sources failed", exc_info=(type(result), result, result.__traceback__))
+                    logger.error("Nobitex public FX API failed", exc_info=(type(result), result, result.__traceback__))
                     # Keep the last confirmed quote during a bounded outage grace period.
                     # auto_pricing_ready() independently expires it after the grace window.
                     if not (cfg.get("fx_valid") and _pricing_timestamp_fresh(cfg.get("fx_source_updated_at"), _PRICING_FX_MAX_AGE_SECONDS) and _pricing_decimal(cfg.get("fx_rate_toman"))):
                         cfg["fx_valid"] = False
                     cfg["fx_error"] = str(result)[:500] or f"دریافت نرخ تتر ناموفق بود ({type(result).__name__})."
-                    # Retry failed FX feeds on the next 30-second polling cycle.
-                    cfg["fx_attempted_at"] = now_iso
+                    # Retry a failed FX fetch in about five minutes, without hammering the API.
+                    cfg["fx_attempted_at"] = (utc_now() - timedelta(minutes=25)).isoformat(timespec="seconds")
                 else:
                     tether, usd_market, usd_error = result
                     cfg["fx_rate_toman"] = str(tether["rate"])
@@ -4358,9 +3709,8 @@ async def refresh_auto_pricing(force=False, background=False):
         if str(latest_cfg.get("provider_api_key") or "").strip() == api_key:
             for key in catalog_fields:
                 latest_cfg[key] = cfg.get(key)
-        if str(latest_cfg.get("fx_rate_mode") or "auto").lower() != "manual":
-            for key in fx_fields:
-                latest_cfg[key] = cfg.get(key)
+        for key in fx_fields:
+            latest_cfg[key] = cfg.get(key)
         latest_cfg["refresh_interval_minutes"] = 30
         save_auto_pricing_config(latest_cfg)
         cfg = load_auto_pricing_config()
@@ -4379,7 +3729,7 @@ async def refresh_auto_pricing(force=False, background=False):
 
 
 async def auto_pricing_refresh_loop(application):
-    """Run FX failover continuously (30s) and refresh Star/Premium catalog every 30m."""
+    """Refresh the Nobitex public FX API every 30m and the product catalog every 30m."""
     while True:
         try:
             await refresh_auto_pricing(force=False, background=True)
@@ -9135,84 +8485,22 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(pricing_panel_text(), reply_markup=pricing_panel_keyboard())
             return
 
-        if data == "admin_nobitex_api_setup":
-            context.user_data["pricing_admin_state"] = {"field": "nobitex_api_setup", "step": "public"}
-            await query.edit_message_text(
-                "🔐 اتصال API نوبیتکس | فقط READ\n\n"
-                "ابتدا کلید عمومی API (Nobitex-Key) را بفرست. سپس Private Key را جداگانه می‌پرسم.\n"
-                "در پنل نوبیتکس دسترسی کلید را فقط روی READ بگذار؛ TRADE و WITHDRAW لازم نیست.\n"
-                "کلیدها در پیام خصوصی ربات دریافت و پیام‌ها حذف می‌شوند. برای لغو /cancel را بفرست.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="admin_auto_pricing", style="danger")]]),
-            )
-            return
-
-        if data == "admin_nobitex_api_clear":
-            cfg = load_auto_pricing_config()
-            cfg["nobitex_api_public_key"] = ""
-            cfg["nobitex_api_private_key"] = ""
-            cfg["nobitex_api_verified_at"] = ""
-            save_auto_pricing_config(cfg)
+        if data in {"admin_nobitex_api_setup", "admin_nobitex_api_clear", "admin_pricing_api_key"}:
             context.user_data.pop("pricing_admin_state", None)
             await query.edit_message_text(
-                pricing_panel_text(cfg, "✅ کلید API نوبیتکس از تنظیمات ربات حذف شد."),
-                reply_markup=pricing_panel_keyboard(cfg),
+                "✅ نرخ تتر از API عمومی رسمی نوبیتکس دریافت می‌شود و برای این کار هیچ API Key یا Private Key لازم نیست.\n\n"
+                "از دکمهٔ «دریافت نرخ تتر از API عمومی نوبیتکس» برای دریافت و همگام‌سازی نرخ استفاده کن.",
+                reply_markup=pricing_panel_keyboard(),
             )
             return
 
-        if data == "admin_fx_manual_rate":
-            context.user_data["pricing_admin_state"] = {"field": "fx_manual_rate_toman"}
-            await query.edit_message_text("✍️ نرخ دستی هر ۱ تتر را به تومان وارد کن. فقط عدد صحیح؛ نمونه: ۲۷۳۵۰۰\nاین نرخ ذخیره می‌شود و تا انتخاب دوبارهٔ حالت خودکار تغییر نمی‌کند. برای لغو /cancel را بزن.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="admin_auto_pricing", style="danger")]]))
-            return
 
-        if data == "admin_fx_auto_mode":
-            cfg = load_auto_pricing_config()
-            cfg["fx_rate_mode"] = "auto"
-            cfg["fx_attempted_at"] = ""
-            save_auto_pricing_config(cfg)
-            await query.edit_message_text(pricing_panel_text(cfg, "حالت نرخ تتر روی دریافت خودکار قرار گرفت."), reply_markup=pricing_panel_keyboard(cfg))
-            context.application.create_task(refresh_auto_pricing(force=True, background=True))
-            return
-
-        if data == "admin_fx_api_menu":
-            cfg = load_auto_pricing_config()
-            url = str(cfg.get("fx_custom_api_url") or "").strip()
-            api_status = "✅ تنظیم شده" if url else "❌ هنوز تنظیم نشده"
-            unit = "ریال (تقسیم بر ۱۰)" if str(cfg.get("fx_custom_unit") or "TOMAN").upper() == "RIAL" else "تومان"
-            path = str(cfg.get("fx_custom_json_path") or "auto")
-            host = urlsplit(url).hostname if url else "—"
-            text_value = (
-                "🧩 API پشتیبان نرخ تتر | SEYED PREMIUM\n━━━━━━━━━━━━━━━━━━\n"
-                f"وضعیت: {api_status}\nدامنه: {host or '—'}\nمسیر قیمت JSON: {path}\nواحد قیمت: {unit}\n"
-                f"کلید API: {'✅ ثبت شده' if cfg.get('fx_custom_api_key') else 'بدون کلید / عمومی'}\n\n"
-                "این گزینه کاملاً اختیاری است؛ بدون واردکردن API هم والکس، تبدیل، اکسیر و سایر منابع عمومی فعال می‌مانند.\n"
-                "برای API اختصاصی، یک آدرس HTTPS عمومی با پاسخ JSON لازم است. کلید (در صورت نیاز) با هدر Bearer و X-API-KEY ارسال می‌شود."
-            )
-            markup = InlineKeyboardMarkup([
-                [InlineKeyboardButton("➕ ثبت / تغییر API پشتیبان", callback_data="admin_fx_api_setup", style="success")],
-                [InlineKeyboardButton("🗑 حذف API پشتیبان", callback_data="admin_fx_api_clear", style="danger")],
-                [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_auto_pricing", style="primary")],
-            ])
-            await query.edit_message_text(text_value, reply_markup=markup)
-            return
-
-        if data == "admin_fx_api_setup":
-            context.user_data["pricing_admin_state"] = {"field": "fx_custom_api_setup", "step": "url"}
+        if data in {"admin_fx_api_menu", "admin_fx_api_setup", "admin_fx_api_clear"}:
+            context.user_data.pop("pricing_admin_state", None)
             await query.edit_message_text(
-                "🧩 تنظیم API پشتیبان نرخ تتر\n\nآدرس کامل HTTPS یک API عمومی که JSON برمی‌گرداند را بفرست.\n"
-                "نمونه: https://example.com/api/usdt\n\nفقط آدرس سرویس معتبر خودت را وارد کن. برای لغو /cancel را بزن.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="admin_fx_api_menu", style="danger")]]),
+                "در این نسخه، منبع نرخ تتر فقط API عمومی نوبیتکس است. تنظیم API سفارشی یا کلید جداگانه استفاده نمی‌شود.",
+                reply_markup=pricing_panel_keyboard(),
             )
-            return
-
-        if data == "admin_fx_api_clear":
-            cfg = load_auto_pricing_config()
-            cfg["fx_custom_api_url"] = ""
-            cfg["fx_custom_json_path"] = "auto"
-            cfg["fx_custom_unit"] = "TOMAN"
-            cfg["fx_custom_api_key"] = ""
-            cfg["fx_attempted_at"] = ""
-            save_auto_pricing_config(cfg)
-            await query.edit_message_text("✅ API پشتیبان حذف شد. منابع عمومی پیش‌فرض بدون نیاز به API همچنان فعال‌اند.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت به قیمت‌گذاری", callback_data="admin_auto_pricing", style="primary")]]))
             return
 
         if data == "admin_pricing_refresh":
@@ -9235,14 +8523,6 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(
                 pricing_panel_text(cfg, "✅ چرخهٔ به‌روزرسانی طبق تنظیم ثابت، هر ۳۰ دقیقه است."),
                 reply_markup=pricing_panel_keyboard(cfg),
-            )
-            return
-
-        if data == "admin_pricing_api_key":
-            context.user_data["pricing_admin_state"] = {"field": "nobitex_api_setup", "step": "public"}
-            await query.edit_message_text(
-                "🔐 ابتدا کلید عمومی API نوبیتکس (Nobitex-Key) را بفرست. دسترسی کلید باید فقط READ باشد. برای لغو /cancel را بزن.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="admin_auto_pricing", style="danger")]]),
             )
             return
 
@@ -11206,65 +10486,8 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return
         cfg = load_auto_pricing_config()
         if field == "nobitex_api_setup":
-            step = str(pricing_state.get("step") or "public")
-            try:
-                await message.delete()
-            except Exception:
-                logger.debug("Could not delete Nobitex API credential message", exc_info=True)
-
-            if step == "public":
-                public_key = raw_value.strip()
-                if len(public_key) < 12 or len(public_key) > 512 or any(ch.isspace() for ch in public_key):
-                    await message.reply_text("❌ کلید عمومی معتبر به نظر نمی‌رسد. مقدار Nobitex-Key را دوباره بفرست یا /cancel بزن.")
-                    return
-                user_data["pricing_admin_state"] = {"field": "nobitex_api_setup", "step": "private", "public_key": public_key}
-                await message.reply_text("✅ کلید عمومی دریافت شد. حالا Private Key خصوصیِ همان API Key را بفرست. پیام پس از دریافت حذف می‌شود.")
-                return
-
-            if step == "private":
-                public_key = str(pricing_state.get("public_key") or "").strip()
-                private_key = raw_value.strip()
-                if len(private_key) < 30 or len(private_key) > 512 or any(ch.isspace() for ch in private_key):
-                    await message.reply_text("❌ قالب Private Key معتبر نیست. همان Private Key اصلیِ زمان ساخت کلید را دوباره بفرست یا /cancel بزن.")
-                    return
-                try:
-                    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0), follow_redirects=False) as client:
-                        await _verify_nobitex_readonly_key(client, public_key, private_key)
-                except RuntimeError as exc:
-                    await message.reply_text("❌ " + str(exc))
-                    return
-                except httpx.HTTPStatusError as exc:
-                    status_code = exc.response.status_code if exc.response is not None else 0
-                    if status_code in (401, 403):
-                        error_text = "❌ نوبیتکس کلید را نپذیرفت. مطمئن شو public/private از یک جفت‌اند و دسترسی READ فعال است."
-                    elif status_code == 429:
-                        error_text = "⚠️ محدودیت درخواست نوبیتکس فعال شد؛ چند دقیقه بعد دوباره تلاش کن. کلید قبلی دست‌نخورده ماند."
-                    else:
-                        error_text = f"⚠️ اعتبارسنجی نوبیتکس ناموفق بود (HTTP {status_code}). کلید قبلی دست‌نخورده ماند."
-                    await message.reply_text(error_text)
-                    return
-                except (httpx.HTTPError, ValueError) as exc:
-                    await message.reply_text("❌ اعتبارسنجی انجام نشد: " + str(exc)[:220] + "\nکلید قبلی دست‌نخورده ماند.")
-                    return
-                except Exception:
-                    logger.exception("Nobitex API key validation failed")
-                    await message.reply_text("❌ خطای غیرمنتظره در بررسی کلید نوبیتکس؛ کلید قبلی دست‌نخورده ماند.")
-                    return
-
-                cfg["nobitex_api_public_key"] = public_key
-                cfg["nobitex_api_private_key"] = private_key
-                cfg["nobitex_api_verified_at"] = utc_now().isoformat(timespec="seconds")
-                save_auto_pricing_config(cfg)
-                user_data.pop("pricing_admin_state", None)
-                cfg = load_auto_pricing_config()
-                await message.reply_text(
-                    pricing_panel_text(cfg, "✅ کلید نوبیتکس با موفقیت از مسیر رسمی READ تأیید و ذخیره شد."),
-                    reply_markup=pricing_panel_keyboard(cfg),
-                )
-                return
-
             user_data.pop("pricing_admin_state", None)
-            await message.reply_text("⚠️ مرحلهٔ ثبت کلید نامعتبر بود؛ دوباره از دکمهٔ ثبت کلید نوبیتکس شروع کن.", reply_markup=pricing_panel_keyboard())
+            await message.reply_text("نرخ عمومی از API نوبیتکس بدون API Key و Private Key دریافت می‌شود؛ هیچ کلیدی لازم نیست.", reply_markup=pricing_panel_keyboard())
             return
 
         if field == "provider_api_key":
@@ -11288,77 +10511,14 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return
 
         if field == "fx_custom_api_setup":
-            step = str(pricing_state.get("step") or "url")
-            if step == "url":
-                if not _fx_custom_api_url_is_safe(raw_value):
-                    await message.reply_text("❌ آدرس باید HTTPS، عمومی و معتبر باشد؛ آدرس localhost یا شبکهٔ خصوصی پذیرفته نمی‌شود. دوباره بفرست یا /cancel بزن.")
-                    return
-                user_data["pricing_admin_state"] = {"field": "fx_custom_api_setup", "step": "path", "url": raw_value}
-                await message.reply_text("✅ آدرس ثبت شد. حالا مسیر مقدار قیمت در JSON را بفرست؛ نمونه: data.price یا result.lastPrice. اگر نمی‌دانی بنویس auto تا ربات فیلدهای رایج را خودش پیدا کند.")
-                return
-            if step == "path":
-                path = raw_value.strip()
-                if path.lower() != "auto" and (len(path) > 120 or not re.fullmatch(r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*", path)):
-                    await message.reply_text("❌ مسیر JSON معتبر نیست. نمونه: data.price یا result.lastPrice یا auto.")
-                    return
-                user_data["pricing_admin_state"] = {"field": "fx_custom_api_setup", "step": "unit", "url": pricing_state.get("url"), "path": path}
-                await message.reply_text("واحد عدد قیمت را مشخص کن: TOMAN برای تومان یا RIAL برای ریال. اگر API برحسب تومان است TOMAN بفرست.")
-                return
-            if step == "unit":
-                unit_raw = normalize_ascii_digits(raw_value).strip().upper()
-                unit_aliases = {"TOMAN": "TOMAN", "TMN": "TOMAN", "IRT": "TOMAN", "تومان": "TOMAN", "RIAL": "RIAL", "IRR": "RIAL", "ریال": "RIAL"}
-                if unit_raw not in unit_aliases:
-                    await message.reply_text("❌ فقط TOMAN یا RIAL (یا تومان/ریال) بفرست.")
-                    return
-                user_data["pricing_admin_state"] = {"field": "fx_custom_api_setup", "step": "key", "url": pricing_state.get("url"), "path": pricing_state.get("path", "auto"), "unit": unit_aliases[unit_raw]}
-                await message.reply_text("اگر API کلید می‌خواهد، کلید را بفرست. اگر API عمومی و بدون کلید است فقط یک خط تیره - بفرست. پیام کلید بعد از دریافت حذف می‌شود. برای لغو /cancel.")
-                return
-            if step == "key":
-                secret = "" if raw_value == "-" else raw_value
-                try:
-                    await message.delete()
-                except Exception:
-                    logger.debug("Could not delete custom FX API key message", exc_info=True)
-                if secret and (len(secret) < 6 or len(secret) > 1024 or any(ch.isspace() for ch in secret)):
-                    await message.reply_text("❌ قالب کلید API معتبر نیست. دوباره بفرست یا برای API بدون کلید - ارسال کن.")
-                    return
-                cfg["fx_custom_api_url"] = str(pricing_state.get("url") or "")
-                cfg["fx_custom_json_path"] = str(pricing_state.get("path") or "auto")
-                cfg["fx_custom_unit"] = str(pricing_state.get("unit") or "TOMAN")
-                cfg["fx_custom_api_key"] = secret
-                cfg["fx_attempted_at"] = ""
-                save_auto_pricing_config(cfg)
-                user_data.pop("pricing_admin_state", None)
-                await message.reply_text("✅ تنظیم API پشتیبان ذخیره شد. اکنون اتصال آن در پس‌زمینه آزمایش می‌شود؛ منابع عمومی اصلی نیز فعال می‌مانند.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💹 مشاهدهٔ وضعیت قیمت‌ها", callback_data="admin_auto_pricing", style="primary")]]))
-                context.application.create_task(_finish_custom_fx_api_test(context.application, message.chat_id))
-                return
+            user_data.pop("pricing_admin_state", None)
+            await message.reply_text("در این نسخه نرخ تتر فقط از API عمومی نوبیتکس دریافت می‌شود؛ تنظیم API سفارشی غیرفعال است.", reply_markup=pricing_panel_keyboard())
+            return
 
         normalized_value = normalize_ascii_digits(raw_value).replace("٪", "").replace("%", "").replace(",", "").replace("٬", "").replace("،", "").strip()
         if field == "fx_manual_rate_toman":
-            try:
-                amount = int(normalized_value)
-                if amount < 1000 or amount > 100_000_000:
-                    raise ValueError
-            except ValueError:
-                await message.reply_text("نرخ تتر باید عدد صحیحی بین ۱٬۰۰۰ تا ۱۰۰٬۰۰۰٬۰۰۰ تومان باشد. دوباره وارد کن یا /cancel بزن.")
-                return
-            cfg["fx_manual_rate_toman"] = str(amount)
-            cfg["fx_rate_mode"] = "manual"
-            cfg["fx_rate_toman"] = str(amount)
-            cfg["fx_valid"] = True
-            cfg["fx_source_name"] = "نرخ دستی مدیر"
-            cfg["fx_source_symbol"] = "MANUAL_USDT_TOMAN"
-            cfg["fx_source_updated_at"] = utc_now().isoformat(timespec="seconds")
-            cfg["fx_error"] = ""
-            save_auto_pricing_config(cfg)
             user_data.pop("pricing_admin_state", None)
-            try:
-                apply_auto_prices_to_products(cfg)
-                sync_premium_prices_in_db()
-                sync_gift_prices_in_db()
-            except Exception:
-                logger.exception("Manual FX rate saved but dependent price sync failed")
-            await message.reply_text(pricing_panel_text(cfg, "نرخ دستی تتر ذخیره شد."), reply_markup=pricing_panel_keyboard(cfg))
+            await message.reply_text("نرخ تتر فقط از API عمومی نوبیتکس دریافت می‌شود و ورود نرخ دستی غیرفعال است.", reply_markup=pricing_panel_keyboard())
             return
 
         if field == "refresh_interval_minutes":
