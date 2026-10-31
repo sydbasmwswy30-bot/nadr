@@ -1,2 +1,4 @@
-python-telegram-bot>=21.0,<23.0
-jdatetime>=5.0.0
+python-telegram-bot>=22.7,<23.0
+httpx>=0.27,<1.0
+jdatetime>=5.0.0,<6.0.0
+tzdata>=2025.2

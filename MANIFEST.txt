@@ -1,0 +1,32 @@
+SEYED PREMIUM - patched project bundle
+
+Root source files:
+bot.py
+Procfile
+README_FA.md
+render.yaml
+requirements.txt
+service_menu.py
+stars_menu.py
+start.py
+ui_config.py
+
+Pricing and data-safety modules:
+pricing_engine.py
+pricing_sources.py
+database_safety.py
+backup_manager.py
+health_monitor.py
+
+Deployment support:
+DEPLOY_CHECKLIST_FA.md
+.gitignore
+
+Offline tests:
+tests/test_pricing_engine.py
+tests/test_pricing_sources.py
+tests/test_database_safety.py
+tests/test_backup_manager.py
+tests/test_health_monitor.py
+
+Note: shop.db was not supplied and is intentionally not included.

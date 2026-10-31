@@ -1,5 +1,6 @@
 import logging
 import asyncio
+import os
 from copy import deepcopy
 import sqlite3
 import time
@@ -10,6 +11,12 @@ from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+import pricing_engine
+import pricing_sources
+import health_monitor
+from backup_manager import run_backup_loop
+from database_safety import migrate_legacy_database
 
 from telegram import (
     Bot,
@@ -64,7 +71,9 @@ def normalize_ascii_digits(value):
     return str(value).translate(str.maketrans(digits, ascii_digits))
 
 
-DB_FILE = Path(__file__).with_name("shop.db")
+LEGACY_DB_FILE = Path(__file__).with_name("shop.db")
+DB_FILE = Path(os.environ.get("SHOP_DB_PATH", str(LEGACY_DB_FILE))).expanduser()
+DB_BACKUP_DIR = Path(os.environ.get("DB_BACKUP_DIR", str(DB_FILE.parent / "backups"))).expanduser()
 IRAN_TZ = ZoneInfo("Asia/Tehran")
 
 
@@ -992,6 +1001,10 @@ def coupon_created_message(record):
 
 
 def init_db():
+    DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+    # When moving to Render persistent storage, copy an existing legacy shop.db
+    # exactly once. The old file is never deleted or overwritten.
+    migrate_legacy_database(DB_FILE, LEGACY_DB_FILE, logger)
     with sqlite3.connect(DB_FILE, timeout=10) as setup:
         setup.execute("PRAGMA journal_mode=WAL")
     with db() as con:
@@ -1530,8 +1543,8 @@ def _central_stars_quote_for_quantity(star_count, auto_cfg=None):
         return None
     components = _pricing_sale_components(
         unit_usd * Decimal(amount), fx,
-        cfg.get("margin_percent", "30"),
-        cfg.get("fee_percent", "1"),
+        cfg.get("margin_percent", pricing_engine.DEFAULT_MARGIN_PERCENT),
+        cfg.get("fee_percent", pricing_engine.DEFAULT_FEE_PERCENT),
     )
     if components is None:
         return None
@@ -2417,29 +2430,35 @@ _AUTO_PRICING_REFRESH_LOCK = None
 _PROVIDER_PRODUCTS_URL = "https://pay.tgsuperstars.com/api/partner/v1/products"
 # Free, read-only public price quote endpoint; no API key and no purchase requests are made.
 _PUBLIC_PRICE_API_BASE = "https://api-stars.duckdns.org/api/v1/prices/quote"
-_PROVIDER_REFRESH_COOLDOWN_SECONDS = 1800  # Stars/Premium reference catalog: every 30 minutes.
+_PROVIDER_REFRESH_COOLDOWN_SECONDS = pricing_engine.REFRESH_INTERVAL_SECONDS  # Every 60 minutes.
 _PROVIDER_FORCE_REFRESH_COOLDOWN_SECONDS = 5
-_FX_REFRESH_COOLDOWN_SECONDS = 30 * 60  # Official Nobitex public FX API: refresh every 30 minutes.
-_PRICING_MAX_AGE_SECONDS = 35 * 60  # A scheduled 30-minute quote remains fresh until the next cycle.
+_FX_REFRESH_COOLDOWN_SECONDS = pricing_engine.REFRESH_INTERVAL_SECONDS  # Every 60 minutes.
+_PRICING_MAX_AGE_SECONDS = pricing_engine.FEED_MAX_AGE_SECONDS
 # A brief exchange/API outage must not erase the last good value, but never use
 # an old FX quote for new orders after this short safety grace window.
-_PRICING_FX_MAX_AGE_SECONDS = 40 * 60
-_PRICING_CATALOG_MAX_AGE_SECONDS = 40 * 60
+_PRICING_FX_MAX_AGE_SECONDS = 70 * 60  # Display-only grace; checkout engine still expires at 60 minutes.
+_PRICING_CATALOG_MAX_AGE_SECONDS = pricing_engine.FEED_MAX_AGE_SECONDS
 
 
 def _auto_pricing_defaults():
     return {
         "enabled": True,
         "provider_api_key": "",
-        "margin_percent": "30",
-        "fee_percent": "1",
-        "refresh_interval_minutes": 30,
+        "margin_percent": pricing_engine.DEFAULT_MARGIN_PERCENT,
+        "fee_percent": pricing_engine.DEFAULT_FEE_PERCENT,
+        "refresh_interval_minutes": pricing_engine.REFRESH_INTERVAL_MINUTES,
         "fx_sources_status": {},
         "fx_failures": 0,
         "fx_retry_after": "",
         "catalog_failures": 0,
         "catalog_retry_after": "",
-        "catalog_prices": {"stars_price_per_star_usd": "", "stars_max_per_order": "", "stars_max_per_order_source": "", "premium_usd": {}},
+        "catalog_prices": {
+            "stars_price_per_star_usd": "", "stars_price_trusted": False,
+            "stars_max_per_order": "", "stars_max_per_order_source": "",
+            "premium_usd": {},
+            "premium_prices_trusted": {"3": False, "6": False, "12": False},
+            "catalog_source": "",
+        },
         "catalog_valid": False,
         "catalog_updated_at": "",
         "premium_catalog_valid": None,
@@ -2489,6 +2508,15 @@ def load_auto_pricing_config():
     price_defaults = defaults["catalog_prices"]
     price_stored = cfg.get("catalog_prices")
     cfg["catalog_prices"] = dict(price_defaults, **(price_stored if isinstance(price_stored, dict) else {}))
+    trust_map = cfg["catalog_prices"].get("premium_prices_trusted")
+    if not isinstance(trust_map, dict):
+        trust_map = {}
+    cfg["catalog_prices"]["premium_prices_trusted"] = {
+        month: bool(trust_map.get(month) is True) for month in ("3", "6", "12")
+    }
+    cfg["catalog_prices"]["stars_price_trusted"] = (
+        cfg["catalog_prices"].get("stars_price_trusted") is True
+    )
     # Sanitize values used by the admin pricing screens. Older provider responses
     # may store a decimal/text max-order field; never let that crash a menu.
     # A supplier order cap is used only when that supplier explicitly returned it.
@@ -2512,8 +2540,8 @@ def load_auto_pricing_config():
     # and show an unavailable marker instead of raising ValueError in the gift menu.
     normalized_fx = _pricing_decimal(cfg.get("fx_rate_toman"))
     cfg["fx_rate_toman"] = str(normalized_fx) if normalized_fx is not None else ""
-    # The product owner requested a fixed 30-minute refresh; normalize legacy values.
-    cfg["refresh_interval_minutes"] = 30
+    # The refresh cadence is a fixed owner-approved hourly interval.
+    cfg["refresh_interval_minutes"] = pricing_engine.REFRESH_INTERVAL_MINUTES
     # The store's USDT rate is API-only; older manual-rate settings are ignored.
     legacy_pricing_keys = {
         "nobitex_api_public_key", "nobitex_api_private_key", "nobitex_api_verified_at",
@@ -2528,9 +2556,8 @@ def load_auto_pricing_config():
             cfg[name] = str(value)
         except (InvalidOperation, ValueError, TypeError):
             cfg[name] = defaults[name]
-    # One-time migration: only replace the previous built-in defaults (40%/0%)
-    # with the owner's requested defaults (30%/1%). Any non-default values chosen
-    # by the administrator are preserved exactly.
+    # One-time migration: replace only the known old built-in 40%/0% defaults.
+    # Explicit administrator values are preserved; new installations default to 30%/0%.
     try:
         with db() as con:
             marker = con.execute(
@@ -2549,8 +2576,8 @@ def load_auto_pricing_config():
             except (InvalidOperation, TypeError, ValueError):
                 is_previous_builtin_default = False
             if is_previous_builtin_default:
-                cfg["margin_percent"] = "30"
-                cfg["fee_percent"] = "1"
+                cfg["margin_percent"] = pricing_engine.DEFAULT_MARGIN_PERCENT
+                cfg["fee_percent"] = pricing_engine.DEFAULT_FEE_PERCENT
                 save_auto_pricing_config(cfg)
             with db() as con:
                 con.execute(
@@ -2575,7 +2602,7 @@ def save_auto_pricing_config(cfg):
     catalog_prices = normalized.get("catalog_prices")
     normalized["catalog_prices"] = dict(defaults["catalog_prices"], **(catalog_prices if isinstance(catalog_prices, dict) else {}))
     normalized["provider_api_key"] = str(normalized.get("provider_api_key") or "").strip()
-    normalized["refresh_interval_minutes"] = 30
+    normalized["refresh_interval_minutes"] = pricing_engine.REFRESH_INTERVAL_MINUTES
     for obsolete_key in (
         "nobitex_api_public_key", "nobitex_api_private_key", "nobitex_api_verified_at",
         "fx_custom_api_url", "fx_custom_json_path", "fx_custom_unit", "fx_custom_api_key",
@@ -2600,39 +2627,19 @@ def save_auto_pricing_config(cfg):
 
 
 def _pricing_decimal(value):
-    try:
-        result = Decimal(str(value).strip())
-        return result if result.is_finite() and result > 0 else None
-    except (InvalidOperation, TypeError, ValueError, AttributeError):
-        return None
+    return pricing_engine.positive_decimal(value)
 
 
 def _pricing_time(value):
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(timezone.utc)
-    except (ValueError, TypeError, OverflowError):
-        return None
+    return pricing_engine.parse_utc_timestamp(value)
 
 
 def _pricing_timestamp_fresh(value, max_age_seconds=_PRICING_MAX_AGE_SECONDS):
-    parsed = _pricing_time(value)
-    if parsed is None:
-        return False
-    age = (utc_now() - parsed).total_seconds()
-    return -60 <= age <= max_age_seconds
+    return pricing_engine.timestamp_is_fresh(value, max_age_seconds)
 
 
 def _pricing_timestamp_age(value):
-    parsed = _pricing_time(value)
-    if parsed is None:
-        return None
-    age = (utc_now() - parsed).total_seconds()
-    return age if age >= 0 else 0
+    return pricing_engine.timestamp_age(value)
 
 
 def _effective_fx_rate(cfg=None):
@@ -2642,22 +2649,12 @@ def _effective_fx_rate(cfg=None):
 
 def _effective_fx_is_usable(cfg=None):
     cfg = cfg or load_auto_pricing_config()
-    return bool(
-        cfg.get("fx_valid")
-        and _pricing_timestamp_fresh(cfg.get("fx_source_updated_at"), _PRICING_FX_MAX_AGE_SECONDS)
-        and _effective_fx_rate(cfg)
-    )
+    return pricing_engine.fx_feed_usable(cfg)
 
 
 def auto_pricing_ready(cfg=None):
     cfg = cfg or load_auto_pricing_config()
-    return bool(
-        cfg.get("enabled")
-        and cfg.get("catalog_valid")
-        and _effective_fx_is_usable(cfg)
-        and _pricing_timestamp_fresh(cfg.get("catalog_updated_at"), _PRICING_CATALOG_MAX_AGE_SECONDS)
-        and _pricing_decimal((cfg.get("catalog_prices") or {}).get("stars_price_per_star_usd"))
-    )
+    return pricing_engine.pricing_ready(cfg)
 
 
 def _ceil_toman(value):
@@ -2665,118 +2662,19 @@ def _ceil_toman(value):
 
 
 def _pricing_sale_components(cost_usd, fx_rate_toman, margin_percent, fee_percent):
-    """Single authoritative USD/USDT -> Toman -> fee -> margin calculation."""
-    try:
-        cost_usd = _pricing_decimal(cost_usd)
-        fx_rate_toman = _pricing_decimal(fx_rate_toman)
-        margin = Decimal(str(margin_percent))
-        fee = Decimal(str(fee_percent))
-        if (cost_usd is None or fx_rate_toman is None
-                or not margin.is_finite() or not fee.is_finite()
-                or margin < 0 or margin > 500 or fee < 0 or fee > 100):
-            return None
-        cost_toman = _ceil_toman(cost_usd * fx_rate_toman)
-        fee_toman = _ceil_toman(Decimal(cost_toman) * fee / Decimal(100)) if fee else 0
-        sale_toman = _ceil_toman(Decimal(cost_toman + fee_toman) * (Decimal(100) + margin) / Decimal(100))
-        return {
-            "cost_toman": cost_toman,
-            "fee_toman": fee_toman,
-            "sale_toman": sale_toman,
-            "profit_toman": sale_toman - cost_toman - fee_toman,
-            "margin_percent": str(margin),
-            "fee_percent": str(fee),
-        }
-    except (InvalidOperation, TypeError, ValueError, OverflowError):
-        return None
+    """Delegate every sale calculation to the tested central pricing engine."""
+    return pricing_engine.sale_components(cost_usd, fx_rate_toman, margin_percent, fee_percent)
 
 
 def auto_pricing_quote(product_type, quantity, cfg=None, allow_stale=False):
-    """Return a quote; allow_stale is only for clearly labelled display previews, never orders."""
+    """Return verified checkout quotes; stale preview is only available to admins."""
     cfg = cfg or load_auto_pricing_config()
-    fx_rate = _effective_fx_rate(cfg)
-    fx_is_fresh = _effective_fx_is_usable(cfg)
-    fx_ready = bool(cfg.get("enabled") and fx_rate and (fx_is_fresh or allow_stale))
-    if not fx_ready:
-        return None
-    try:
-        quantity = int(quantity)
-    except (TypeError, ValueError):
-        return None
-    prices = cfg.get("catalog_prices") or {}
-    if product_type == "stars":
-        if not 50 <= quantity <= 1_000_000:
-            return None
-        catalog_is_fresh = bool(cfg.get("catalog_valid") and _pricing_timestamp_fresh(cfg.get("catalog_updated_at"), _PRICING_CATALOG_MAX_AGE_SECONDS))
-        if not (catalog_is_fresh or allow_stale):
-            return None
-        unit_usd = _pricing_decimal(prices.get("stars_price_per_star_usd"))
-        if unit_usd is None:
-            return None
-        cost_usd = unit_usd * Decimal(quantity)
-        upstream_max = None
-        if str(prices.get("stars_max_per_order_source") or "") == "TgSuperstars":
-            try:
-                raw_upstream_max = Decimal(str(prices.get("stars_max_per_order")))
-                candidate_max = (int(raw_upstream_max) if raw_upstream_max.is_finite()
-                                 and raw_upstream_max == raw_upstream_max.to_integral_value() else None)
-                if candidate_max is not None and 50 <= candidate_max <= 1_000_000:
-                    upstream_max = candidate_max
-            except (InvalidOperation, TypeError, ValueError, OverflowError):
-                upstream_max = None
-    elif product_type == "premium":
-        if quantity not in (3, 6, 12):
-            return None
-        premium_catalog_fresh = _premium_catalog_is_fresh(cfg)
-        if not (premium_catalog_fresh or allow_stale):
-            return None
-        cost_usd = _pricing_decimal((prices.get("premium_usd") or {}).get(str(quantity)))
-        if cost_usd is None:
-            return None
-        upstream_max = None
-    else:
-        return None
-
-    fx_rate = _effective_fx_rate(cfg)
-    if fx_rate is None:
-        return None
-    components = _pricing_sale_components(
-        cost_usd, fx_rate,
-        cfg.get("margin_percent", "30"),
-        cfg.get("fee_percent", "1"),
-    )
-    if components is None:
-        return None
-    return {
-        "product_type": product_type,
-        "quantity": quantity,
-        "cost_usd": str(cost_usd),
-        "fx_rate_toman": str(fx_rate),
-        **components,
-        "provider_max_per_order": upstream_max,
-        "provider_over_limit": bool(product_type == "stars" and upstream_max and quantity > upstream_max),
-        "catalog_updated_at": cfg.get("catalog_updated_at", ""),
-        "fx_source_updated_at": cfg.get("fx_source_updated_at", ""),
-        "is_stale": bool(allow_stale and (not fx_is_fresh or (product_type == "stars" and not catalog_is_fresh) or (product_type == "premium" and not premium_catalog_fresh))),
-    }
+    return pricing_engine.quote(product_type, quantity, cfg, allow_stale=allow_stale)
 
 
 def auto_pricing_unit_sale(cfg=None):
-    """Approximate per-Star retail price to two decimals; totals are rounded separately."""
     cfg = cfg or load_auto_pricing_config()
-    if not auto_pricing_ready(cfg):
-        return None
-    prices = cfg.get("catalog_prices") or {}
-    unit = _pricing_decimal(prices.get("stars_price_per_star_usd"))
-    fx = _effective_fx_rate(cfg)
-    if unit is None or fx is None:
-        return None
-    try:
-        fee = Decimal(str(cfg.get("fee_percent", "1")))
-        margin = Decimal(str(cfg.get("margin_percent", "30")))
-        value = unit * fx * (Decimal(100) + fee) / Decimal(100) * (Decimal(100) + margin) / Decimal(100)
-        return value.quantize(Decimal("0.01"), rounding=ROUND_CEILING)
-    except (InvalidOperation, ValueError, TypeError):
-        return None
+    return pricing_engine.unit_stars_sale(cfg)
 
 
 def premium_product_months(product):
@@ -2896,12 +2794,14 @@ def _premium_feed_parts(auto_cfg=None):
 
 
 def _premium_catalog_is_fresh(cfg):
-    """Premium prices have their own validity clock, independent from Stars prices."""
-    explicit_flag = cfg.get("premium_catalog_valid")
-    if explicit_flag is None:  # compatibility with databases created before this split
-        return bool(cfg.get("catalog_valid") and _pricing_timestamp_fresh(cfg.get("catalog_updated_at")))
+    """Premium plans require all three independently verified supplier prices."""
+    prices = cfg.get("catalog_prices") or {}
+    trusted = prices.get("premium_prices_trusted")
+    complete = isinstance(trusted, dict) and all(trusted.get(str(m)) is True for m in (3, 6, 12))
+    complete = complete and all(_pricing_decimal((prices.get("premium_usd") or {}).get(str(m))) is not None for m in (3, 6, 12))
     timestamp = cfg.get("premium_catalog_updated_at")
-    return bool(explicit_flag and _pricing_timestamp_fresh(timestamp, _PRICING_CATALOG_MAX_AGE_SECONDS))
+    return bool(cfg.get("premium_catalog_valid") is True and complete
+                and _pricing_timestamp_fresh(timestamp, _PRICING_CATALOG_MAX_AGE_SECONDS))
 
 
 def premium_effective_star_rate_toman(settings=None, auto_cfg=None):
@@ -3189,17 +3089,22 @@ def _fx_source_short(value):
 def pricing_panel_text(cfg=None, note=""):
     cfg = cfg or load_auto_pricing_config()
     ready = auto_pricing_ready(cfg)
-    catalog_state = "✅ تازه/معتبر" if cfg.get("catalog_valid") and _pricing_timestamp_fresh(cfg.get("catalog_updated_at"), _PRICING_CATALOG_MAX_AGE_SECONDS) else "⚠️ نامعتبر/منقضی"
+    catalog_state = "✅ تأمین‌کننده تأییدشده و تازه" if pricing_engine.stars_feed_usable(cfg) else "⚠️ قیمت فروش تأیید نشده/منقضی"
     fx_fresh = bool(cfg.get("fx_valid") and _pricing_timestamp_fresh(cfg.get("fx_source_updated_at"), _PRICING_MAX_AGE_SECONDS))
     fx_grace = bool(cfg.get("fx_valid") and _pricing_timestamp_fresh(cfg.get("fx_source_updated_at"), _PRICING_FX_MAX_AGE_SECONDS))
     fx_state = "✅ تازه" if fx_fresh else ("⚠️ آخرین نرخ تأییدشده" if fx_grace else "❌ نامعتبر")
     stored_fx = _pricing_decimal(cfg.get("fx_rate_toman"))
     fx_text = f"{toman(stored_fx)} تومان" if stored_fx is not None else "دریافت نشده"
-    fx_ready = bool(cfg.get("enabled") and fx_grace and stored_fx is not None)
+    # Checkout readiness expires at 60m; the longer 70m window is display-only.
+    fx_ready = bool(cfg.get("enabled") and pricing_engine.fx_feed_usable(cfg) and stored_fx is not None)
     stars_ready = bool(ready)
     premium_terms = (cfg.get("catalog_prices") or {}).get("premium_usd") or {}
-    premium_terms_text = "، ".join(f"{term}ماهه" for term in ("3", "6", "12") if _pricing_decimal(premium_terms.get(term))) or "دریافت نشده"
-    premium_ready = bool(fx_ready and _premium_catalog_is_fresh(cfg) and all(_pricing_decimal(premium_terms.get(str(m))) is not None for m in (3, 6, 12)))
+    premium_trust = (cfg.get("catalog_prices") or {}).get("premium_prices_trusted") or {}
+    premium_terms_text = "، ".join(
+        f"{term}ماهه" for term in ("3", "6", "12")
+        if premium_trust.get(term) is True and _pricing_decimal(premium_terms.get(term))
+    ) or "قیمت تأییدشده دریافت نشده"
+    premium_ready = bool(fx_ready and _premium_catalog_is_fresh(cfg))
     catalog_source = _catalog_source_names((cfg.get("catalog_prices") or {}).get("catalog_source"))
     fx_source = _fx_source_short(cfg.get("fx_source_name"))
     lines = [
@@ -3218,8 +3123,9 @@ def pricing_panel_text(cfg=None, note=""):
         f"🕒 آخرین دریافت کاتالوگ: {_pricing_time_text(cfg.get('catalog_updated_at'))}",
         f"💎 پلن‌های پرمیوم: {premium_terms_text}",
         f"📈 سود: {cfg.get('margin_percent')}٪  |  🧾 کارمزد: {cfg.get('fee_percent')}٪",
-        "⏱️ بروزرسانی: نرخ تتر از API نوبیتکس هر ۳۰ دقیقه؛ کاتالوگ قیمت هر ۳۰ دقیقه",
-        "ℹ️ منابع پشتیبان فقط برای کنترل/اجماع استفاده می‌شوند؛ نرخ پرت یا تنها پشتیبان پذیرفته نمی‌شود.",
+        "⏱️ بروزرسانی: نرخ تتر از API نوبیتکس هر ۶۰ دقیقه؛ کاتالوگ قیمت هر ۶۰ دقیقه",
+        "ℹ️ کاتالوگ عمومی فقط مرجع نمایشی است؛ قیمت فروش باید از API تأمین‌کنندهٔ احراز‌شده و با زمان معتبر برسد.",
+        "ℹ️ در نبود قیمت تأییدشده، خرید متوقف می‌شود و قیمت قدیمی/حدسی جایگزین نخواهد شد.",
     ]
     source_status = cfg.get("fx_sources_status") if isinstance(cfg.get("fx_sources_status"), dict) else {}
     if source_status:
@@ -3323,8 +3229,8 @@ async def _fetch_public_price_catalog(client):
                 age_seconds = float(age)
             except (TypeError, ValueError):
                 raise ValueError("سن قیمت مرجع قابل‌تشخیص نیست.")
-            if not 0 <= age_seconds <= 30 * 60:
-                raise ValueError("سن قیمت مرجع نامعتبر یا بیش از ۳۰ دقیقه است.")
+            if not 0 <= age_seconds <= pricing_engine.SOURCE_MAX_AGE_SECONDS:
+                raise ValueError("سن قیمت مرجع نامعتبر یا بیش از ۶۰ دقیقه است.")
         else:
             observed = (quote.get("updated_at") or quote.get("timestamp")
                         or quote.get("last_updated") or payload.get("updated_at")
@@ -3344,8 +3250,8 @@ async def _fetch_public_price_catalog(client):
             if parsed is None:
                 raise ValueError("منبع غیررسمی زمان آخرین به‌روزرسانی قیمت را اعلام نکرده است؛ برای جلوگیری از نرخ ساختگی رد شد.")
             age_seconds = (utc_now() - parsed).total_seconds()
-            if age_seconds < -60 or age_seconds > 30 * 60:
-                raise ValueError("قیمت مرجع بیش از ۳۰ دقیقه عمر دارد یا زمان آن نامعتبر است.")
+            if age_seconds < -60 or age_seconds > pricing_engine.SOURCE_MAX_AGE_SECONDS:
+                raise ValueError("قیمت مرجع بیش از ۶۰ دقیقه عمر دارد یا زمان آن نامعتبر است.")
         return value
 
     requests = [("stars", 50), ("premium", 3), ("premium", 6), ("premium", 12)]
@@ -3372,94 +3278,38 @@ async def _fetch_public_price_catalog(client):
             premium_prices[str(months)] = str(result)
     return {
         "stars_price_per_star_usd": stars_price_per_star,
+        "stars_price_trusted": False,
         "stars_max_per_order": "",
         "stars_max_per_order_source": "",
         "premium_usd": premium_prices,
+        "premium_prices_trusted": {"3": False, "6": False, "12": False},
         "stars_quote_error": stars_error,
         "premium_quote_errors": premium_errors,
-        "catalog_source": "سرویس مرجع غیررسمی مستقل (ادعای قیمت Fragment؛ USD مبهم پذیرفته نمی‌شود)",
+        "catalog_source": "منبع مرجع غیررسمی (صرفاً نمایشی؛ مجاز برای قیمت فروش نیست)",
     }
 
 
 async def _fetch_tgsuperstars_price_catalog(client, api_key):
-    """Optional second quote source for operators who configured a supplier key."""
+    """Fetch authenticated wholesale catalog, then validate it in pricing_sources."""
     response = await client.get(
         _PROVIDER_PRODUCTS_URL,
         headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
     )
     response.raise_for_status()
-    payload = response.json()
-    if not isinstance(payload, dict):
-        raise ValueError("پاسخ تأمین‌کننده ساختار JSON معتبر ندارد.")
-    catalog = payload.get("data", payload)
-    payload_meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
-    catalog_meta = catalog.get("meta") if isinstance(catalog, dict) and isinstance(catalog.get("meta"), dict) else {}
-    stale = any((
-        payload.get("unavailable") is True,
-        isinstance(catalog, dict) and catalog.get("unavailable") is True,
-        payload.get("stale") is True,
-        isinstance(catalog, dict) and catalog.get("stale") is True,
-        payload_meta.get("stale") is True,
-        catalog_meta.get("stale") is True,
-        str(payload.get("source_status", "")).lower() in {"stale", "unavailable"},
-        isinstance(catalog, dict) and str(catalog.get("source_status", "")).lower() in {"stale", "unavailable"},
-    ))
-    if not isinstance(catalog, dict) or stale:
-        raise ValueError("منبع تأمین‌کننده قیمت تازه ارائه نکرد.")
-    stars_info = catalog.get("stars") or {}
-    stars_currency = str(stars_info.get("currency") or catalog.get("currency") or "").upper()
-    unit_price = _pricing_decimal(stars_info.get("price_per_star"))
-    if stars_currency not in {"USD", "USDT"} or unit_price is None:
-        raise ValueError("قیمت استارز یا واحد USD/USDT صریح در کاتالوگ تأمین‌کننده معتبر نیست.")
-    premium_raw = catalog.get("premium") or {}
-    premium_prices = {}
-    for months in (3, 6, 12):
-        item = premium_raw.get(str(months)) or premium_raw.get(months)
-        if not isinstance(item, dict):
-            continue
-        currency = str(item.get("currency") or catalog.get("currency") or "").upper()
-        value = _pricing_decimal(item.get("partner_price"))
-        if currency in {"USD", "USDT"} and value is not None:
-            premium_prices[str(months)] = str(value)
-    try:
-        raw_upstream_max = stars_info.get("max_per_order")
-        if raw_upstream_max in (None, ""):
-            raise ValueError("سقف سفارش از کاتالوگ تأمین‌کننده اعلام نشده است.")
-        raw_max_decimal = Decimal(str(raw_upstream_max))
-        if (not raw_max_decimal.is_finite()
-                or raw_max_decimal != raw_max_decimal.to_integral_value()):
-            raise ValueError("سقف سفارش باید عدد صحیح باشد.")
-        upstream_max = int(raw_max_decimal)
-        if not 50 <= upstream_max <= 1_000_000:
-            raise ValueError("سقف سفارش استارز تأمین‌کننده خارج از محدودهٔ معتبر است.")
-    except (TypeError, ValueError):
-        raise ValueError("سقف سفارش استارز تأمین‌کننده معتبر نیست.")
-    return {
-        "stars_price_per_star_usd": str(unit_price),
-        "stars_max_per_order": upstream_max,
-        "stars_max_per_order_source": "TgSuperstars",
-        "premium_usd": premium_prices,
-        "catalog_source": "TgSuperstars (کلید API مدیر)",
-    }
+    return pricing_sources.parse_tgsuperstars_catalog(response.json())
 
 
 def _merge_quote_catalog(primary, fallback):
-    """Use primary fields where present and safely fill missing fields from fallback."""
-    result = dict(primary or {})
-    fallback = fallback or {}
-    if _pricing_decimal(result.get("stars_price_per_star_usd")) is None:
-        result["stars_price_per_star_usd"] = fallback.get("stars_price_per_star_usd", "")
-        result["stars_max_per_order"] = fallback.get("stars_max_per_order", "")
-        result["stars_max_per_order_source"] = fallback.get("stars_max_per_order_source", "")
-    premium = result.get("premium_usd") if isinstance(result.get("premium_usd"), dict) else {}
-    fallback_premium = fallback.get("premium_usd") if isinstance(fallback.get("premium_usd"), dict) else {}
-    premium = dict(premium)
-    for month in ("3", "6", "12"):
-        if _pricing_decimal(premium.get(month)) is None and _pricing_decimal(fallback_premium.get(month)) is not None:
-            premium[month] = fallback_premium[month]
-    result["premium_usd"] = premium
-    result["catalog_source"] = _catalog_source_names(" + ".join(x for x in (result.get("catalog_source"), fallback.get("catalog_source")) if x))
-    return result
+    """Trust-aware merge used for current quotes and preservation of last-good prices."""
+    merged = pricing_sources.merge_quote_catalog(primary, fallback)
+    source_names = " + ".join(
+        value for value in (
+            (primary or {}).get("catalog_source") if isinstance(primary, dict) else None,
+            (fallback or {}).get("catalog_source") if isinstance(fallback, dict) else None,
+        ) if value
+    )
+    merged["catalog_source"] = _catalog_source_names(source_names)
+    return merged
 
 
 async def _fetch_live_fx_bundle(client):
@@ -3792,12 +3642,17 @@ async def refresh_auto_pricing(force=False, background=False):
         now_iso = utc_now().isoformat(timespec="seconds")
         api_key = str(cfg.get("provider_api_key") or "").strip()
 
+        catalog_has_fresh_verified_data = (
+            pricing_engine.stars_feed_usable(cfg) or _premium_catalog_is_fresh(cfg)
+        )
         catalog_due = _pricing_feed_due(
             cfg, "catalog_attempted_at", "catalog_retry_after", _PROVIDER_REFRESH_COOLDOWN_SECONDS
-        )
+        ) or (not catalog_has_fresh_verified_data and not cfg.get("catalog_retry_after"))
+        # A failed/crashed prior attempt must not leave an unusable FX feed waiting
+        # for the full hour merely because attempted_at was recently written.
         fx_due = _pricing_feed_due(
             cfg, "fx_attempted_at", "fx_retry_after", _FX_REFRESH_COOLDOWN_SECONDS
-        )
+        ) or (not _effective_fx_is_usable(cfg) and not cfg.get("fx_retry_after"))
         force_allowed = bool(force) and (
             _pricing_timestamp_age(cfg.get("catalog_attempted_at")) is None
             or _pricing_timestamp_age(cfg.get("catalog_attempted_at")) >= _PROVIDER_FORCE_REFRESH_COOLDOWN_SECONDS
@@ -3814,7 +3669,7 @@ async def refresh_auto_pricing(force=False, background=False):
         if catalog_due or fx_due:
             if not background and not force:
                 # Never make a customer-facing button wait on a rate provider.
-                # The 30-minute scheduler refreshes these sources independently.
+                # The hourly scheduler refreshes these sources independently.
                 return auto_pricing_ready(cfg)
             save_auto_pricing_config(cfg)
         else:
@@ -3828,8 +3683,9 @@ async def refresh_auto_pricing(force=False, background=False):
             follow_redirects=True,
         ) as client:
             async def fetch_catalog():
-                # Fetch independent sources concurrently. If a supplier key exists, its
-                # wholesale/partner amounts take precedence; the public quote only fills gaps.
+                # The authenticated supplier is the only executable price source.
+                # The public intermediary may fill reference fields for diagnostics,
+                # but those values are explicitly marked untrusted and cannot price orders.
                 supplier_task = (
                     asyncio.create_task(_fetch_tgsuperstars_price_catalog(client, api_key))
                     if api_key else None
@@ -3846,7 +3702,7 @@ async def refresh_auto_pricing(force=False, background=False):
                 if isinstance(public_result, asyncio.CancelledError):
                     raise public_result
                 if isinstance(supplier_result, BaseException):
-                    logger.warning("Supplier catalog unavailable; public reference may be used: %s", supplier_result)
+                    logger.warning("Authenticated supplier catalog unavailable; public reference remains display-only: %s", supplier_result)
                 if isinstance(public_result, BaseException):
                     logger.warning("Public reference catalog unavailable: %s", public_result)
                 if supplier_catalog and public_catalog:
@@ -3888,35 +3744,56 @@ async def refresh_auto_pricing(force=False, background=False):
                         result["premium_usd"] = {}
                     old_prices = cfg.get("catalog_prices") if isinstance(cfg.get("catalog_prices"), dict) else {}
                     merged_prices = _merge_quote_catalog(result, old_prices)
-                    new_stars_price = _pricing_decimal(result.get("stars_price_per_star_usd"))
-                    retained_stars_price = _pricing_decimal(merged_prices.get("stars_price_per_star_usd"))
-                    if new_stars_price is not None:
+
+                    new_source_time = result.get("source_updated_at")
+                    new_stars_verified = (
+                        result.get("stars_price_trusted") is True
+                        and _pricing_decimal(result.get("stars_price_per_star_usd")) is not None
+                        and _pricing_timestamp_fresh(new_source_time, pricing_engine.SOURCE_MAX_AGE_SECONDS)
+                    )
+                    if new_stars_verified:
                         cfg["catalog_valid"] = True
-                        cfg["catalog_updated_at"] = utc_now().isoformat(timespec="seconds")
+                        cfg["catalog_updated_at"] = str(new_source_time)
                         cfg["catalog_error"] = ""
-                    elif retained_stars_price is not None and cfg.get("catalog_valid") and _pricing_timestamp_fresh(cfg.get("catalog_updated_at"), _PRICING_CATALOG_MAX_AGE_SECONDS):
-                        cfg["catalog_error"] = str(result.get("stars_quote_error") or "قیمت تازهٔ استارز نیامد؛ نرخ موفق قبلی حفظ شد.")[:250]
+                    elif pricing_engine.stars_feed_usable(cfg):
+                        cfg["catalog_error"] = "قیمت تازه و تأییدشده از تأمین‌کننده نیامد؛ نرخ قبلی فقط تا پایان مهلت اعتبار حفظ شد."
                     else:
                         cfg["catalog_valid"] = False
-                        cfg["catalog_error"] = str(result.get("stars_quote_error") or "منبع قیمت تازهٔ هر استارز ارائه نکرد.")[:250]
+                        merged_prices["stars_price_trusted"] = False
+                        cfg["catalog_error"] = str(result.get("stars_quote_error") or "قیمت قابل‌فروش از API تأمین‌کنندهٔ احراز‌شده دریافت نشد؛ منبع عمومی فقط مرجع است.")[:300]
 
                     new_premium = result.get("premium_usd") or {}
-                    merged_premium = merged_prices.get("premium_usd") or {}
-                    new_premium_complete = all(_pricing_decimal(new_premium.get(str(m))) is not None for m in (3, 6, 12))
-                    merged_premium_complete = all(_pricing_decimal(merged_premium.get(str(m))) is not None for m in (3, 6, 12))
+                    new_premium_trust = result.get("premium_prices_trusted") or {}
+                    new_premium_complete = (
+                        all(_pricing_decimal(new_premium.get(str(m))) is not None for m in (3, 6, 12))
+                        and all(new_premium_trust.get(str(m)) is True for m in (3, 6, 12))
+                        and _pricing_timestamp_fresh(result.get("premium_source_updated_at"), pricing_engine.SOURCE_MAX_AGE_SECONDS)
+                    )
                     if new_premium_complete:
                         cfg["premium_catalog_valid"] = True
-                        cfg["premium_catalog_updated_at"] = utc_now().isoformat(timespec="seconds")
+                        cfg["premium_catalog_updated_at"] = str(result.get("premium_source_updated_at"))
                         cfg["premium_catalog_error"] = ""
-                    elif merged_premium_complete and _premium_catalog_is_fresh(cfg):
-                        cfg["premium_catalog_error"] = "دریافت تازهٔ بعضی پلن‌ها ناموفق بود؛ کاتالوگ موفق قبلی حفظ شد."
-                    elif merged_premium_complete and cfg.get("premium_catalog_valid") and _pricing_timestamp_fresh(cfg.get("premium_catalog_updated_at"), _PRICING_CATALOG_MAX_AGE_SECONDS):
-                        cfg["premium_catalog_error"] = "کاتالوگ تازه کامل نبود؛ دادهٔ قبلی حفظ شد."
+                    elif _premium_catalog_is_fresh(cfg):
+                        cfg["premium_catalog_error"] = "قیمت تازهٔ تأییدشده برای همه پلن‌ها دریافت نشد؛ کاتالوگ قبلی فقط تا پایان مهلت اعتبار حفظ شد."
                     else:
                         cfg["premium_catalog_valid"] = False
-                        missing = [str(m) for m in (3, 6, 12) if _pricing_decimal(merged_premium.get(str(m))) is None]
-                        cfg["premium_catalog_error"] = "قیمت مرجع پلن‌های " + "، ".join(missing) + " ماهه هنوز موجود نیست."
+                        merged_prices["premium_prices_trusted"] = {"3": False, "6": False, "12": False}
+                        missing = [str(m) for m in (3, 6, 12)
+                                   if new_premium_trust.get(str(m)) is not True
+                                   or _pricing_decimal(new_premium.get(str(m))) is None]
+                        cfg["premium_catalog_error"] = (
+                            "قیمت تأییدشدهٔ پلن‌های " + "، ".join(missing or ["۳، ۶، ۱۲"]) +
+                            " ماهه از API تأمین‌کننده دریافت نشد. منبع عمومی برای فروش استفاده نمی‌شود."
+                        )
                     cfg["catalog_prices"] = merged_prices
+                    if not pricing_engine.stars_feed_usable(cfg) and not _premium_catalog_is_fresh(cfg):
+                        cfg["catalog_failures"] = int(cfg.get("catalog_failures") or 0) + 1
+                        cfg["catalog_retry_after"] = (utc_now() + timedelta(
+                            seconds=_pricing_retry_delay_seconds(cfg["catalog_failures"])
+                        )).isoformat(timespec="seconds")
+                    else:
+                        cfg["catalog_failures"] = 0
+                        cfg["catalog_retry_after"] = ""
             elif name == "fx":
                 if isinstance(result, asyncio.CancelledError):
                     raise result
@@ -3975,7 +3852,7 @@ async def refresh_auto_pricing(force=False, background=False):
                 latest_cfg[key] = cfg.get(key)
         for key in fx_fields:
             latest_cfg[key] = cfg.get(key)
-        latest_cfg["refresh_interval_minutes"] = 30
+        latest_cfg["refresh_interval_minutes"] = pricing_engine.REFRESH_INTERVAL_MINUTES
         save_auto_pricing_config(latest_cfg)
         cfg = load_auto_pricing_config()
         if cfg.get("enabled") and cfg.get("fx_valid") and _pricing_timestamp_fresh(cfg.get("fx_source_updated_at"), _PRICING_FX_MAX_AGE_SECONDS):
@@ -3993,7 +3870,7 @@ async def refresh_auto_pricing(force=False, background=False):
 
 
 async def auto_pricing_refresh_loop(application):
-    """Refresh the Nobitex public FX API every 30m and the product catalog every 30m."""
+    """Refresh the verified FX feed and product catalog every 60 minutes."""
     while True:
         try:
             await refresh_auto_pricing(force=False, background=True)
@@ -8774,10 +8651,10 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if data == "admin_pricing_interval":
             cfg = load_auto_pricing_config()
-            cfg["refresh_interval_minutes"] = 30
+            cfg["refresh_interval_minutes"] = pricing_engine.REFRESH_INTERVAL_MINUTES
             save_auto_pricing_config(cfg)
             await query.edit_message_text(
-                pricing_panel_text(cfg, "✅ چرخهٔ به‌روزرسانی طبق تنظیم ثابت، هر ۳۰ دقیقه است."),
+                pricing_panel_text(cfg, "✅ چرخهٔ به‌روزرسانی طبق تنظیم ثابت، هر ۶۰ دقیقه است."),
                 reply_markup=pricing_panel_keyboard(cfg),
             )
             return
@@ -10779,10 +10656,10 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return
 
         if field == "refresh_interval_minutes":
-            cfg["refresh_interval_minutes"] = 30
+            cfg["refresh_interval_minutes"] = pricing_engine.REFRESH_INTERVAL_MINUTES
             user_data.pop("pricing_admin_state", None)
             save_auto_pricing_config(cfg)
-            await message.reply_text("✅ فاصلهٔ به‌روزرسانی ثابت است و هر ۳۰ دقیقه انجام می‌شود.", reply_markup=pricing_panel_keyboard(cfg))
+            await message.reply_text("✅ فاصلهٔ به‌روزرسانی ثابت است و هر ۶۰ دقیقه انجام می‌شود.", reply_markup=pricing_panel_keyboard(cfg))
             return
         elif field in {"margin_percent", "fee_percent"}:
             try:
@@ -12343,6 +12220,36 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 # ==========================================
+# پشتیبان‌گیری ایمن دیتابیس
+# ==========================================
+
+async def health_command(update, context):
+    """Admin-only, read-only operational report; never exposes secrets or customer data."""
+    user = update.effective_user
+    message = update.effective_message
+    if not user or user.id != ADMIN_ID:
+        if message:
+            await message.reply_text("⛔ دسترسی مجاز نیست.")
+        return
+    try:
+        cfg = load_auto_pricing_config()
+        report = await asyncio.to_thread(
+            health_monitor.format_health_report, DB_FILE, DB_BACKUP_DIR, cfg
+        )
+        if message:
+            await message.reply_text(report, disable_web_page_preview=True)
+    except Exception:
+        logger.exception("Could not generate admin health report")
+        if message:
+            await message.reply_text("گزارش سلامت ساخته نشد؛ جزئیات خطا در گزارش فنی ثبت شد.")
+
+
+async def database_backup_loop(application):
+    """Delegate safe daily SQLite snapshots to the dedicated backup manager."""
+    await run_backup_loop(DB_FILE, DB_BACKUP_DIR, logger=logger, keep=7)
+
+
+# ==========================================
 # اجرای ربات
 # ==========================================
 
@@ -12359,6 +12266,7 @@ def main():
         await application.bot.set_my_commands([
             BotCommand("start", "نمایش منوی فروشگاه"),
             BotCommand("admin", "پنل مدیریت"),
+            BotCommand("health", "گزارش سلامت فنی (مدیر)"),
         ])
 
     async def post_init(application):
@@ -12367,6 +12275,11 @@ def main():
         if refresh_task is None or refresh_task.done():
             application.bot_data["_auto_pricing_refresh_task"] = application.create_task(
                 auto_pricing_refresh_loop(application), name="seyed-premium-auto-pricing"
+            )
+        backup_task = application.bot_data.get("_database_backup_task")
+        if backup_task is None or backup_task.done():
+            application.bot_data["_database_backup_task"] = application.create_task(
+                database_backup_loop(application), name="seyed-premium-database-backups"
             )
     app = (
         Application.builder()
@@ -12391,6 +12304,7 @@ def main():
     app.add_handler(TypeHandler(Update, trace_update), group=-1)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin))
+    app.add_handler(CommandHandler("health", health_command))
     app.add_handler(CommandHandler("cancel", cancel_coupon_creation))
     app.add_handler(CallbackQueryHandler(callbacks))
     if PreCheckoutQueryHandler is not None:
