@@ -4,14 +4,6 @@ services:
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: python start.py
-    disk:
-      name: seyed-premium-shop-data
-      mountPath: /opt/render/project/src/data
-      sizeGB: 1
     envVars:
       - key: BOT_TOKEN
         sync: false
-      - key: SHOP_DB_PATH
-        value: /opt/render/project/src/data/shop.db
-      - key: DB_BACKUP_DIR
-        value: /opt/render/project/src/data/backups
