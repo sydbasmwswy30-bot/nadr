@@ -6,6 +6,7 @@ any value is allowed into the central checkout pricing engine.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -13,7 +14,8 @@ import pricing_engine
 
 
 def extract_supplier_catalog_timestamp(payload: dict[str, Any], catalog: dict[str, Any],
-                                       *, now: datetime | None = None) -> str:
+                                       *, now: datetime | None = None,
+                                       response_date: Any = None) -> str:
     """Require a verifiable source time or age; never substitute HTTP receipt time."""
     containers: list[dict[str, Any]] = [payload, catalog]
     for obj in (payload, catalog):
@@ -50,11 +52,31 @@ def extract_supplier_catalog_timestamp(payload: dict[str, Any], catalog: dict[st
             if age < -60 or age > pricing_engine.SOURCE_MAX_AGE_SECONDS:
                 raise ValueError("کاتالوگ تأمین‌کننده قدیمی یا دارای زمان نامعتبر است.")
             return parsed.isoformat(timespec="seconds")
-    raise ValueError("API تأمین‌کننده زمان واقعی کاتالوگ را اعلام نکرد؛ قیمت برای فروش تأیید نمی‌شود.")
+    # TgSuperstars' documented GET /products response does not include a catalog
+    # timestamp. Its authenticated endpoint is documented as returning current
+    # prices; in that specific case use the HTTP Date header from the supplier
+    # response as the fetch timestamp (not the local machine clock).
+    if response_date not in (None, ""):
+        parsed = pricing_engine.parse_utc_timestamp(response_date)
+        if parsed is None:
+            try:
+                parsed = parsedate_to_datetime(str(response_date))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                parsed = parsed.astimezone(timezone.utc)
+            except (TypeError, ValueError, OverflowError):
+                parsed = None
+        if parsed is not None:
+            age = (current - parsed).total_seconds()
+            if -60 <= age <= pricing_engine.SOURCE_MAX_AGE_SECONDS:
+                return parsed.isoformat(timespec="seconds")
+            raise ValueError("زمان پاسخ HTTP تأمین‌کننده قدیمی یا نامعتبر است.")
+    raise ValueError("API تأمین‌کننده زمان کاتالوگ یا هدر معتبر Date را اعلام نکرد؛ قیمت برای فروش تأیید نمی‌شود.")
 
 
-def parse_tgsuperstars_catalog(payload: Any, *, now: datetime | None = None) -> dict[str, Any]:
-    """Validate authenticated supplier data, accepting only explicit USDT costs."""
+def parse_tgsuperstars_catalog(payload: Any, *, now: datetime | None = None,
+                               response_date: Any = None) -> dict[str, Any]:
+    """Validate authenticated supplier data using the documented USD currency."""
     if not isinstance(payload, dict):
         raise ValueError("پاسخ تأمین‌کننده ساختار JSON معتبر ندارد.")
     catalog = payload.get("data", payload)
@@ -71,15 +93,18 @@ def parse_tgsuperstars_catalog(payload: Any, *, now: datetime | None = None) -> 
     ))
     if stale:
         raise ValueError("تأمین‌کننده دادهٔ قدیمی یا ناموجود اعلام کرد.")
-    source_updated_at = extract_supplier_catalog_timestamp(payload, catalog, now=now)
+    source_updated_at = extract_supplier_catalog_timestamp(payload, catalog, now=now, response_date=response_date)
 
     stars_info = catalog.get("stars") or {}
     if not isinstance(stars_info, dict):
         raise ValueError("ساختار قیمت استارز در کاتالوگ معتبر نیست.")
     currency = str(stars_info.get("currency") or catalog.get("currency") or "").upper()
     unit_price = pricing_engine.positive_decimal(stars_info.get("price_per_star"))
-    if currency != "USDT" or unit_price is None:
-        raise ValueError("قیمت استارز تأمین‌کننده باید مبلغ مثبت با واحد صریح USDT باشد.")
+    # TgSuperstars documentation labels the partner catalog currency as USD,
+    # while its prepaid Stars/Premium balance is funded in USDT. Treat the
+    # documented USD denomination as the supplier's USDT-equivalent cost.
+    if currency not in {"USD", "USDT"} or unit_price is None:
+        raise ValueError("قیمت استارز تأمین‌کننده باید مبلغ مثبت با واحد USD اعلام‌شده در کاتالوگ باشد.")
 
     premium_raw = catalog.get("premium") or {}
     if not isinstance(premium_raw, dict):
@@ -92,7 +117,7 @@ def parse_tgsuperstars_catalog(payload: Any, *, now: datetime | None = None) -> 
             continue
         plan_currency = str(item.get("currency") or catalog.get("currency") or "").upper()
         amount = pricing_engine.positive_decimal(item.get("partner_price"))
-        if plan_currency == "USDT" and amount is not None:
+        if plan_currency in {"USD", "USDT"} and amount is not None:
             premium_prices[str(months)] = str(amount)
             premium_trusted[str(months)] = True
 

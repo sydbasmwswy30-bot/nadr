@@ -3290,13 +3290,30 @@ async def _fetch_public_price_catalog(client):
 
 
 async def _fetch_tgsuperstars_price_catalog(client, api_key):
-    """Fetch authenticated wholesale catalog, then validate it in pricing_sources."""
+    """Fetch the documented authenticated supplier catalog with actionable errors."""
+    if not api_key or not str(api_key).startswith("pk_live_"):
+        raise ValueError("کلید API تأمین‌کننده خالی یا نامعتبر است؛ کلید فعال با پیشوند pk_live_ لازم است.")
     response = await client.get(
         _PROVIDER_PRODUCTS_URL,
         headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
     )
-    response.raise_for_status()
-    return pricing_sources.parse_tgsuperstars_catalog(response.json())
+    if response.status_code == 401:
+        raise ValueError("TgSuperstars خطای 401 داد: کلید pk_live_ اشتباه، باطل یا متعلق به حساب دیگری است. کلید را از داشبورد تأمین‌کننده دوباره صادر و در پنل ربات ثبت کنید.")
+    if response.status_code == 403:
+        try:
+            detail = response.json()
+        except Exception:
+            detail = response.text[:200]
+        raise ValueError(f"TgSuperstars دسترسی را رد کرد (403؛ احتمالاً IP مجاز نیست یا حساب فعال نشده): {str(detail)[:200]}")
+    if response.status_code >= 400:
+        raise ValueError(f"TgSuperstars HTTP {response.status_code}: {response.text[:200]}")
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise ValueError("پاسخ TgSuperstars JSON معتبر نیست.") from exc
+    return pricing_sources.parse_tgsuperstars_catalog(
+        payload, response_date=response.headers.get("Date")
+    )
 
 
 def _merge_quote_catalog(primary, fallback):
@@ -3683,35 +3700,12 @@ async def refresh_auto_pricing(force=False, background=False):
             follow_redirects=True,
         ) as client:
             async def fetch_catalog():
-                # The authenticated supplier is the only executable price source.
-                # The public intermediary may fill reference fields for diagnostics,
-                # but those values are explicitly marked untrusted and cannot price orders.
-                supplier_task = (
-                    asyncio.create_task(_fetch_tgsuperstars_price_catalog(client, api_key))
-                    if api_key else None
-                )
-                public_task = asyncio.create_task(_fetch_public_price_catalog(client))
-                supplier_result = None
-                if supplier_task is not None:
-                    supplier_result = (await asyncio.gather(supplier_task, return_exceptions=True))[0]
-                public_result = (await asyncio.gather(public_task, return_exceptions=True))[0]
-                supplier_catalog = supplier_result if isinstance(supplier_result, dict) else None
-                public_catalog = public_result if isinstance(public_result, dict) else None
-                if isinstance(supplier_result, asyncio.CancelledError):
-                    raise supplier_result
-                if isinstance(public_result, asyncio.CancelledError):
-                    raise public_result
-                if isinstance(supplier_result, BaseException):
-                    logger.warning("Authenticated supplier catalog unavailable; public reference remains display-only: %s", supplier_result)
-                if isinstance(public_result, BaseException):
-                    logger.warning("Public reference catalog unavailable: %s", public_result)
-                if supplier_catalog and public_catalog:
-                    return _merge_quote_catalog(supplier_catalog, public_catalog)
-                if supplier_catalog:
-                    return supplier_catalog
-                if public_catalog:
-                    return public_catalog
-                raise RuntimeError("کاتالوگ تأمین‌کننده و منبع عمومی هیچ قیمت معتبری ارائه نکردند.")
+                # Only the authenticated supplier catalog may provide executable
+                # costs. The retired/unofficial public intermediary is deliberately
+                # not queried: its 401 responses added noise and never authorized sales.
+                if not api_key:
+                    raise ValueError("کلید API تأمین‌کننده در تنظیمات ثبت نشده است؛ کاتالوگ قابل دریافت نیست.")
+                return await _fetch_tgsuperstars_price_catalog(client, api_key)
 
             tasks = []
             if catalog_due:
@@ -10629,8 +10623,10 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 await message.delete()
             except Exception:
                 logger.debug("Could not delete pricing API key message", exc_info=True)
-            if len(raw_value) < 12 or len(raw_value) > 512 or any(ch.isspace() for ch in raw_value):
-                await message.reply_text("❌ کلید API از نظر قالب معتبر نیست. کلید درست را دوباره بفرست یا /cancel را بزن.")
+            if (len(raw_value) < 12 or len(raw_value) > 512
+                    or any(ch.isspace() for ch in raw_value)
+                    or not raw_value.startswith("pk_live_")):
+                await message.reply_text("❌ قالب کلید معتبر نیست. کلید فعال TgSuperstars باید با pk_live_ شروع شود. کلید را از داشبورد تأمین‌کننده کپی کن یا /cancel را بزن.")
                 return
             cfg["provider_api_key"] = raw_value
             cfg["catalog_valid"] = False
