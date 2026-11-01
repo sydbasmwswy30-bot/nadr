@@ -5702,7 +5702,7 @@ def stars_admin_home_text(note=""):
         f"⚙️ قیمت‌گذاری خودکار: {'🟢 روشن' if manager['auto_enabled'] else '🔴 خاموش'}",
         f"💵 قیمت پایهٔ هر ⭐: {manager['base_usd_per_star']} دلار",
         f"💱 نرخ دلار آزاد: {usd_text}",
-        f"✍️ نرخ دستی دلار: {f"{toman(manager['manual_usd_toman'])} تومان" if manager['manual_usd_toman'] else 'خودکار (منبع زنده)'}",
+        f"✍️ نرخ دستی دلار: {toman(manager['manual_usd_toman'])} تومان" if manager['manual_usd_toman'] else "✍️ نرخ دستی دلار: خودکار (منبع زنده)",
         f"🌐 منبع: {fx.get('usd_market_source_name') or 'ثبت نشده'}",
         f"🕒 زمان نرخ: {_pricing_time_text(fx.get('usd_market_source_updated_at'))}",
         f"📡 وضعیت منابع: {fx_state} | منابع سالم: {int(fx.get('usd_market_sources_ok') or 0)}/2",
