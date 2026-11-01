@@ -1473,6 +1473,234 @@ def save_gift_settings(cfg):
     return load_gift_settings()
 
 
+# Stars pricing is isolated from the general USDT-based price engine so that
+# Telegram Stars use the USD free-market rate, while other categories keep
+# their existing settings and calculation path.
+STARS_MANAGER_KEY = "stars_management_settings_v1"
+STARS_MANAGER_DEFAULTS = {
+    "auto_enabled": True,
+    "base_usd_per_star": "0.015",
+    "manual_unit_toman": 0,
+    "manual_usd_toman": 0,
+    "profit_percent": "30",
+    "min_order": 50,
+    "max_order": 1_000_000,
+}
+
+
+def load_stars_manager_settings():
+    cfg = deepcopy(STARS_MANAGER_DEFAULTS)
+    stored = None
+    try:
+        with db() as con:
+            row = con.execute("SELECT value FROM app_settings WHERE key=?", (STARS_MANAGER_KEY,)).fetchone()
+        if row:
+            stored = json.loads(row["value"] or "{}")
+    except (sqlite3.Error, ValueError, TypeError, KeyError):
+        logger.warning("Stars management settings could not be loaded", exc_info=True)
+    if isinstance(stored, dict):
+        cfg.update(stored)
+    else:
+        # Preserve an explicitly configured legacy Stars base rate, if one exists.
+        try:
+            legacy = load_premium_manager_settings()
+            if legacy.get("star_rate_toman_explicit"):
+                cfg["manual_unit_toman"] = int(legacy.get("star_rate_toman") or 0)
+            auto_cfg = load_auto_pricing_config()
+            cfg["profit_percent"] = str(auto_cfg.get("margin_percent") or cfg["profit_percent"])
+        except Exception:
+            logger.debug("Legacy Stars settings migration was not available", exc_info=True)
+    cfg["auto_enabled"] = bool(cfg.get("auto_enabled", True))
+    try:
+        base_usd = Decimal(str(cfg.get("base_usd_per_star", "0.015")).strip())
+        cfg["base_usd_per_star"] = str(base_usd) if base_usd.is_finite() and Decimal("0.000001") <= base_usd <= Decimal("100") else "0.015"
+    except (InvalidOperation, TypeError, ValueError):
+        cfg["base_usd_per_star"] = "0.015"
+    try:
+        manual_rate = int(normalize_ascii_digits(str(cfg.get("manual_unit_toman", 0))).replace(",", "").replace("٬", ""))
+        cfg["manual_unit_toman"] = manual_rate if 0 <= manual_rate <= 100_000_000 else 0
+    except (TypeError, ValueError):
+        cfg["manual_unit_toman"] = 0
+    try:
+        manual_fx = int(normalize_ascii_digits(str(cfg.get("manual_usd_toman", 0))).replace(",", "").replace("٬", ""))
+        cfg["manual_usd_toman"] = manual_fx if manual_fx == 0 or 1000 <= manual_fx <= 100_000_000 else 0
+    except (TypeError, ValueError):
+        cfg["manual_usd_toman"] = 0
+    try:
+        margin = Decimal(str(cfg.get("profit_percent", "30")))
+        cfg["profit_percent"] = str(margin) if margin.is_finite() and 0 <= margin <= 500 else "30"
+    except (InvalidOperation, TypeError, ValueError):
+        cfg["profit_percent"] = "30"
+    try:
+        minimum = int(normalize_ascii_digits(str(cfg.get("min_order", 50))).replace(",", "").replace("٬", ""))
+        maximum = int(normalize_ascii_digits(str(cfg.get("max_order", 1_000_000))).replace(",", "").replace("٬", ""))
+        if not 1 <= minimum <= maximum <= 1_000_000:
+            raise ValueError("invalid Stars order range")
+        cfg["min_order"], cfg["max_order"] = minimum, maximum
+    except (TypeError, ValueError):
+        cfg["min_order"], cfg["max_order"] = 50, 1_000_000
+    return cfg
+
+
+def save_stars_manager_settings(cfg):
+    current = load_stars_manager_settings()
+    if isinstance(cfg, dict):
+        current.update(cfg)
+    # Normalize through the same validation used by readers before persistence.
+    current["auto_enabled"] = bool(current.get("auto_enabled"))
+    try:
+        base_usd = Decimal(str(current.get("base_usd_per_star", "0.015")).strip())
+        if not base_usd.is_finite() or not Decimal("0.000001") <= base_usd <= Decimal("100"):
+            raise InvalidOperation
+        current["base_usd_per_star"] = str(base_usd)
+        margin = Decimal(str(current.get("profit_percent", "30")))
+        if not margin.is_finite() or not 0 <= margin <= 500:
+            raise InvalidOperation
+        current["profit_percent"] = str(margin)
+        minimum = int(current.get("min_order", 50))
+        maximum = int(current.get("max_order", 1_000_000))
+        if not 1 <= minimum <= maximum <= 1_000_000:
+            raise ValueError("invalid Stars order range")
+        current["min_order"], current["max_order"] = minimum, maximum
+        manual = int(current.get("manual_unit_toman", 0) or 0)
+        if not 0 <= manual <= 100_000_000:
+            raise ValueError("invalid manual Stars rate")
+        current["manual_unit_toman"] = manual
+        manual_fx = int(current.get("manual_usd_toman", 0) or 0)
+        if manual_fx != 0 and not 1000 <= manual_fx <= 100_000_000:
+            raise ValueError("invalid manual USD/Toman rate")
+        current["manual_usd_toman"] = manual_fx
+    except (InvalidOperation, TypeError, ValueError, OverflowError):
+        raise ValueError("تنظیمات استارز معتبر نیستند؛ مقدار قبلی حفظ شد.")
+    with db() as con:
+        con.execute(
+            "INSERT INTO app_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (STARS_MANAGER_KEY, json.dumps(current, ensure_ascii=False)),
+        )
+    return load_stars_manager_settings()
+
+
+def stars_order_bounds():
+    cfg = load_stars_manager_settings()
+    return int(cfg["min_order"]), int(cfg["max_order"])
+
+
+def is_valid_stars_quantity(amount):
+    try:
+        amount = int(amount)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    minimum, maximum = stars_order_bounds()
+    return minimum <= amount <= maximum
+
+
+def stars_pricing_quote(quantity, auto_cfg=None):
+    """Quote Stars using USD free-market Toman or the saved manual Toman fallback."""
+    try:
+        quantity = int(quantity)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not is_valid_stars_quantity(quantity):
+        return None
+    manager = load_stars_manager_settings()
+    auto_cfg = auto_cfg or load_auto_pricing_config()
+    base_usd = _pricing_decimal(manager.get("base_usd_per_star"))
+    try:
+        margin = Decimal(str(manager.get("profit_percent", "30")))
+        if not margin.is_finite() or not 0 <= margin <= 500:
+            raise InvalidOperation
+    except (InvalidOperation, TypeError, ValueError):
+        margin = Decimal("30")
+    fx = None
+    source = "قیمت دستی مدیر"
+    source_updated_at = ""
+    cost_unit_toman = None
+    if manager.get("auto_enabled"):
+        manual_fx = _pricing_decimal(manager.get("manual_usd_toman"))
+        candidate_fx = _pricing_decimal(auto_cfg.get("usd_market_rate_toman"))
+        fx_available = bool(auto_cfg.get("usd_market_valid") and candidate_fx)
+        if base_usd is not None and manual_fx is not None and manual_fx > 0:
+            fx = manual_fx
+            cost_unit_toman = base_usd * fx
+            source = "نرخ دستی دلار × قیمت پایهٔ دلاری"
+        elif fx_available and base_usd is not None:
+            fx = candidate_fx
+            cost_unit_toman = base_usd * fx
+            fx_fresh = _pricing_timestamp_fresh(
+                auto_cfg.get("usd_market_source_updated_at"), _PRICING_FX_MAX_AGE_SECONDS
+            )
+            source = "دلار آزاد × قیمت پایهٔ دلاری" if fx_fresh else "آخرین نرخ تأییدشدهٔ دلار آزاد × قیمت پایهٔ دلاری"
+            source_updated_at = str(auto_cfg.get("usd_market_source_updated_at") or "")
+    if cost_unit_toman is None:
+        manual = _pricing_decimal(manager.get("manual_unit_toman"))
+        if manual is None or manual <= 0:
+            return None
+        cost_unit_toman = manual
+        source = "نرخ دستی مدیر (پشتیبان)" if manager.get("auto_enabled") else "نرخ دستی مدیر"
+    cost_toman = _ceil_toman(cost_unit_toman * Decimal(quantity))
+    sale_toman = _ceil_toman(Decimal(cost_toman) * (Decimal(100) + margin) / Decimal(100))
+    return {
+        "product_type": "stars", "quantity": quantity,
+        "cost_toman": cost_toman, "fee_toman": 0,
+        "sale_toman": sale_toman, "profit_toman": sale_toman - cost_toman,
+        "margin_percent": str(margin), "fee_percent": "0",
+        "base_usd_per_star": str(base_usd or ""),
+        "cost_usd": str(base_usd * Decimal(quantity)) if fx and base_usd is not None else "",
+        "fx_rate_toman": str(fx or ""),
+        "source": source, "source_updated_at": source_updated_at,
+        "manual_price": not bool(fx),
+    }
+
+
+def stars_pricing_unit_cost():
+    """Return the current pre-margin unit cost for the Stars admin breakdown."""
+    manager = load_stars_manager_settings()
+    if manager.get("auto_enabled"):
+        base_usd = _pricing_decimal(manager.get("base_usd_per_star"))
+        manual_fx = _pricing_decimal(manager.get("manual_usd_toman"))
+        fx_cfg = load_auto_pricing_config()
+        live_fx = _pricing_decimal(fx_cfg.get("usd_market_rate_toman")) if fx_cfg.get("usd_market_valid") else None
+        selected_fx = manual_fx or live_fx
+        if base_usd is not None and selected_fx is not None:
+            return base_usd * selected_fx
+    manual_cost = _pricing_decimal(manager.get("manual_unit_toman"))
+    return manual_cost if manual_cost is not None and manual_cost > 0 else None
+
+
+def stars_pricing_unit_sale():
+    quote = stars_pricing_quote(max(1, stars_order_bounds()[0]))
+    if not quote:
+        return None
+    return (Decimal(quote["sale_toman"]) / Decimal(quote["quantity"])).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
+
+
+def stars_rate_customer_status_text():
+    """Customer-facing status must never expose provider outages or API errors."""
+    manager = load_stars_manager_settings()
+    cfg = load_auto_pricing_config()
+    if not manager["auto_enabled"]:
+        return "قیمت‌گذاری با نرخ ثبت‌شدهٔ مدیر انجام می‌شود."
+    if manager.get("manual_usd_toman"):
+        return "قیمت‌گذاری با نرخ دلار تنظیم‌شده انجام می‌شود."
+    if cfg.get("usd_market_valid") and _pricing_decimal(cfg.get("usd_market_rate_toman")):
+        return "قیمت به‌صورت خودکار بر اساس آخرین نرخ تأییدشده محاسبه می‌شود."
+    if manager.get("manual_unit_toman"):
+        return "قیمت بر اساس نرخ پشتیبان ثبت‌شده محاسبه می‌شود."
+    return "قیمت سفارش پس از آماده‌شدن نرخ معتبر نمایش داده می‌شود."
+
+
+def stars_support_attach(text, button_rows=None):
+    """Append the configured first-support message to manual Stars order confirmations."""
+    settings = load_gift_settings()
+    rows = list(button_rows or [])
+    if settings.get("support_first"):
+        support_text = str(settings.get("support_text") or GIFT_DEFAULT_SETTINGS["support_text"]).strip()
+        if support_text:
+            text = str(text) + "\n\n" + support_text
+        rows.append([InlineKeyboardButton("💬 پیام به پشتیبانی", callback_data="support", style="primary")])
+    return text, rows
+
+
 def iran_timestamp_now():
     return utc_now().isoformat(timespec="seconds")
 
@@ -1658,7 +1886,6 @@ def gift_admin_home_keyboard():
         [InlineKeyboardButton("🟢 افزایش موجودی استارز ربات (مشترک خدمات)", callback_data="gift_star_topup", style="success")],
         [InlineKeyboardButton("🔵 انتخاب روش ارسال توسط مشتری: " + ("روشن" if settings['customer_delivery_choice'] else "خاموش"), callback_data="gift_customer_choice", style="primary")],
         [InlineKeyboardButton("✋ مدیریت روش تحویل تک‌تک گیفت‌ها", callback_data="gift_delivery_page_1", style="primary")],
-        [InlineKeyboardButton("💹 مدیریت نرخ، تتر، سود و کارمزد در مرکز اصلی", callback_data="admin_auto_pricing", style="success")],
         [InlineKeyboardButton("📩 «اول به پشتیبانی پیام بده»: " + ("روشن" if settings['support_first'] else "خاموش"), callback_data="gift_support_first", style="primary")],
         [InlineKeyboardButton("📝 متن پیام «اول به پشتیبانی پیام بده»", callback_data="gift_support_text", style="primary")],
         [InlineKeyboardButton("📋 سفارش‌های گیفت", callback_data="gift_orders", style="primary")],
@@ -2460,6 +2687,12 @@ def _auto_pricing_defaults():
         "usd_market_source_updated_at": "",
         "usd_market_source_name": "",
         "usd_market_error": "نرخ دلار بازار آزاد هنوز دریافت نشده است.",
+        "usd_market_attempted_at": "",
+        "usd_market_retry_after": "",
+        "usd_market_failures": 0,
+        "usd_market_sources_status": {},
+        "usd_market_sources_ok": 0,
+        "usd_market_alerted_error": "",
     }
 
 
@@ -2691,8 +2924,10 @@ def _pricing_sale_components(cost_usd, fx_rate_toman, margin_percent, fee_percen
 
 
 def auto_pricing_quote(product_type, quantity, cfg=None, allow_stale=False):
-    """Return a quote; allow_stale is only for clearly labelled display previews, never orders."""
+    """Return a quote; Stars are isolated on USD free-market pricing."""
     cfg = cfg or load_auto_pricing_config()
+    if product_type == "stars":
+        return stars_pricing_quote(quantity, cfg)
     fx_rate = _effective_fx_rate(cfg)
     fx_is_fresh = _effective_fx_is_usable(cfg)
     fx_ready = bool(cfg.get("enabled") and fx_rate and (fx_is_fresh or allow_stale))
@@ -3013,7 +3248,7 @@ def premium_admin_text(note=""):
             lines.append("  └ قیمت اختصاصی مدیر (اولویت بالاتر از محاسبهٔ خودکار)")
     lines.extend([
         "",
-        "برای تغییر نرخ ارز، منبع کاتالوگ، سود و کارمزد از دکمهٔ «مدیریت نرخ و قیمت‌گذاری خودکار» استفاده کن.",
+        "قیمت پلن‌ها بر اساس تنظیمات فعال قیمت‌گذاری خودکار محاسبه می‌شود.",
         "قیمت اختصاصی هر پلن همچنان از همین بخش قابل تنظیم است.",
         "تحویل خودکار فقط پس از تأیید پرداخت و کنترل موجودی واقعی Stars انجام می‌شود.",
     ])
@@ -3028,7 +3263,6 @@ def premium_admin_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("⭐ افزایش موجودی استارز ربات", callback_data="gift_star_topup", style="success")],
         [InlineKeyboardButton("⚙️ مدیریت تحویل پلن‌های ۳، ۶ و ۱۲ ماهه", callback_data="premium_delivery_menu", style="primary")],
-        [InlineKeyboardButton("💹 مدیریت نرخ، قیمت مرجع و سود در مرکز قیمت‌گذاری", callback_data="admin_auto_pricing", style="success")],
         [InlineKeyboardButton("💰 قیمت شخصی برای ۳ ماهه", callback_data="premium_plan_price_3", style="primary")],
         [InlineKeyboardButton("💰 قیمت شخصی برای ۶ ماهه", callback_data="premium_plan_price_6", style="primary")],
         [InlineKeyboardButton("💰 قیمت شخصی برای ۱۲ ماهه", callback_data="premium_plan_price_12", style="primary")],
@@ -3065,21 +3299,9 @@ def premium_delivery_text(note=""):
 
 
 def _saved_stars_pack_quote(amount):
-    """Use a saved pack price only in explicit manual mode, never as stale auto-price fallback."""
-    try:
-        # apply_auto_prices_to_products() also writes automatic prices into products.price.
-        # While the central engine is enabled, those stored values are not safe fallbacks.
-        if load_auto_pricing_config().get("enabled"):
-            return None
-        with db() as con:
-            row = con.execute("SELECT price FROM products WHERE lower(category)='stars' AND star_amount=? AND active=1 ORDER BY id LIMIT 1", (int(amount),)).fetchone()
-        price = int(row["price"] or 0) if row else 0
-        if price > 0:
-            return {"product_type": "stars", "quantity": int(amount), "cost_toman": price,
-                    "sale_toman": price, "profit_toman": 0, "margin_percent": "0",
-                    "source": "قیمت دستی/ذخیره‌شدهٔ مدیر", "manual_price": True}
-    except Exception:
-        logger.debug("Could not load saved Stars pack price", exc_info=True)
+    """Never treat products.price as a Stars quote: older auto-syncs may have written stale values."""
+    # All Stars prices now come from the isolated Stars manager (or its last verified
+    # USD-market snapshot). A legacy products.price value has no reliable provenance.
     return None
 
 
@@ -3102,6 +3324,9 @@ def dynamic_product_quote(product, cfg=None):
         quote = premium_price_quote(months, auto_cfg=cfg) if months else None
     if quote is not None:
         return quote
+    if category == "stars":
+        # Stars must not fall through to a product-table price written by an older engine.
+        return None
     if category in {"stars", "premium"} and cfg.get("enabled"):
         # A cached DB price may have been produced by a previous automatic refresh.
         # Do not let it become a new checkout quote after its feed has expired.
@@ -3747,6 +3972,112 @@ async def _fetch_live_fx_toman(client):
     return tether["rate"], tether["updated_at"], tether["symbol"], tether["source"]
 
 
+async def _fetch_live_usd_market_bundle(client):
+    """Fetch USD free-market Toman independently from USDT exchange prices."""
+    headers = {
+        "Accept": "application/json", "User-Agent": "SEYED-PREMIUM-USD-FX/1.0",
+        "Cache-Control": "no-cache, no-store, max-age=0", "Pragma": "no-cache",
+    }
+
+    async def json_get(url):
+        response = await client.get(url, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict):
+            raise ValueError("پاسخ نرخ دلار ساختار معتبر ندارد.")
+        return data
+
+    async def iran_market_data():
+        payload = await json_get("https://raw.githubusercontent.com/iran-market/iran-market.github.io/main/data/latest-toman.json")
+        found = []
+        def walk(node):
+            if isinstance(node, dict):
+                if str(node.get("symbol") or "") == "USD_IRR_FREE":
+                    found.append(node)
+                for value in node.values():
+                    walk(value)
+            elif isinstance(node, list):
+                for value in node:
+                    walk(value)
+        walk(payload)
+        if not found:
+            raise ValueError("نماد دلار آزاد USD_IRR_FREE در پاسخ پیدا نشد.")
+        record = found[0]
+        if str(record.get("currency") or "").upper() not in {"IRT", "TOMAN", "TMN"}:
+            raise ValueError("واحد نرخ منبع اول تومان تأیید نشد.")
+        if str(record.get("market") or "").lower() not in {"iran_free", "free", "open_market"}:
+            raise ValueError("بازار نرخ منبع اول بازار آزاد نیست.")
+        if record.get("stale") is True or "stale" in str(record.get("quality") or "").lower():
+            raise ValueError("دادهٔ دلار منبع اول کهنه علامت‌گذاری شده است.")
+        rate = _pricing_decimal(record.get("price"))
+        raw_updated = record.get("timestamp") or record.get("updated_at")
+        updated = _pricing_time(raw_updated)
+        if updated is None and raw_updated not in (None, ""):
+            try:
+                numeric_timestamp = float(raw_updated)
+                if numeric_timestamp > 100_000_000_000:
+                    numeric_timestamp /= 1000.0
+                updated = datetime.fromtimestamp(numeric_timestamp, tz=timezone.utc)
+            except (TypeError, ValueError, OverflowError, OSError):
+                updated = None
+        if rate is None or not Decimal("1000") <= rate <= Decimal("100000000") or updated is None:
+            raise ValueError("قیمت یا زمان منبع اول معتبر نیست.")
+        age = (utc_now() - updated).total_seconds()
+        if age < -60 or age > 40 * 60:
+            raise ValueError("زمان نرخ دلار منبع اول بیش از ۴۰ دقیقه قدیمی است.")
+        return {"rate": rate, "updated_at": updated.isoformat(timespec="seconds"), "source": "Iran Market Data (USD بازار آزاد)", "symbol": "USD_IRR_FREE"}
+
+    async def nerkhsanj():
+        payload = await json_get("https://nerkh.jahankhahan.shop/data/live.json")
+        rates = payload.get("rates") if isinstance(payload.get("rates"), dict) else {}
+        rate = _pricing_decimal(rates.get("dollar"))
+        date_text = str(payload.get("date") or payload.get("jalali_date") or "").strip()
+        time_text = str(payload.get("time") or "").strip()
+        if rate is None or not Decimal("1000") <= rate <= Decimal("100000000"):
+            raise ValueError("قیمت دلار منبع دوم معتبر نیست.")
+        dm = re.search(r"(\d{4})[/\-](\d{1,2})[/\-](\d{1,2})", date_text)
+        tm = re.search(r"(\d{1,2}):(\d{2})(?::(\d{2}))?", time_text)
+        if not dm or not tm:
+            raise ValueError("تاریخ یا ساعت به‌روزرسانی منبع دوم موجود نیست.")
+        # Build the exact Tehran-local timestamp, then convert it to UTC.
+        local_date = jalali_to_gregorian(int(dm.group(1)), int(dm.group(2)), int(dm.group(3)))
+        local_dt = local_date.replace(hour=int(tm.group(1)), minute=int(tm.group(2)), second=int(tm.group(3) or 0))
+        updated = local_dt.astimezone(timezone.utc)
+        age = (utc_now() - updated).total_seconds()
+        if age < -60 or age > 15 * 60:
+            raise ValueError("زمان نرخ دلار منبع دوم بیش از ۱۵ دقیقه قدیمی است یا بازار بسته است.")
+        return {"rate": rate, "updated_at": updated.isoformat(timespec="seconds"), "source": "Nerkhsanj (USD بازار آزاد)", "symbol": "USD_FREE"}
+
+    results = await asyncio.gather(iran_market_data(), nerkhsanj(), return_exceptions=True)
+    names = ("Iran Market Data", "Nerkhsanj")
+    good, statuses = [], {}
+    for name, result in zip(names, results):
+        if isinstance(result, asyncio.CancelledError):
+            raise result
+        if isinstance(result, BaseException):
+            statuses[name] = {"ok": False, "error": str(result)[:180]}
+        else:
+            statuses[name] = {"ok": True, "rate": str(result["rate"]), "updated_at": result["updated_at"]}
+            good.append(result)
+    if not good:
+        detail = "؛ ".join(f"{name}: {status.get('error','ناموفق')}" for name, status in statuses.items())
+        raise RuntimeError("هیچ منبع معتبر دلار آزاد در دسترس نبود؛ نرخ قبلی حفظ شد. " + detail)
+    if len(good) == 2:
+        low, high = sorted(item["rate"] for item in good)
+        spread = (high - low) / low if low else Decimal("999")
+        if spread > Decimal("0.04"):
+            raise RuntimeError("اختلاف دو منبع دلار آزاد بیش از ۴٪ است؛ برای جلوگیری از قیمت اشتباه، نرخ جدید پذیرفته نشد.")
+        rate = (good[0]["rate"] + good[1]["rate"]) / Decimal(2)
+        updated = min(_pricing_time(item["updated_at"]) for item in good)
+        source = "میانگین دو منبع مستقل دلار آزاد"
+    else:
+        rate = good[0]["rate"]
+        updated = _pricing_time(good[0]["updated_at"])
+        source = good[0]["source"] + " (منبع پشتیبان)"
+    return {"rate": rate, "updated_at": updated.isoformat(timespec="seconds"), "source": source,
+            "sources_status": statuses, "sources_ok": len(good), "sources_failed": 2-len(good)}
+
+
 def _pricing_feed_due(cfg, attempted_key, retry_key, interval_seconds):
     retry_at = _pricing_time(cfg.get(retry_key))
     if retry_at is not None:
@@ -3798,20 +4129,28 @@ async def refresh_auto_pricing(force=False, background=False):
         fx_due = _pricing_feed_due(
             cfg, "fx_attempted_at", "fx_retry_after", _FX_REFRESH_COOLDOWN_SECONDS
         )
+        usd_market_due = _pricing_feed_due(
+            cfg, "usd_market_attempted_at", "usd_market_retry_after", _FX_REFRESH_COOLDOWN_SECONDS
+        )
         force_allowed = bool(force) and (
             _pricing_timestamp_age(cfg.get("catalog_attempted_at")) is None
             or _pricing_timestamp_age(cfg.get("catalog_attempted_at")) >= _PROVIDER_FORCE_REFRESH_COOLDOWN_SECONDS
             or _pricing_timestamp_age(cfg.get("fx_attempted_at")) is None
             or _pricing_timestamp_age(cfg.get("fx_attempted_at")) >= _PROVIDER_FORCE_REFRESH_COOLDOWN_SECONDS
+            or _pricing_timestamp_age(cfg.get("usd_market_attempted_at")) is None
+            or _pricing_timestamp_age(cfg.get("usd_market_attempted_at")) >= _PROVIDER_FORCE_REFRESH_COOLDOWN_SECONDS
         )
         catalog_due = catalog_due or force_allowed
         fx_due = fx_due or force_allowed
+        usd_market_due = usd_market_due or force_allowed
 
         if catalog_due:
             cfg["catalog_attempted_at"] = now_iso
         if fx_due:
             cfg["fx_attempted_at"] = now_iso
-        if catalog_due or fx_due:
+        if usd_market_due:
+            cfg["usd_market_attempted_at"] = now_iso
+        if catalog_due or fx_due or usd_market_due:
             if not background and not force:
                 # Never make a customer-facing button wait on a rate provider.
                 # The 30-minute scheduler refreshes these sources independently.
@@ -3862,6 +4201,8 @@ async def refresh_auto_pricing(force=False, background=False):
                 tasks.append(("catalog", asyncio.create_task(fetch_catalog())))
             if fx_due:
                 tasks.append(("fx", asyncio.create_task(_fetch_live_fx_bundle(client))))
+            if usd_market_due:
+                tasks.append(("usd_market", asyncio.create_task(_fetch_live_usd_market_bundle(client))))
             results = await asyncio.gather(*(task for _name, task in tasks), return_exceptions=True) if tasks else []
 
         for (name, _task), result in zip(tasks, results):
@@ -3951,9 +4292,30 @@ async def refresh_auto_pricing(force=False, background=False):
                         cfg["usd_market_source_name"] = str(usd_market["source"])
                         cfg["usd_market_valid"] = True
                         cfg["usd_market_error"] = ""
-                    else:
-                        cfg["usd_market_valid"] = False
-                        cfg["usd_market_error"] = usd_error or "نرخ مستقل دلار بازار آزاد فعلاً دریافت نشد."
+                    # Otherwise leave the independent USD-market feed untouched. The
+                    # separate usd_market task owns its status and error lifecycle.
+            elif name == "usd_market":
+                if isinstance(result, asyncio.CancelledError):
+                    raise result
+                if isinstance(result, BaseException):
+                    logger.error("USD free-market FX refresh failed; keeping last confirmed USD rate", exc_info=(type(result), result, result.__traceback__))
+                    cfg["usd_market_failures"] = int(cfg.get("usd_market_failures") or 0) + 1
+                    cfg["usd_market_retry_after"] = (utc_now() + timedelta(
+                        seconds=_pricing_retry_delay_seconds(cfg["usd_market_failures"])
+                    )).isoformat(timespec="seconds")
+                    cfg["usd_market_error"] = str(result)[:500] or "دریافت نرخ دلار آزاد ناموفق بود."
+                    # Keep the last valid snapshot for new Stars quotes; admin receives a private outage alert.
+                else:
+                    cfg["usd_market_rate_toman"] = str(result["rate"])
+                    cfg["usd_market_source_updated_at"] = str(result["updated_at"])
+                    cfg["usd_market_source_name"] = str(result["source"])
+                    cfg["usd_market_sources_status"] = result.get("sources_status") or {}
+                    cfg["usd_market_sources_ok"] = int(result.get("sources_ok") or 1)
+                    cfg["usd_market_failures"] = 0
+                    cfg["usd_market_retry_after"] = ""
+                    cfg["usd_market_valid"] = True
+                    cfg["usd_market_error"] = ""
+                    cfg["usd_market_alerted_error"] = ""
 
         # Merge only feed fields into the latest settings snapshot. This prevents a
         # concurrent admin change (enable/disable, margin, fee or API key) from being
@@ -3968,6 +4330,8 @@ async def refresh_auto_pricing(force=False, background=False):
             "fx_rate_toman", "fx_valid", "fx_source_updated_at", "fx_source_name", "fx_source_symbol",
             "fx_fetched_at", "fx_attempted_at", "fx_error", "usd_market_rate_toman",
             "usd_market_valid", "usd_market_source_updated_at", "usd_market_source_name", "usd_market_error",
+            "usd_market_attempted_at", "usd_market_retry_after", "usd_market_failures",
+            "usd_market_sources_status", "usd_market_sources_ok", "usd_market_alerted_error",
             "fx_sources_ok", "fx_sources_failed", "fx_sources_status", "fx_failures", "fx_retry_after",
         )
         if str(latest_cfg.get("provider_api_key") or "").strip() == api_key:
@@ -4002,24 +4366,58 @@ async def auto_pricing_refresh_loop(application):
         except Exception:
             logger.exception("Automatic pricing refresh task failed")
         cfg = load_auto_pricing_config()
+        usd_error = str(cfg.get("usd_market_error") or "").strip()
+        alerted_error = str(cfg.get("usd_market_alerted_error") or "").strip()
+        if usd_error and usd_error != alerted_error:
+            try:
+                rate_value = _pricing_decimal(cfg.get("usd_market_rate_toman"))
+                rate_line = (f"آخرین نرخ ذخیره‌شده: {toman(rate_value)} تومان" if rate_value is not None
+                             else "هنوز نرخ معتبر قبلی ذخیره نشده است.")
+                await application.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=("⚠️ هشدار خصوصی نرخ دلار آزاد استارز\n"
+                          "دریافت از منابع فعلی ناموفق بود؛ نرخ قبلی حذف نشده است.\n"
+                          f"{rate_line}\nجزئیات: {usd_error[:700]}"),
+                )
+                cfg["usd_market_alerted_error"] = usd_error
+                save_auto_pricing_config(cfg)
+            except Exception:
+                logger.exception("Could not send private admin alert about USD market sources")
         catalog_wait = _pricing_next_sleep(
             cfg, "catalog_attempted_at", "catalog_retry_after", _PROVIDER_REFRESH_COOLDOWN_SECONDS
         )
         fx_wait = _pricing_next_sleep(
             cfg, "fx_attempted_at", "fx_retry_after", _FX_REFRESH_COOLDOWN_SECONDS
         )
-        await asyncio.sleep(max(5.0, min(catalog_wait, fx_wait)))
+        usd_wait = _pricing_next_sleep(
+            cfg, "usd_market_attempted_at", "usd_market_retry_after", _FX_REFRESH_COOLDOWN_SECONDS
+        )
+        await asyncio.sleep(max(5.0, min(catalog_wait, fx_wait, usd_wait)))
 
 
 def quote_breakdown_text(quote):
-    text_value = (
-        f"برآورد هزینه بر پایه کاتالوگ تأمین‌کننده: {quote['cost_usd']} USDT × نرخ {toman(quote['fx_rate_toman'])} تومان\n"
-        "⚠️ این مبلغ برآورد مرجع است؛ کسر دقیق تأمین‌کننده فقط هنگام ثبت سفارش نزد همان تأمین‌کننده مشخص می‌شود. این ربات سفارش خودکار نزد تأمین‌کننده نمی‌سازد.\n"
-        f"💰 هزینهٔ خرید برآوردی: {toman(quote['cost_toman'])} تومان\n"
-        f"🧾 کارمزد/هزینهٔ اضافی تنظیم‌شده: {toman(quote['fee_toman'])} تومان\n"
-        f"📈 سود محاسبه‌شده: {toman(quote['profit_toman'])} تومان\n"
-        f"💵 قیمت نهایی: {toman(quote['sale_toman'])} تومان"
-    )
+    if str(quote.get("product_type") or "") == "stars":
+        if quote.get("cost_usd") and quote.get("fx_rate_toman"):
+            basis = (f"مبنای استارز: {quote.get('base_usd_per_star')} دلار × {quote.get('quantity')} استارز؛ "
+                     f"نرخ دلار: {toman(quote['fx_rate_toman'])} تومان\n")
+        else:
+            basis = f"مبنای استارز: {quote.get('source') or 'نرخ دستی مدیر'}\n"
+        text_value = (
+            basis
+            + f"💰 هزینهٔ پایه: {toman(quote['cost_toman'])} تومان\n"
+            + "🧾 کارمزد: ۰ تومان\n"
+            + f"📈 سود: {toman(quote['profit_toman'])} تومان\n"
+            + f"💵 قیمت نهایی: {toman(quote['sale_toman'])} تومان"
+        )
+    else:
+        text_value = (
+            f"برآورد هزینه بر پایه کاتالوگ تأمین‌کننده: {quote['cost_usd']} USDT × نرخ {toman(quote['fx_rate_toman'])} تومان\n"
+            "⚠️ این مبلغ برآورد مرجع است؛ کسر دقیق تأمین‌کننده فقط هنگام ثبت سفارش نزد همان تأمین‌کننده مشخص می‌شود. این ربات سفارش خودکار نزد تأمین‌کننده نمی‌سازد.\n"
+            f"💰 هزینهٔ خرید برآوردی: {toman(quote['cost_toman'])} تومان\n"
+            f"🧾 کارمزد/هزینهٔ اضافی تنظیم‌شده: {toman(quote['fee_toman'])} تومان\n"
+            f"📈 سود محاسبه‌شده: {toman(quote['profit_toman'])} تومان\n"
+            f"💵 قیمت نهایی: {toman(quote['sale_toman'])} تومان"
+        )
     if quote.get("provider_over_limit"):
         text_value += "\n⚠️ این مقدار از سقف سفارش یک‌بارهٔ API تأمین‌کننده بیشتر است؛ ثبت در فروشگاه دستی است و تأمین این مقدار باید جداگانه بررسی شود."
     return text_value
@@ -4095,14 +4493,14 @@ def stars_detail_menu(amount):
 
 
 def stars_text():
-    """Stars intro plus a truthful snapshot of the live price feed."""
-    cfg = load_auto_pricing_config()
+    """Stars intro plus the isolated USD free-market price snapshot."""
     base = bot_text("stars_menu_description")
-    if auto_pricing_ready(cfg):
-        unit = auto_pricing_unit_sale(cfg)
-        unit_text = f"{persian_digits(format(unit, ',.2f').replace(',', '٬'))} تومان" if unit is not None else "در حال محاسبه"
-        return base + f"\n\n💹 قیمت هر استارز: {unit_text}"
-    return base
+    unit = stars_pricing_unit_sale()
+    unit_text = f"{persian_digits(format(unit, ',.2f').replace(',', '٬'))} تومان" if unit is not None else "فعلاً ناموجود"
+    minimum, maximum = stars_order_bounds()
+    return (base + f"\n\n💹 قیمت هر استارز: {unit_text}"
+            + f"\n🔢 محدودهٔ سفارش: {persian_digits(toman(minimum))} تا {persian_digits(toman(maximum))}"
+            + f"\n{stars_rate_customer_status_text()}")
 
 
 MENU_TYPE_DEFAULT = "keyboard"
@@ -5254,13 +5652,137 @@ def _auto_price_category_map(context):
 
 def auto_price_categories_markup(context):
     categories = _auto_price_category_map(context)
-    buttons = [[InlineKeyboardButton("💹 مدیریت نرخ ارز، تتر و محاسبهٔ قیمت", callback_data="admin_auto_pricing", style="success")]]
+    buttons = [[InlineKeyboardButton("⭐ مدیریت استارز تلگرام", callback_data="admin_auto_cat|stars|1", style="primary")]]
     buttons.extend(
         [InlineKeyboardButton(label, callback_data=f"admin_auto_cat|{token}|1", style="primary")]
-        for token, label in categories
+        for token, label in categories if token != "stars"
     )
     buttons.append([InlineKeyboardButton("🔙 بازگشت به مدیریت", callback_data="admin")])
     return InlineKeyboardMarkup(buttons)
+
+
+def stars_pending_order_count():
+    try:
+        with db() as con:
+            row = con.execute(
+                "SELECT COUNT(*) FROM orders o JOIN products p ON p.id=o.product_id "
+                "WHERE lower(p.category)='stars' AND o.status NOT IN ('لغو شده','رد شده','تحویل‌شده','تحویل شده','تکمیل شده','لغو‌شده')"
+            ).fetchone()
+        return int(row[0] or 0)
+    except Exception:
+        logger.exception("Could not count pending Stars orders")
+        return 0
+
+
+def stars_admin_home_text(note=""):
+    manager = load_stars_manager_settings()
+    fx = load_auto_pricing_config()
+    usd_rate = _pricing_decimal(fx.get("usd_market_rate_toman"))
+    usd_fresh = bool(fx.get("usd_market_valid") and _pricing_timestamp_fresh(
+        fx.get("usd_market_source_updated_at"), _PRICING_FX_MAX_AGE_SECONDS
+    ) and usd_rate)
+    if usd_fresh:
+        usd_text = f"{toman(usd_rate)} تومان"
+        fx_state = "✅ معتبر و تازه"
+    elif usd_rate is not None:
+        usd_text = f"{toman(usd_rate)} تومان (آخرین نرخ ذخیره‌شده؛ فعلاً قدیمی)"
+        fx_state = "⚠️ نرخ تازه در دسترس نیست"
+    else:
+        usd_text = "دریافت نشده"
+        fx_state = "❌ نرخ معتبر موجود نیست"
+    unit_cost = stars_pricing_unit_cost()
+    cost_text = f"{format(unit_cost, ',.2f').replace(',', '٬')} تومان" if unit_cost is not None else "ناموجود"
+    unit = stars_pricing_unit_sale()
+    unit_text = f"{format(unit, ',.2f').replace(',', '٬')} تومان" if unit is not None else "ناموجود"
+    support = load_gift_settings()
+    minimum, maximum = int(manager["min_order"]), int(manager["max_order"])
+    lines = [
+        "⭐ مدیریت استارز تلگرام | SEYED PREMIUM",
+        "━━━━━━━━━━━━━━━━━━",
+        f"⚙️ قیمت‌گذاری خودکار: {'🟢 روشن' if manager['auto_enabled'] else '🔴 خاموش'}",
+        f"💵 قیمت پایهٔ هر ⭐: {manager['base_usd_per_star']} دلار",
+        f"💱 نرخ دلار آزاد: {usd_text}",
+        f"✍️ نرخ دستی دلار: {f"{toman(manager['manual_usd_toman'])} تومان" if manager['manual_usd_toman'] else 'خودکار (منبع زنده)'}",
+        f"🌐 منبع: {fx.get('usd_market_source_name') or 'ثبت نشده'}",
+        f"🕒 زمان نرخ: {_pricing_time_text(fx.get('usd_market_source_updated_at'))}",
+        f"📡 وضعیت منابع: {fx_state} | منابع سالم: {int(fx.get('usd_market_sources_ok') or 0)}/2",
+        f"📈 سود: {manager['profit_percent']}٪ | کارمزد: ۰٪",
+        f"💸 هزینهٔ تمام‌شدهٔ هر ⭐: {cost_text}",
+        f"💰 قیمت نهایی فروش هر ⭐: {unit_text}",
+        f"✍️ نرخ دستی هر ⭐ (هزینهٔ پایه): {toman(manager['manual_unit_toman']) if manager['manual_unit_toman'] else 'تنظیم نشده'} تومان",
+        f"🔽 حداقل سفارش: {toman(minimum)} استارز",
+        f"🔼 حداکثر سفارش: {toman(maximum)} استارز",
+        f"💬 پیام اول به پشتیبانی برای سفارش دستی: {'🟢 روشن' if support['support_first'] else '🔴 خاموش'}",
+        f"📋 سفارش‌های استارز باز: {stars_pending_order_count()}",
+        "━━━━━━━━━━━━━━━━━━",
+        "در حالت خودکار، قیمت = قیمت پایهٔ دلاری × دلار آزاد × تعداد + سود مدیر. در حالت خاموش، نرخ دستی تومان استفاده می‌شود.",
+        "نرخ تتر در محاسبهٔ استارز دخالت ندارد؛ تأیید سفارش نیز تحویل خودکار ایجاد نمی‌کند.",
+    ]
+    if manager["auto_enabled"] and not manager["manual_usd_toman"]:
+        if usd_rate is not None and not usd_fresh:
+            lines.extend(["", "⚠️ منبع‌ها موقتاً نرخ تازه نداده‌اند؛ فروش با آخرین نرخ تأییدشدهٔ ذخیره‌شده ادامه دارد."])
+        elif usd_rate is None and not manager["manual_unit_toman"]:
+            lines.extend(["", "⚠️ هنوز نرخ معتبر دلار دریافت نشده و نرخ دستی پشتیبان هم ثبت نشده است؛ ثبت سفارش فعلاً ممکن نیست."])
+    if fx.get("usd_market_error"):
+        lines.extend(["", "جزئیات آخرین خطای نرخ: " + str(fx["usd_market_error"])[:240]])
+    if note:
+        lines.extend(["", note])
+    return "\n".join(lines)[:3900]
+
+
+def stars_admin_home_keyboard():
+    manager = load_stars_manager_settings()
+    support = load_gift_settings()
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 به‌روزرسانی نرخ دلار آزاد", callback_data="stars_admin_refresh_usd", style="success")],
+        [InlineKeyboardButton("⚙️ قیمت‌گذاری خودکار: " + ("روشن" if manager["auto_enabled"] else "خاموش"), callback_data="stars_admin_toggle", style="primary")],
+        [InlineKeyboardButton("💵 قیمت پایهٔ دلاری هر ⭐", callback_data="stars_admin_base_usd", style="primary"),
+         InlineKeyboardButton("💱 نرخ دستی دلار", callback_data="stars_admin_usd_fx", style="primary")],
+        [InlineKeyboardButton("✍️ نرخ دستی هر ⭐ (تومان)", callback_data="stars_admin_manual_rate", style="primary")],
+        [InlineKeyboardButton("📈 درصد سود", callback_data="stars_admin_profit", style="primary")],
+        [InlineKeyboardButton("🔽 حداقل تعداد", callback_data="stars_admin_min", style="primary"),
+         InlineKeyboardButton("🔼 حداکثر تعداد", callback_data="stars_admin_max", style="primary")],
+        [InlineKeyboardButton("💬 اول به پشتیبانی پیام بده: " + ("روشن" if support["support_first"] else "خاموش"), callback_data="stars_admin_support_toggle", style="primary")],
+        [InlineKeyboardButton("📝 ویرایش متن پیام پشتیبانی", callback_data="stars_admin_support_text", style="primary")],
+        [InlineKeyboardButton("📋 سفارش‌های استارز در انتظار", callback_data="stars_admin_pending_1", style="primary")],
+        [InlineKeyboardButton("🔙 بازگشت به مدیریت قیمت‌گذاری", callback_data="admin_auto_prices", style="danger")],
+    ])
+
+
+def stars_pending_orders_page(page=1):
+    page = max(1, int(page))
+    with db() as con:
+        rows = con.execute(
+            "SELECT o.id,o.user_id,o.price,o.status,o.created_at,o.payment_method,p.name AS product_name,o.order_details "
+            "FROM orders o JOIN products p ON p.id=o.product_id WHERE lower(p.category)='stars' "
+            "AND o.status NOT IN ('لغو شده','رد شده','تحویل‌شده','تحویل شده','تکمیل شده','لغو‌شده') "
+            "ORDER BY o.id DESC"
+        ).fetchall()
+    per_page = 8
+    pages = max(1, (len(rows) + per_page - 1) // per_page)
+    page = min(page, pages)
+    visible = rows[(page - 1) * per_page:page * per_page]
+    lines = [f"📋 سفارش‌های استارز در انتظار | {page}/{pages}", "━━━━━━━━━━━━━━━━━━"]
+    buttons = []
+    for row in visible:
+        details = str(row["order_details"] or "").replace("\n", " ")[:95]
+        lines.append(
+            f"\n🧾 سفارش #{row['id']} | {row['product_name'] or 'استارز'}\n"
+            f"👤 کاربر: {row['user_id']} | 💰 {toman(row['price'])} تومان\n"
+            f"📌 {row['status']} | {row['payment_method'] or 'روش نامشخص'}\n{details}"
+        )
+        buttons.append([InlineKeyboardButton(f"🔎 جزئیات سفارش #{row['id']}", callback_data=f"admin_order_view_{row['id']}")])
+    if not visible:
+        lines.append("\nسفارشی برای استارز ثبت نشده است.")
+    nav = []
+    if page > 1:
+        nav.append(InlineKeyboardButton("⬅️ قبلی", callback_data=f"stars_admin_pending_{page-1}"))
+    if page < pages:
+        nav.append(InlineKeyboardButton("بعدی ➡️", callback_data=f"stars_admin_pending_{page+1}"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton("🔙 مدیریت استارز", callback_data="stars_admin_home")])
+    return "\n".join(lines)[:3900], InlineKeyboardMarkup(buttons)
 
 
 def auto_price_category_screen(context, token, page=1):
@@ -5362,7 +5884,7 @@ def build_stars_menu():
             amount = int(row["star_amount"] or 0)
         except (TypeError, ValueError):
             continue
-        if amount in FIXED_STAR_AMOUNTS and amount not in by_amount and int(row["active"] or 0):
+        if amount in FIXED_STAR_AMOUNTS and is_valid_stars_quantity(amount) and amount not in by_amount and int(row["active"] or 0):
             by_amount[amount] = row
 
     cfg = load_auto_pricing_config()
@@ -5375,10 +5897,11 @@ def build_stars_menu():
         amount_text = persian_digits(f"{amount:,}".replace(",", "٬"))
         if live_quote:
             price_text = f"{persian_digits(toman(live_quote['sale_toman']))} تومان"
-        elif not cfg.get("enabled") and int(row["price"] or 0) > 0:
-            price_text = f"{persian_digits(toman(row['price']))} تومان"
         else:
-            price_text = "قیمت ناموجود"
+            saved_quote = _saved_stars_pack_quote(amount)
+            if not saved_quote:
+                continue
+            price_text = f"{persian_digits(toman(saved_quote['sale_toman']))} تومان"
         label = f"✧ {amount_text} استارز | {price_text}"
         style = str(row["button_style"] or "primary").strip().lower()
         if style not in {"primary", "success", "danger"}:
@@ -5391,9 +5914,7 @@ def build_stars_menu():
         for item in load_bot_settings().get("menus", {}).get("stars", [])
         if isinstance(item, dict)
     }
-    unit_price = auto_pricing_unit_sale(cfg)
-    if unit_price is None and not cfg.get("enabled"):
-        unit_price = _manual_stars_unit_toman()
+    unit_price = stars_pricing_unit_sale()
     if unit_price is not None:
         unit_label = persian_digits(format(unit_price, ",.2f").replace(",", "٬"))
         custom_label = f"✏️ استارز به مقدار دلخواه (هر استارز: {unit_label} تومان)"
@@ -5425,40 +5946,30 @@ def custom_stars_keyboard():
 
 
 def _manual_stars_unit_toman():
-    """Return only a rate explicitly entered by the administrator, never a hard-coded default."""
+    """Return the explicitly configured manual Stars base cost, if available."""
     try:
-        if load_auto_pricing_config().get("enabled"):
-            return None
-        settings = load_premium_manager_settings()
-        if not settings.get("star_rate_toman_explicit"):
-            return None
-        rate = _pricing_decimal(settings.get("star_rate_toman"))
-        return rate
+        manager = load_stars_manager_settings()
+        manual = _pricing_decimal(manager.get("manual_unit_toman"))
+        if manual is not None and manual > 0:
+            return manual
+        legacy = load_premium_manager_settings()
+        if legacy.get("star_rate_toman_explicit"):
+            return _pricing_decimal(legacy.get("star_rate_toman"))
     except Exception:
         logger.debug("Could not load explicitly configured manual Stars unit rate", exc_info=True)
-        return None
+    return None
 
 
 def _manual_stars_quote(amount):
-    unit = _manual_stars_unit_toman()
-    if unit is None:
-        return None
-    try:
-        total = _ceil_toman(unit * Decimal(int(amount)))
-    except (InvalidOperation, TypeError, ValueError):
-        return None
-    return {"product_type": "stars", "quantity": int(amount), "cost_toman": total,
-            "sale_toman": total, "profit_toman": 0, "margin_percent": "0",
-            "source": "قیمت دستی مدیر", "manual_price": True}
+    quote = stars_pricing_quote(amount)
+    return quote if quote and quote.get("manual_price") else None
 
 
 def custom_stars_display_text(raw_amount="", cfg=None):
     cfg = cfg or load_auto_pricing_config()
     raw_amount = normalize_ascii_digits(str(raw_amount or ""))
     raw_amount = re.sub(r"\D", "", raw_amount)[:7]
-    unit = auto_pricing_unit_sale(cfg)
-    if unit is None and not cfg.get("enabled"):
-        unit = _manual_stars_unit_toman()
+    unit = stars_pricing_unit_sale()
     unit_text = f"{persian_digits(format(unit, ',.2f').replace(',', '٬'))} تومان" if unit is not None else "—"
     if raw_amount:
         try:
@@ -5468,26 +5979,24 @@ def custom_stars_display_text(raw_amount="", cfg=None):
     else:
         amount = 0
     amount_text = persian_digits(f"{amount:,}".replace(",", "٬")) if raw_amount else "—"
-    if amount < 50:
-        total_text = "برای محاسبه، حداقل ۵۰ استارز وارد کن."
-    elif amount > 1_000_000:
-        total_text = "❌ تعداد بیشتر از سقف ۱٬۰۰۰٬۰۰۰ استارز است."
+    minimum, maximum = stars_order_bounds()
+    if amount and amount < minimum:
+        total_text = f"برای محاسبه، حداقل {persian_digits(toman(minimum))} استارز وارد کن."
+    elif amount > maximum:
+        total_text = f"❌ تعداد بیشتر از سقف {persian_digits(toman(maximum))} استارز است."
+    elif amount:
+        quote = stars_pricing_quote(amount, cfg)
+        total_text = f"{persian_digits(toman(quote['sale_toman']))} تومان" if quote else "قیمت فعلاً در دسترس نیست."
     else:
-        quote = auto_pricing_quote("stars", amount, cfg)
-        if quote:
-            total_text = f"{persian_digits(toman(quote['sale_toman']))} تومان"
-        elif not cfg.get("enabled") and unit is not None:
-            total_text = f"{persian_digits(toman(_ceil_toman(unit * Decimal(amount))))} تومان"
-        else:
-            total_text = "برای ثبت قیمت این مقدار با پشتیبانی تماس بگیر."
+        total_text = "تعداد استارز را انتخاب کن."
     return (
         "✎ مقدار دلخواه استارز\n\n"
         f"✧ هر استارز: {unit_text}\n"
-        "▤ محدوده: 50 تا 1,000,000 استارز\n\n"
+        f"▤ محدوده: {persian_digits(toman(minimum))} تا {persian_digits(toman(maximum))} استارز\n\n"
         "برای انتخاب تعداد 👇\n"
         f"🔢 تعداد انتخاب‌شده: {amount_text}\n"
         f"💰 مبلغ کل: {total_text}\n\n"
-        f"{pricing_customer_status_text(cfg)}"
+        f"{stars_rate_customer_status_text()}"
     )
 
 
@@ -5526,7 +6035,7 @@ def custom_stars_customer_text(order, quote=None, warning=""):
     ]
     if quote:
         lines.append(f"💰 قیمت نهایی: {toman(quote['sale_toman'])} تومان")
-        unit = auto_pricing_unit_sale()
+        unit = stars_pricing_unit_sale()
         if unit is not None:
             lines.append(f"✧ نرخ محاسبه‌شدهٔ تقریبی هر استارز: {format(unit, ',.2f').replace(',', '٬')} تومان")
     else:
@@ -5577,7 +6086,7 @@ async def _safe_callback_answer(query):
 
 GLOBAL_CANCEL_STATE_KEYS = (
     # Admin forms and editors
-    "gift_admin_input", "premium_admin_input", "gift_custom_state",
+    "gift_admin_input", "premium_admin_input", "stars_admin_input", "gift_custom_state",
     "support_admin_reply_state", "support_admin_search_state", "gift_order_search_state",
     "pricing_admin_state", "product_admin_state", "uiadm_state", "editor_wait_key",
     "coupon_edit_state", "coupon_edit_categories", "coupon_category_add_state",
@@ -5656,7 +6165,10 @@ async def handle_global_cancel_callback(update, context):
             logger.exception("Could not remove cancelled support form session")
 
     if user.id == ADMIN_ID:
-        if "premium_admin_input" in cleared:
+        if "stars_admin_input" in cleared:
+            destination = "stars_admin_home"
+            title = "مدیریت استارز"
+        elif "premium_admin_input" in cleared:
             destination = "premium_admin_home"
             title = "مدیریت پرمیوم"
         elif "gift_admin_input" in cleared or "gift_custom_state" in cleared or "gift_order_search_state" in cleared:
@@ -5756,6 +6268,8 @@ async def _show_product_category(query, category, user_id):
             live_quote = dynamic_product_quote(row, pricing_cfg)
             if live_quote:
                 price_text = f"{toman(live_quote['sale_toman'])} تومان"
+            elif str(category or "").lower() == "stars":
+                continue
             elif int(row["price"] or 0) > 0:
                 price_text = f"{toman(row['price'])} تومان ⚠️"
             else:
@@ -6347,7 +6861,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     data = query.data
 
-    if (data.startswith("premium_") or data == "admin_auto_prices" or data.startswith("admin_auto_cat|")) and user_id != ADMIN_ID:
+    if (data.startswith("premium_") or data.startswith("stars_admin_") or data == "admin_auto_prices" or data.startswith("admin_auto_cat|")) and user_id != ADMIN_ID:
         await query.answer("این بخش فقط برای مدیر ربات در دسترس است.", show_alert=True)
         return
 
@@ -6775,7 +7289,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("بسته انتخاب‌شده معتبر نیست.", show_alert=True)
             return
 
-        if amount not in FIXED_STAR_AMOUNTS:
+        if amount not in FIXED_STAR_AMOUNTS or not is_valid_stars_quantity(amount):
             await query.answer("این بسته در فهرست مجاز استارز نیست.", show_alert=True)
             return
         await refresh_auto_pricing(force=False)
@@ -6800,7 +7314,8 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("این بسته فعلاً در دسترس نیست.", show_alert=True)
             return
 
-        price = int(live_quote["sale_toman"]) if live_quote else int(product["price"] or 0)
+        # Never fall back to a legacy products.price value for Stars. It may be stale.
+        price = int(live_quote["sale_toman"]) if live_quote else 0
         balance = int(user["balance"] or 0) if user else 0
 
         if price <= 0:
@@ -6842,7 +7357,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("stars_discount_") and not data.startswith("stars_discount_skip_"):
         try:
             amount = int(data.rsplit("_", 1)[-1])
-            if amount not in FIXED_STAR_AMOUNTS:
+            if amount not in FIXED_STAR_AMOUNTS or not is_valid_stars_quantity(amount):
                 await query.answer("بسته معتبر نیست.", show_alert=True)
                 return
             await refresh_auto_pricing(force=False)
@@ -6895,7 +7410,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await query.answer("بسته معتبر نیست.", show_alert=True)
             return
-        if amount not in FIXED_STAR_AMOUNTS:
+        if amount not in FIXED_STAR_AMOUNTS or not is_valid_stars_quantity(amount):
             await query.answer("بسته معتبر نیست.", show_alert=True)
             return
         await refresh_auto_pricing(force=False)
@@ -7005,7 +7520,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("بسته معتبر نیست.", show_alert=True)
             return
 
-        if amount not in FIXED_STAR_AMOUNTS:
+        if amount not in FIXED_STAR_AMOUNTS or not is_valid_stars_quantity(amount):
             await query.answer("بسته معتبر نیست.", show_alert=True)
             return
         await refresh_auto_pricing(force=False)
@@ -7075,7 +7590,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await query.answer("بسته معتبر نیست.", show_alert=True)
             return
-        if amount not in FIXED_STAR_AMOUNTS:
+        if amount not in FIXED_STAR_AMOUNTS or not is_valid_stars_quantity(amount):
             await query.answer("بسته معتبر نیست.", show_alert=True)
             return
         await refresh_auto_pricing(force=False)
@@ -7168,12 +7683,13 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             except Exception:
                 logger.warning("Could not notify admin about Stars order #%s", order_id, exc_info=True)
-            await query.edit_message_text(
+            customer_text, customer_rows = stars_support_attach(
                 f"✅ سفارش استارز #{order_id} ثبت شد.\n\n"
                 f"💰 مبلغ: {price:,} {str(product['currency'] or 'تومان')}\n"
                 "حالا تصویر واضح رسید پرداخت را در همین گفت‌وگو ارسال کن. پس از بررسی و تأیید مدیر، سفارش برای تحویل آماده می‌شود.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو سفارش", callback_data=f"cancel_receipt_order_{order_id}", style="danger")]]),
+                [[InlineKeyboardButton("❌ لغو سفارش", callback_data=f"cancel_receipt_order_{order_id}", style="danger")]],
             )
+            await query.edit_message_text(customer_text, reply_markup=InlineKeyboardMarkup(customer_rows))
         except Exception:
             logger.exception("Could not create Stars payment order")
             await query.answer("ثبت سفارش انجام نشد؛ دوباره تلاش کن.", show_alert=True)
@@ -7204,7 +7720,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("بسته استارز معتبر نیست.", show_alert=True)
             return
 
-        if amount not in FIXED_STAR_AMOUNTS:
+        if amount not in FIXED_STAR_AMOUNTS or not is_valid_stars_quantity(amount):
             await query.answer("بسته معتبر نیست.", show_alert=True)
             return
         await refresh_auto_pricing(force=False)
@@ -7340,7 +7856,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("پرداخت انجام نشد؛ موجودی کسر نشده است.", show_alert=True)
             return
 
-        await query.edit_message_text(
+        customer_text, customer_rows = stars_support_attach(
             "💎 SEYED PREMIUM\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "✅ پرداخت با موفقیت انجام شد\n\n"
@@ -7351,10 +7867,9 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "━━━━━━━━━━━━━━━━━━\n"
             "📦 وضعیت: در انتظار تحویل توسط مدیر\n"
             "━━━━━━━━━━━━━━━━━━",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🏠 منوی اصلی", callback_data="home")
-            ]])
+            [[InlineKeyboardButton("🏠 منوی اصلی", callback_data="home")]],
         )
+        await query.edit_message_text(customer_text, reply_markup=InlineKeyboardMarkup(customer_rows))
 
         try:
             await context.bot.send_message(
@@ -7414,8 +7929,9 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             amount = int(raw_amount)
         except (TypeError, ValueError):
             amount = 0
-        if not 50 <= amount <= 1_000_000:
-            await query.answer("تعداد باید بین ۵۰ تا ۱٬۰۰۰٬۰۰۰ استارز باشد.", show_alert=True)
+        minimum, maximum = stars_order_bounds()
+        if not minimum <= amount <= maximum:
+            await query.answer(f"تعداد باید بین {toman(minimum)} تا {toman(maximum)} استارز باشد.", show_alert=True)
             return
         await refresh_auto_pricing(force=False)
         quote = auto_pricing_quote("stars", amount) or _saved_stars_pack_quote(amount) or _manual_stars_quote(amount)
@@ -7503,7 +8019,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("مقدار استارز معتبر نیست.", show_alert=True)
             return
         order = context.user_data.get("stars_custom_order")
-        if not isinstance(order, dict) or int(order.get("amount") or 0) != amount or not order.get("recipient"):
+        if not isinstance(order, dict) or int(order.get("amount") or 0) != amount or not is_valid_stars_quantity(amount) or not order.get("recipient"):
             await query.answer("اطلاعات سفارش یا گیرنده پیدا نشد؛ انتخاب را دوباره انجام بده.", show_alert=True)
             return
 
@@ -7560,13 +8076,14 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             except Exception:
                 logger.warning("Could not notify admin about custom Stars order #%s", order_id, exc_info=True)
-            await query.edit_message_text(
+            customer_text, customer_rows = stars_support_attach(
                 f"✅ سفارش استارز دلخواه #{order_id} ثبت شد.\n\n"
                 f"⭐ تعداد: {amount:,} استارز\n💰 مبلغ قابل پرداخت: {toman(fresh_quote['sale_toman'])} تومان\n"
                 f"🏦 شماره کارت: {card_number}\n👤 صاحب کارت: {bot_text('payment_card_owner')}\n\n"
                 f"{bot_text('payment_instructions')}\n\nپس از پرداخت، تصویر واضح رسید را ارسال کن. سفارش فقط پس از تأیید دستی مدیر قابل تحویل است.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو سفارش", callback_data=f"cancel_receipt_order_{order_id}", style="danger")]]),
+                [[InlineKeyboardButton("❌ لغو سفارش", callback_data=f"cancel_receipt_order_{order_id}", style="danger")]],
             )
+            await query.edit_message_text(customer_text, reply_markup=InlineKeyboardMarkup(customer_rows))
             return
 
         # Wallet payment is atomic, but fulfillment remains a separate manual admin action.
@@ -7617,12 +8134,13 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception:
             logger.warning("Could not notify admin about custom Stars wallet order #%s", order_id, exc_info=True)
-        await query.edit_message_text(
+        customer_text, customer_rows = stars_support_attach(
             f"✅ پرداخت سفارش #{order_id} انجام شد.\n⭐ تعداد: {amount:,} استارز\n"
             f"💰 پرداخت‌شده: {toman(sale_price)} تومان\n👛 موجودی باقی‌مانده: {toman(new_balance)} تومان\n\n"
             "📦 وضعیت: در انتظار تحویل دستی مدیر.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⌂ منوی اصلی", callback_data="home", style="primary")]]),
+            [[InlineKeyboardButton("⌂ منوی اصلی", callback_data="home", style="primary")]],
         )
+        await query.edit_message_text(customer_text, reply_markup=InlineKeyboardMarkup(customer_rows))
         return
 
     if data == "customstars_back":
@@ -8683,7 +9201,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if data == "admin" or data.startswith("admin_"):
+    if data == "admin" or data.startswith("admin_") or data.startswith("stars_admin_"):
         if user_id != ADMIN_ID:
             await query.edit_message_text("⛔ دسترسی مجاز نیست.")
             return
@@ -8709,6 +9227,79 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        if data == "stars_admin_home":
+            context.user_data.pop("stars_admin_input", None)
+            await query.edit_message_text(stars_admin_home_text(), reply_markup=stars_admin_home_keyboard())
+            return
+
+        if data in {"stars_admin_manual_rate", "stars_admin_base_usd", "stars_admin_usd_fx", "stars_admin_profit", "stars_admin_min", "stars_admin_max"}:
+            prompt_map = {
+                "stars_admin_manual_rate": ("manual_rate", "✍️ هزینهٔ پایهٔ هر استارز را به تومان بفرست. فقط عدد؛ نمونه: ۴۵۰۰. این نرخ در حالت خودکار، پشتیبان است."),
+                "stars_admin_base_usd": ("base_usd", "💵 قیمت پایهٔ هر ⭐ به دلار را بفرست. فقط عدد؛ نمونه: 0.015"),
+                "stars_admin_usd_fx": ("usd_fx", "💱 نرخ دستی دلار به تومان را بفرست. نمونه: دلار 165000\nبرای برگشت به نرخ خودکار: دلار 0"),
+                "stars_admin_profit": ("profit", "📈 چند درصد سود روی قیمت تمام‌شده گذاشته شود؟ فقط عدد؛ نمونه: 30 یا 0"),
+                "stars_admin_min": ("min", "🔽 حداقل تعداد استارز در هر سفارش چند باشد؟ فقط عدد صحیح؛ نمونه: 50"),
+                "stars_admin_max": ("max", "🔼 حداکثر تعداد استارز در هر سفارش چند باشد؟ فقط عدد صحیح؛ نمونه: 1000000"),
+            }
+            field, prompt = prompt_map[data]
+            context.user_data["stars_admin_input"] = {"field": field}
+            await query.edit_message_text(prompt + "\n\nبرای لغو /cancel را بفرست.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="global_cancel", style="danger")]]))
+            return
+
+        if data == "stars_admin_toggle":
+            manager = load_stars_manager_settings()
+            manager["auto_enabled"] = not manager["auto_enabled"]
+            save_stars_manager_settings(manager)
+            if manager["auto_enabled"]:
+                note = "✅ قیمت‌گذاری خودکار روشن شد؛ نرخ دلار آزاد بررسی می‌شود. در صورت نبود نرخ تازه، نرخ دستی ذخیره‌شده پشتیبان است."
+                try:
+                    await refresh_auto_pricing(force=True, background=True)
+                except Exception:
+                    logger.exception("Stars USD FX refresh after enabling failed")
+                    note += "\n⚠️ دریافت تازه موفق نشد؛ آخرین نرخ معتبر حفظ شد."
+            else:
+                note = "✅ قیمت‌گذاری خودکار خاموش شد؛ از این پس نرخ دستی تومان با درصد سود ذخیره‌شده محاسبه می‌شود."
+            await query.edit_message_text(stars_admin_home_text(note), reply_markup=stars_admin_home_keyboard())
+            return
+
+        if data == "stars_admin_refresh_usd":
+            await safe_callback_edit_or_reply(query, stars_admin_home_text("🔄 دریافت نرخ دلار آزاد آغاز شد؛ فقط دادهٔ تازه و معتبر پذیرفته می‌شود."), stars_admin_home_keyboard())
+            try:
+                await refresh_auto_pricing(force=True, background=True)
+                note = "✅ بررسی منابع دلار آزاد انجام شد؛ نتیجه و زمان نرخ در همین صفحه نمایش داده می‌شود."
+            except Exception as exc:
+                logger.exception("Manual Stars USD rate refresh failed")
+                note = "⚠️ دریافت نرخ موفق نشد؛ نرخ معتبر قبلی حذف یا جایگزین نشد. " + str(exc)[:180]
+            await safe_callback_edit_or_reply(query, stars_admin_home_text(note), stars_admin_home_keyboard())
+            return
+
+        if data == "stars_admin_support_toggle":
+            settings = load_gift_settings()
+            settings["support_first"] = not bool(settings.get("support_first"))
+            save_gift_settings(settings)
+            note = "✅ پیام اول به پشتیبانی برای سفارش‌های دستی استارز روشن شد." if settings["support_first"] else "✅ پیام اول به پشتیبانی خاموش شد؛ متن ذخیره‌شده پاک نمی‌شود."
+            await query.edit_message_text(stars_admin_home_text(note), reply_markup=stars_admin_home_keyboard())
+            return
+
+        if data == "stars_admin_support_text":
+            settings = load_gift_settings()
+            context.user_data["stars_admin_input"] = {"field": "support_text"}
+            await query.edit_message_text(
+                "✏️ متن جدید پیام پشتیبانی را بفرست (HTML ساده مجاز است). برای برگشت به متن پیش‌فرض «-» بفرست:\n\n"
+                + str(settings.get("support_text") or GIFT_DEFAULT_SETTINGS["support_text"]),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="global_cancel", style="danger")]])
+            )
+            return
+
+        if data.startswith("stars_admin_pending_"):
+            try:
+                page = max(1, int(data.rsplit("_", 1)[1]))
+            except (ValueError, IndexError):
+                page = 1
+            text_value, markup = stars_pending_orders_page(page)
+            await query.edit_message_text(text_value, reply_markup=markup)
+            return
+
         if data == "admin_auto_prices":
             context.user_data.pop("auto_pricing_return", None)
             await query.edit_message_text(
@@ -8726,6 +9317,9 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             if token == "gifts":
                 await _show_gift_admin_home(query, context.bot)
+                return
+            if token == "stars":
+                await query.edit_message_text(stars_admin_home_text(), reply_markup=stars_admin_home_keyboard())
                 return
             if token == "premium":
                 context.application.create_task(refresh_auto_pricing(force=False))
@@ -9956,7 +10550,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 customer_id = int(order["user_id"])
                 category = str(order["category"] or "").lower()
                 if approve:
-                    new_status = "پرداخت تأیید شد - در انتظار تحویل" if category in {"gifts", "premium"} else "تأیید شده"
+                    new_status = "پرداخت تأیید شد - در انتظار تحویل" if category in {"gifts", "premium", "stars"} else "تأیید شده"
                     con.execute("UPDATE orders SET status=?,payment_verified_at=?,delivery_error='' WHERE id=?",
                                 (new_status, iran_timestamp_now(), order_id))
                     con.execute("UPDATE coupon_usage SET status='used' WHERE order_id=? AND status='pending'", (order_id,))
@@ -10005,6 +10599,11 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             try:
                 customer_text = f"📦 وضعیت سفارش شما در SEYED PREMIUM تغییر کرد.\nکد سفارش: SP-{order_id:06d}\nوضعیت: {new_status}"
+                if approve and category == "stars":
+                    customer_text = (
+                        f"✅ پرداخت سفارش استارز شما تأیید شد.\nکد سفارش: SP-{order_id:06d}\n"
+                        "وضعیت: در انتظار تحویل دستی مدیر.\nبرای تحویل، لطفاً اطلاعات گیرندهٔ ثبت‌شده در سفارش را بررسی کن."
+                    )
                 if approve and category in {"gifts", "premium"}:
                     with db() as con:
                         delivered = con.execute("SELECT delivered_at,order_code,delivery_mode,status,delivery_error FROM orders WHERE id=?", (order_id,)).fetchone()
@@ -10500,6 +11099,104 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await message.reply_text("برای این جست‌وجو سفارش گیفتی پیدا نشد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 سفارش‌های گیفت", callback_data="gift_orders")]]))
         return
 
+    # Dedicated Stars management inputs; saved in the existing app_settings table only.
+    stars_input = user_data.get("stars_admin_input") if user and user.id == ADMIN_ID else None
+    if message and message.text and stars_input:
+        raw = message.text.strip()
+        if _is_customer_cancel_text(raw) or raw.lower() == "/cancel":
+            user_data.pop("stars_admin_input", None)
+            await message.reply_text("❌ عملیات لغو شد؛ تنظیم قبلی حفظ شد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⭐ مدیریت استارز", callback_data="stars_admin_home")]]))
+            return
+        field = str(stars_input.get("field") or "")
+        clean = normalize_ascii_digits(raw).replace(",", "").replace("٬", "").replace("،", "").strip()
+        manager = load_stars_manager_settings()
+        note = ""
+        if field == "manual_rate":
+            if not clean.isdigit() or not 1 <= int(clean) <= 100_000_000:
+                await message.reply_text("❌ نرخ باید عدد صحیحی بین ۱ تا ۱۰۰٬۰۰۰٬۰۰۰ تومان باشد. دوباره بفرست یا /cancel بزن.")
+                return
+            manager["manual_unit_toman"] = int(clean)
+            note = "✅ نرخ دستی هر استارز ذخیره شد؛ این نرخ هزینهٔ پایه است و سود یک‌بار به آن اضافه می‌شود."
+        elif field == "base_usd":
+            try:
+                value = Decimal(clean)
+                if not value.is_finite() or not Decimal("0.000001") <= value <= Decimal("100"):
+                    raise InvalidOperation
+            except (InvalidOperation, TypeError, ValueError):
+                await message.reply_text("❌ قیمت پایه باید عدد دلاری معتبر بین 0.000001 تا 100 باشد؛ نمونه: 0.015")
+                return
+            manager["base_usd_per_star"] = str(value)
+            note = "✅ قیمت پایهٔ دلاری هر استارز ذخیره شد."
+        elif field == "usd_fx":
+            normalized = normalize_ascii_digits(raw).strip()
+            match = re.fullmatch(r"دلار\s+([0-9,٬،]+)", normalized, re.IGNORECASE)
+            if not match:
+                await message.reply_text("❌ قالب معتبر نیست. نمونه‌ها:\nدلار 165000\nدلار 0")
+                return
+            value = int(re.sub(r"[,٬،]", "", match.group(1)) or "0")
+            if value != 0 and not 1000 <= value <= 100_000_000:
+                await message.reply_text("❌ نرخ دلار باید ۰ یا عددی بین ۱٬۰۰۰ تا ۱۰۰٬۰۰۰٬۰۰۰ تومان باشد.")
+                return
+            manager["manual_usd_toman"] = value
+            note = "✅ نرخ دستی دلار ذخیره شد؛ برای برگشت به منبع خودکار، «دلار 0» بفرست." if value else "✅ نرخ دستی پاک شد؛ نرخ دلار آزاد از منابع خودکار دریافت می‌شود."
+        elif field == "profit":
+            try:
+                value = Decimal(clean)
+                if not value.is_finite() or not 0 <= value <= 500:
+                    raise InvalidOperation
+            except (InvalidOperation, TypeError, ValueError):
+                await message.reply_text("❌ درصد سود باید عددی بین ۰ تا ۵۰۰ باشد؛ نمونه: ۳۰")
+                return
+            manager["profit_percent"] = str(value)
+            note = "✅ درصد سود ذخیره شد؛ سود فقط یک‌بار در قیمت نهایی اعمال می‌شود."
+        elif field == "min":
+            if not clean.isdigit() or not 1 <= int(clean) <= 1_000_000:
+                await message.reply_text("❌ حداقل باید عدد صحیح بین ۱ تا ۱٬۰۰۰٬۰۰۰ باشد.")
+                return
+            value = int(clean)
+            if value > int(manager["max_order"]):
+                await message.reply_text(f"❌ حداقل نمی‌تواند از حداکثر فعلی ({toman(manager['max_order'])}) بیشتر باشد.")
+                return
+            manager["min_order"] = value
+            note = "✅ حداقل تعداد سفارش ذخیره شد."
+        elif field == "max":
+            if not clean.isdigit() or not 1 <= int(clean) <= 1_000_000:
+                await message.reply_text("❌ حداکثر باید عدد صحیح بین ۱ تا ۱٬۰۰۰٬۰۰۰ باشد.")
+                return
+            value = int(clean)
+            if value < int(manager["min_order"]):
+                await message.reply_text(f"❌ حداکثر نمی‌تواند از حداقل فعلی ({toman(manager['min_order'])}) کمتر باشد.")
+                return
+            manager["max_order"] = value
+            note = "✅ حداکثر تعداد سفارش ذخیره شد."
+        elif field == "support_text":
+            settings = load_gift_settings()
+            if raw == "-":
+                settings["support_text"] = GIFT_DEFAULT_SETTINGS["support_text"]
+                note = "✅ متن پیام پشتیبانی به متن پیش‌فرض برگشت."
+            elif not raw or len(raw) > 1500:
+                await message.reply_text("متن پیام باید بین ۱ تا ۱۵۰۰ نویسه باشد.")
+                return
+            else:
+                settings["support_text"] = raw
+                note = "✅ متن پیام پشتیبانی ذخیره شد."
+            save_gift_settings(settings)
+            user_data.pop("stars_admin_input", None)
+            await message.reply_text(stars_admin_home_text(note), reply_markup=stars_admin_home_keyboard())
+            return
+        else:
+            user_data.pop("stars_admin_input", None)
+            await message.reply_text("❌ نوع تنظیم مشخص نیست؛ چیزی تغییر نکرد.", reply_markup=stars_admin_home_keyboard())
+            return
+        try:
+            save_stars_manager_settings(manager)
+        except ValueError as exc:
+            await message.reply_text(str(exc), reply_markup=stars_admin_home_keyboard())
+            return
+        user_data.pop("stars_admin_input", None)
+        await message.reply_text(stars_admin_home_text(note), reply_markup=stars_admin_home_keyboard())
+        return
+
     # Premium manager inputs; all values are isolated in premium_manager_settings_v1.
     premium_input = user_data.get("premium_admin_input") if user and user.id == ADMIN_ID else None
     if message and message.text and premium_input:
@@ -10847,7 +11544,7 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             amount = int(fixed_recipient_state.get("amount") or 0)
         except (TypeError, ValueError):
             amount = 0
-        if amount not in FIXED_STAR_AMOUNTS:
+        if amount not in FIXED_STAR_AMOUNTS or not is_valid_stars_quantity(amount):
             user_data.pop("stars_fixed_wait_recipient", None)
             await message.reply_text("بستهٔ استارز پیدا نشد؛ از منوی استارز دوباره شروع کن.")
             return
@@ -10949,7 +11646,7 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await message.reply_text("❌ آیدی معتبر نیست. یک نام کاربری عمومی با @ و ۵ تا ۳۲ نویسه بفرست؛ مثال: @SeyedPro_AIA")
             return
         order = user_data.get("stars_custom_order")
-        if not isinstance(order, dict) or not 50 <= int(order.get("amount") or 0) <= 1_000_000:
+        if not isinstance(order, dict) or not is_valid_stars_quantity(order.get("amount") or 0):
             user_data.pop("stars_custom_wait_recipient", None)
             await message.reply_text("اطلاعات انتخاب استارز پیدا نشد؛ از منوی استارز دوباره شروع کن.")
             return
