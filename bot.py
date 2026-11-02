@@ -740,10 +740,10 @@ def product_details_prompt(product):
     if category == "gifts":
         return (
             "🎁 اطلاعات گیرندهٔ گیفت را در یک پیام بفرست:\n\n"
-            "ID عددی گیرنده: 123456789\n"
+            "ID عددی گیرنده یا @username: 123456789 یا @username\n"
             "آیدی تلگرام گیرنده: @username یا ندارم\n\n"
-            "اگر برای خودت خرید می‌کنی، ID عددی و آیدی خودت را در قسمت گیرنده هم وارد کن.\n"
-            "ID عددی برای بررسی و ارسال رسمی لازم است؛ آیدی @ اختیاری است."
+            "اگر برای خودت خرید می‌کنی، ID یا آیدی خودت را در قسمت گیرنده هم وارد کن.\n"
+            "برای استفاده از @username، گیرنده باید قبلاً توسط ربات شناخته شده باشد؛ تحویل رسمی همچنان به ID عددی نیاز دارد."
         )
     if category == "premium":
         return (
@@ -1839,7 +1839,7 @@ def support_form_text(user):
         f"ID عددی خریدار {user.id}\n"
         f"آیدی تلگرام خریدار {username}\n\n"
         "🎁 اطلاعات گیرنده\n"
-        "ID عددی گیرنده وارد کنید\n"
+        "ID عددی گیرنده یا @username وارد کنید\n"
         "آیدی تلگرام گیرنده @username یا ندارم\n\n"
         "📦 اطلاعات سفارش\n"
         "نام کامل محصول نام دقیق محصول، نوع و مقدار را بنویس\n"
@@ -1856,7 +1856,7 @@ def support_form_copy_text(user):
     return (
         f"ID عددی خریدار {user.id}\n"
         f"آیدی تلگرام خریدار {username}\n"
-        "ID عددی گیرنده وارد کنید\n"
+        "ID عددی گیرنده یا @username وارد کنید\n"
         "آیدی تلگرام گیرنده @username/ندارم\n"
         "نام کامل محصول وارد کنید\n"
         "کد سفارش وارد کنید / ندارم\n"
@@ -1885,8 +1885,15 @@ async def create_support_ticket(update, context, parsed):
     buyer_entered = normalize_ascii_digits(parsed.get("buyer_id_entered", ""))
     # The actual Telegram sender ID is authoritative and cannot be overwritten by copied text.
     recipient_id_raw = normalize_ascii_digits(parsed.get("recipient_id", "")).strip()
+    recipient_username_from_id = ""
     recipient_id = int(recipient_id_raw) if re.fullmatch(r"\d{5,20}", recipient_id_raw) else None
-    recipient_username = normalize_optional_username(parsed.get("recipient_username", ""))
+    if recipient_id is None and recipient_id_raw.startswith("@"):
+        recipient_username_from_id = normalize_optional_username(recipient_id_raw) or ""
+        if recipient_username_from_id:
+            recipient_id = resolve_known_user_id(recipient_username_from_id)
+    recipient_username = normalize_optional_username(parsed.get("recipient_username", "")) or recipient_username_from_id
+    if recipient_id is None and recipient_username:
+        recipient_id = resolve_known_user_id(recipient_username)
     if recipient_username is None:
         await message.reply_text("❌ آیدی تلگرام گیرنده معتبر نیست. آن را به شکل @username وارد کن یا بنویس ندارم.")
         return True
@@ -4728,6 +4735,13 @@ def _prepare_outgoing_markup(chat_id, markup):
         return markup
     if _is_custom_stars_markup(markup):
         return markup
+    # Group panels are always inline, regardless of the private-chat menu preference.
+    if _is_group_chat_id(chat_id):
+        if isinstance(markup, InlineKeyboardMarkup):
+            return InlineKeyboardMarkup(_premium_inline_rows(markup))
+        if isinstance(markup, ReplyKeyboardMarkup):
+            return None
+        return markup
 
     mode = get_main_menu_type()
     if mode == MENU_TYPE_INLINE:
@@ -4925,8 +4939,8 @@ async def _mode_aware_send_message(self, *args, **kwargs):
     markup = kwargs.get("reply_markup")
     chat_id = _bot_argument(args, kwargs, "chat_id", 0)
     mode = get_main_menu_type()
-    # Never display inline or reply keyboards in groups. Purchase/admin flows are private-chat only.
-    if _is_group_chat_id(chat_id) and isinstance(markup, (InlineKeyboardMarkup, ReplyKeyboardMarkup)):
+    # Groups may show inline admin controls; ReplyKeyboardMarkup is never valid there.
+    if _is_group_chat_id(chat_id) and isinstance(markup, ReplyKeyboardMarkup):
         kwargs = dict(kwargs)
         kwargs["reply_markup"] = None
         markup = None
@@ -4949,14 +4963,14 @@ async def _mode_aware_edit_message_text(self, *args, **kwargs):
     text_value = _bot_argument(args, kwargs, "text", 0)
     message_id = _bot_argument(args, kwargs, "message_id", 2)
     mode = get_main_menu_type()
-    # Remove existing buttons as well as preventing new keyboards in group chats.
-    if _is_group_chat_id(chat_id) and isinstance(markup, (InlineKeyboardMarkup, ReplyKeyboardMarkup)):
+    # Keep inline admin buttons in groups, but never render a ReplyKeyboard there.
+    if _is_group_chat_id(chat_id) and isinstance(markup, ReplyKeyboardMarkup):
         kwargs = dict(kwargs)
         kwargs["reply_markup"] = None
         markup = None
     if mode == MENU_TYPE_INLINE and not isinstance(markup, ReplyKeyboardRemove) and not _is_group_chat_id(chat_id):
         await _remove_stale_reply_keyboard(self, chat_id)
-    if mode == MENU_TYPE_KEYBOARD and isinstance(markup, (InlineKeyboardMarkup, ReplyKeyboardMarkup)) and chat_id is not None and not _is_custom_stars_markup(markup):
+    if mode == MENU_TYPE_KEYBOARD and isinstance(markup, (InlineKeyboardMarkup, ReplyKeyboardMarkup)) and chat_id is not None and not _is_group_chat_id(chat_id) and not _is_custom_stars_markup(markup):
         converted = _prepare_outgoing_markup(chat_id, markup)
         # Telegram cannot edit an inline message into a ReplyKeyboard. Send the
         # same screen as a new message with the ReplyKeyboard, then clear old inline buttons.
@@ -5461,6 +5475,112 @@ def admin_tools_keyboard():
     ])
 
 
+def resolve_known_user_id(identifier):
+    """Resolve a numeric Telegram ID or a username already known to this bot."""
+    raw = normalize_ascii_digits(str(identifier or "").strip())
+    if raw.isdigit():
+        return int(raw) if int(raw) > 0 else None
+    username = raw.lstrip("@").strip().casefold()
+    if not username:
+        return None
+    try:
+        with db() as con:
+            row = con.execute(
+                "SELECT user_id FROM users WHERE lower(username)=? LIMIT 1", (username,)
+            ).fetchone()
+            if row:
+                return int(row["user_id"])
+            row = con.execute(
+                "SELECT user_id FROM admin_staff WHERE lower(username)=? LIMIT 1", (username,)
+            ).fetchone()
+            if row:
+                return int(row["user_id"])
+    except sqlite3.Error:
+        logger.exception("Username lookup failed for %s", username)
+    return None
+
+
+async def resolve_group_chat_id(identifier, bot=None):
+    """Resolve a known group ID or @username; never guess an unknown target."""
+    raw = normalize_ascii_digits(str(identifier or "").strip())
+    if raw.lstrip("-").isdigit():
+        return int(raw)
+    username = raw if raw.startswith("@") else "@" + raw
+    try:
+        with db() as con:
+            row = con.execute("SELECT chat_id FROM managed_groups WHERE lower(username)=? LIMIT 1", (username.lstrip("@").lower(),)).fetchone()
+            if row:
+                return int(row["chat_id"])
+        if bot is not None:
+            chat = await bot.get_chat(username)
+            if chat and chat.type in {"group", "supergroup"}:
+                return int(chat.id)
+    except Exception:
+        logger.info("Could not resolve group identifier %s", username, exc_info=True)
+    return None
+
+
+def _is_explicit_group_product_query(text):
+    """Only recognize deliberately addressed product/price phrases in groups."""
+    value = normalize_ascii_digits(str(text or "")).casefold().strip()
+    if not value:
+        return False
+    has_amount = bool(__import__("re").search(r"\d+(?:[.,]\d+)?", value))
+    return (
+        "پرمیوم" in value or "premium" in value or
+        "استارز" in value or "stars" in value or
+        "تون" in value or "ton" in value or
+        "دلار" in value or "usd" in value or "$" in value
+    ) and (has_amount or "پرمیوم" in value or "premium" in value)
+
+
+async def _answer_group_product_query(update, context):
+    """Answer only explicit product-price queries; never show purchase keyboards in groups."""
+    message = update.effective_message
+    text_value = str(message.text or "").strip()
+    normalized = normalize_ascii_digits(text_value).casefold()
+    import re
+    amount_match = re.search(r"(\d+(?:[.,]\d+)?)", normalized)
+    amount = None
+    if amount_match:
+        try:
+            amount = Decimal(amount_match.group(1).replace(",", "."))
+        except InvalidOperation:
+            amount = None
+
+    if "پرمیوم" in normalized or "premium" in normalized:
+        with db() as con:
+            rows = con.execute("SELECT * FROM products WHERE lower(category)='premium' AND active=1 ORDER BY sort_order,id").fetchall()
+        lines = ["💎 پلن‌های فعال تلگرام پرمیوم"]
+        for row in rows[:12]:
+            quote = dynamic_product_quote(row, load_auto_pricing_config())
+            price = f"{toman(quote['sale_toman'])} تومان" if quote else (f"{toman(row['price'])} تومان" if int(row['price'] or 0) > 0 else "استعلام قیمت")
+            lines.append(f"• {row['name']}: {price}")
+        if len(lines) == 1:
+            lines.append("در حال حاضر پلن فعالی ثبت نشده است.")
+        lines.append("برای ثبت سفارش، وارد پی‌وی ربات شوید: /start")
+        await message.reply_text("\n".join(lines)[:3900])
+        return True
+
+    if ("استارز" in normalized or "stars" in normalized) and amount is not None and amount == amount.to_integral_value() and amount > 0:
+        quote = auto_pricing_quote("stars", int(amount))
+        if quote:
+            answer = f"⭐ قیمت {int(amount):,} استارز: {toman(quote['sale_toman'])} تومان"
+        else:
+            answer = f"⭐ درخواست قیمت {int(amount):,} استارز دریافت شد؛ نرخ فعلی در دسترس نیست."
+        await message.reply_text(answer + "\nبرای ثبت سفارش وارد پی‌وی ربات شوید: /start")
+        return True
+
+    if ("تون" in normalized or "ton" in normalized) and amount is not None and amount > 0:
+        await message.reply_text(f"💠 درخواست قیمت {amount.normalize()} TON دریافت شد. برای استعلام و ثبت درخواست وارد پی‌وی ربات شوید: /start")
+        return True
+
+    if ("دلار" in normalized or "usd" in normalized or "$" in normalized) and amount is not None and amount > 0:
+        await message.reply_text(f"💵 درخواست قیمت {amount.normalize()} دلار دریافت شد. برای استعلام و ثبت درخواست وارد پی‌وی ربات شوید: /start")
+        return True
+    return False
+
+
 async def admin_tools_callback(query, context):
     uid, data = query.from_user.id, query.data
     if not is_store_admin(uid):
@@ -5469,7 +5589,7 @@ async def admin_tools_callback(query, context):
         await query.edit_message_text("⚙️ پنل مدیریت SEYED PREMIUM", reply_markup=admin_tools_keyboard()); return True
     if data == "adm_users":
         context.user_data["adm_state"] = {"step":"user_lookup"}
-        await query.edit_message_text("شناسه عددی کاربر را بفرست تا حساب و موجودی او نمایش داده شود. برای لغو /cancel بزن."); return True
+        await query.edit_message_text("ID عددی یا @username کاربر را بفرست تا حساب و موجودی او نمایش داده شود. نام کاربری باید قبلاً توسط ربات شناخته شده باشد. برای لغو /cancel بزن."); return True
     if data == "adm_staff":
         if uid != ADMIN_ID:
             await query.answer("فقط مدیر اصلی می‌تواند مدیر اضافه یا حذف کند.", show_alert=True); return True
@@ -5484,7 +5604,7 @@ async def admin_tools_callback(query, context):
     if data == "adm_staff_add":
         if uid != ADMIN_ID: await query.answer("فقط مدیر اصلی مجاز است.",show_alert=True); return True
         context.user_data["adm_state"]={"step":"staff_add"}
-        await query.edit_message_text("شناسه عددی تلگرام مدیر جدید را بفرست. فقط به پنل کاربران/گروه‌ها و ارسال پیام دسترسی خواهد داشت. /cancel برای لغو."); return True
+        await query.edit_message_text("ID عددی یا @username مدیر جدید را بفرست. کاربر باید قبلاً توسط ربات شناخته شده باشد. فقط به پنل کاربران/گروه‌ها و ارسال پیام دسترسی خواهد داشت. /cancel برای لغو."); return True
     if data.startswith("adm_staff_del_"):
         if uid != ADMIN_ID: await query.answer("فقط مدیر اصلی مجاز است.",show_alert=True); return True
         target=int(data.rsplit("_",1)[1])
@@ -5507,8 +5627,27 @@ async def admin_tools_callback(query, context):
     if data.startswith("adm_group_toggle_") or data.startswith("adm_group_notice_"):
         if uid != ADMIN_ID: await query.answer("فقط مدیر اصلی مجاز است.",show_alert=True); return True
         notice=data.startswith("adm_group_notice_"); target=int(data.rsplit("_",1)[1]); col="notice_enabled" if notice else "enabled"
-        with db() as con: con.execute(f"UPDATE managed_groups SET {col}=1-{col},last_seen=CURRENT_TIMESTAMP WHERE chat_id=?",(target,))
-        admin_audit(uid,"toggle_group_notice" if notice else "toggle_group",target)
+        with db() as con:
+            old_row = con.execute(f"SELECT {col} AS value,title FROM managed_groups WHERE chat_id=?",(target,)).fetchone()
+            old_value = bool(old_row["value"]) if old_row else False
+            con.execute(f"UPDATE managed_groups SET {col}=1-{col},last_seen=CURRENT_TIMESTAMP WHERE chat_id=?",(target,))
+            new_value = not old_value
+        if notice:
+            try:
+                notice_text = (
+                    "📢 اطلاعیه شفافیت: از این پس پیام‌های ارسالی اعضای این گروه برای بررسی به مدیر ربات ارسال می‌شود. با غیرفعال‌کردن گزینه «اطلاعیه» در پنل مدیریت، این ارسال متوقف خواهد شد."
+                    if new_value else
+                    "ℹ️ اطلاعیه: ارسال پیام‌های اعضای این گروه به پی‌وی مدیر ربات متوقف شد."
+                )
+                await context.bot.send_message(chat_id=target, text=notice_text)
+            except Exception:
+                logger.exception("Could not publish group forwarding notice to %s", target)
+                if new_value:
+                    with db() as con:
+                        con.execute("UPDATE managed_groups SET notice_enabled=0 WHERE chat_id=?", (target,))
+                    await query.answer("ارسال اطلاعیه در گروه ناموفق بود؛ ارسال پیام‌ها فعال نشد.", show_alert=True)
+                    return
+        admin_audit(uid,"toggle_group_notice" if notice else "toggle_group",target, f"enabled={int(new_value)}")
         await query.answer("تنظیم گروه ذخیره شد."); return await admin_tools_callback(type("Q",(),{"from_user":query.from_user,"data":"adm_groups","edit_message_text":query.edit_message_text,"answer":query.answer})(),context)
     if data == "adm_audit":
         with db() as con: rows=con.execute("SELECT actor_id,action,target_id,details,created_at FROM admin_audit_log ORDER BY id DESC LIMIT 20").fetchall()
@@ -5527,9 +5666,11 @@ async def handle_admin_tool_text(update, context):
         context.user_data.pop("adm_state",None); await msg.reply_text("عملیات لغو شد.",reply_markup=admin_tools_keyboard()); return True
     step=state.get("step")
     if step in {"user_lookup","staff_add"}:
-        clean=normalize_ascii_digits(raw)
-        if not clean.isdigit() or int(clean)<=0: await msg.reply_text("شناسه باید یک عدد معتبر باشد یا /cancel بزن."); return True
-        target=int(clean); context.user_data.pop("adm_state",None)
+        target = resolve_known_user_id(raw)
+        if not target:
+            await msg.reply_text("کاربر پیدا نشد. ID عددی یا @username را بررسی کن؛ برای جست‌وجوی نام کاربری، کاربر باید قبلاً به ربات پیام داده یا در گروه شناخته شده باشد. /cancel برای لغو.")
+            return True
+        context.user_data.pop("adm_state",None)
         if step=="staff_add":
             if user.id!=ADMIN_ID: await msg.reply_text("فقط مدیر اصلی مجاز است."); return True
             if target==ADMIN_ID: await msg.reply_text("مدیر اصلی از قبل دسترسی کامل دارد."); return True
@@ -6579,15 +6720,20 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     source_chat = getattr(getattr(query, "message", None), "chat", None) if query else None
     if source_chat and source_chat.type in {"group", "supergroup"}:
-        try:
-            await query.answer("خدمات و پنل‌های ربات فقط در پی‌وی فعال هستند.", show_alert=True)
-        except Exception:
-            pass
-        try:
-            await query.edit_message_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-        return
+        group_admin_action = bool(query and is_store_admin(query.from_user.id) and (
+            query.data == "global_cancel" or query.data == "adm_back" or
+            query.data.startswith(("adm_", "admin_", "premium_admin_", "gift_admin_", "gift_orders", "gift_order_", "uiadm_"))
+        ))
+        if not group_admin_action:
+            try:
+                await query.answer("خرید و خدمات مشتری فقط در پی‌وی فعال است؛ پنل مدیریتی در گروه محدود شده است.", show_alert=True)
+            except Exception:
+                pass
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            return
     if query and query.data == "global_cancel":
         await handle_global_cancel_callback(update, context)
         return
@@ -9491,7 +9637,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             prompts = {
                 "code": "✏️ کد جدید را وارد کن (حروف انگلیسی و عدد):\nمثال: SEYED18",
                 "userlimit": "🔢 حداکثر تعداد استفاده را وارد کن (۰ = نامحدود):",
-                "recipient": "👤 اختصاص کد به یک کاربر\n\nآی‌دیِ عددیِ تلگرامِ کاربر را بفرست؛ از آن پس فقط همان کاربر می‌تواند این کد را استفاده کند.\n\nبرای برداشتنِ محدودیت عدد 0 را بفرست.",
+                "recipient": "👤 اختصاص کد به یک کاربر\n\nID عددی یا @username کاربر را بفرست؛ نام کاربری باید قبلاً توسط ربات شناخته شده باشد. از آن پس فقط همان کاربر می‌تواند این کد را استفاده کند.\n\nبرای برداشتنِ محدودیت عدد 0 را بفرست.",
                 "min": "🧾 حداقلِ مبلغ خرید\n\nمبلغ را به تومان بفرست؛ کد فقط روی سفارش‌هایی با مبلغِ برابر یا بیشتر از این اعمال می‌شود.\n\nبرای برداشتنِ محدودیت عدد 0 را بفرست.",
             }
             if field not in prompts:
@@ -10646,7 +10792,31 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
     message = update.effective_message
     chat = update.effective_chat
     if chat and chat.type in {"group", "supergroup"}:
-        # No shopping, admin or conversational input flows are processed in groups.
+        if not message or not user:
+            return
+        if is_store_admin(user.id):
+            if message.text and _is_customer_cancel_text(message.text):
+                await cancel_coupon_creation(update, context)
+                return
+            if message.text and await handle_admin_tool_text(update, context):
+                return
+            admin_flow_keys = {
+                "support_admin_reply_state", "support_admin_search_state", "gift_order_search_state",
+                "gift_admin_input", "premium_admin_input", "gift_custom_state", "product_admin_state",
+                "pricing_admin_state", "product_profit_admin_state", "admin_coupon_state", "uiadm_state",
+                "auto_pricing_admin_state", "stars_custom_wait_recipient", "ton_purchase_state",
+                "mediator_request_state", "pending_broadcast_state",
+            }
+            if not any(user_data.get(key) for key in admin_flow_keys):
+                # Admin menus are opened with /admin and use inline buttons. Do not
+                # let unrelated group chatter fall through to the shop response.
+                return
+        else:
+            if message.text and _is_explicit_group_product_query(message.text):
+                await _answer_group_product_query(update, context)
+            return
+        if message.text and _is_explicit_group_product_query(message.text):
+            await _answer_group_product_query(update, context)
         return
     if user and is_user_blocked(user.id):
         if message: await message.reply_text("⛔ دسترسی شما به این ربات توسط مدیریت محدود شده است.")
@@ -11560,16 +11730,16 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     success_text = "✅ محدودیت حداقل مبلغ خرید برداشته شد." if value == 0 else f"✅ حداقل مبلغ خرید به {value:,} تومان تغییر یافت."
 
                 elif field == "recipient":
-                    if not re.fullmatch(r"[0-9]{1,20}", answer):
-                        await message.reply_text("❌ آی‌دی عددی تلگرام را وارد کن؛ برای برداشتن محدودیت عدد 0 را بفرست.")
-                        return
-                    value = int(answer)
-                    if value == 0:
+                    if answer == "0":
                         con.execute("UPDATE discount_codes SET recipient_type='all', recipient_ids='[]' WHERE code=?", (code,))
                         success_text = "✅ محدودیت اختصاص کد به کاربر برداشته شد."
                     else:
+                        value = resolve_known_user_id(answer)
+                        if not value:
+                            await message.reply_text("❌ کاربر پیدا نشد. ID عددی یا @username شناخته‌شده توسط ربات را وارد کن؛ برای برداشتن محدودیت عدد 0 را بفرست.")
+                            return
                         con.execute("UPDATE discount_codes SET recipient_type='selected', recipient_ids=? WHERE code=?", (json.dumps([str(value)]), code))
-                        success_text = f"✅ کد تخفیف فقط به کاربر با آیدی {value} اختصاص یافت."
+                        success_text = f"✅ کد تخفیف فقط به کاربر {answer} (ID: {value}) اختصاص یافت."
 
                 elif field == "expiry_date":
                     match = re.fullmatch(r"([0-9]{4})-([0-9]{2})-([0-9]{2})", answer)
@@ -12481,17 +12651,27 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 recipient_user_id = None
                 recipient_username = ""
                 if category == "gifts":
-                    gift_id_match = re.search(r"(?im)^\s*ID\s*عددی\s*گیرنده\s*[:：]\s*(\d{5,20})\s*$", normalize_ascii_digits(details))
+                    normalized_details = normalize_ascii_digits(details)
+                    gift_id_match = re.search(r"(?im)^\s*ID\s*عددی\s*گیرنده\s*[:：]\s*(\d{5,20})\s*$", normalized_details)
+                    gift_username_id_match = re.search(r"(?im)^\s*ID\s*عددی\s*گیرنده\s*[:：]\s*(@[A-Za-z0-9_]{5,32})\s*$", details)
                     username_match = re.search(r"(?im)^\s*آیدی\s*تلگرام\s*گیرنده\s*[:：]\s*(.*)$", details)
-                    if not gift_id_match:
-                        await message.reply_text("❌ برای ثبت سفارش گیفت، ID عددی گیرنده را جداگانه وارد کن.\nنمونه:\nID عددی گیرنده: 123456789\nآیدی تلگرام گیرنده: @username یا ندارم")
+                    if gift_id_match:
+                        recipient_user_id = int(gift_id_match.group(1))
+                    elif gift_username_id_match:
+                        recipient_username = normalize_optional_username(gift_username_id_match.group(1)) or ""
+                        recipient_user_id = resolve_known_user_id(recipient_username) if recipient_username else None
+                        if not recipient_user_id:
+                            await message.reply_text("❌ این @username هنوز در سوابق ربات شناخته نشده است. گیرنده باید ابتدا ربات را /start کند یا ID عددی او را وارد کنی.")
+                            return
+                    else:
+                        await message.reply_text("❌ برای ثبت سفارش گیفت، در قسمت گیرنده ID عددی یا @username وارد کن. نمونه: ID عددی گیرنده: 123456789 یا ID عددی گیرنده: @username")
                         return
-                    recipient_user_id = int(gift_id_match.group(1))
                     if username_match:
-                        recipient_username = normalize_optional_username(username_match.group(1))
-                        if recipient_username is None:
+                        parsed_username = normalize_optional_username(username_match.group(1))
+                        if parsed_username is None:
                             await message.reply_text("❌ آیدی تلگرام گیرنده معتبر نیست. آن را با @ وارد کن یا بنویس ندارم.")
                             return
+                        recipient_username = parsed_username or recipient_username
                     gift_cfg_now = load_gift_settings()
                     requested_mode = str(user_data.get("pending_gift_delivery_mode") or ("manual" if gift_cfg_now["manual_delivery_all"] else product["delivery_mode"] or "manual"))
                     if gift_cfg_now["manual_delivery_all"]:
@@ -12677,14 +12857,33 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ==========================================
 
 async def track_managed_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Store group metadata only; never archive or forward member messages."""
-    chat=update.effective_chat
-    if not chat or chat.type not in {"group","supergroup"}: return
+    """Register groups and transparently forward messages only after a public notice is enabled."""
+    chat = update.effective_chat
+    message = update.effective_message
+    if not chat or chat.type not in {"group", "supergroup"}:
+        return
     try:
         with db() as con:
-            con.execute("INSERT INTO managed_groups(chat_id,title,username) VALUES(?,?,?) ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title,username=excluded.username,last_seen=CURRENT_TIMESTAMP",
-                        (chat.id,chat.title or "",chat.username or ""))
-    except sqlite3.Error: logger.exception("Could not register group %s",chat.id)
+            con.execute(
+                "INSERT INTO managed_groups(chat_id,title,username) VALUES(?,?,?) "
+                "ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title,username=excluded.username,last_seen=CURRENT_TIMESTAMP",
+                (chat.id, chat.title or "", chat.username or ""),
+            )
+            row = con.execute("SELECT enabled,notice_enabled FROM managed_groups WHERE chat_id=?", (chat.id,)).fetchone()
+        if not message or not row or not row["enabled"] or not row["notice_enabled"]:
+            return
+        sender = update.effective_user
+        if not sender or sender.is_bot:
+            return
+        # Forward only after the group has received the explicit notice above.
+        try:
+            await context.bot.forward_message(
+                chat_id=ADMIN_ID, from_chat_id=chat.id, message_id=message.message_id
+            )
+        except Exception:
+            logger.exception("Transparent group-to-admin forwarding failed for chat=%s message=%s", chat.id, message.message_id)
+    except sqlite3.Error:
+        logger.exception("Could not register group %s", chat.id)
 
 
 async def track_bot_group_membership(update: Update, context: ContextTypes.DEFAULT_TYPE):
