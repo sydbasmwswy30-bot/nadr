@@ -3640,8 +3640,11 @@ def _nobitex_fernet():
         raise RuntimeError("EncryptionKeyMissing")
     try:
         from cryptography.fernet import Fernet
+    except ImportError:
+        raise RuntimeError("EncryptionLibraryMissing") from None
+    try:
         return Fernet(master_key.encode("ascii"))
-    except Exception:
+    except (ValueError, UnicodeEncodeError, TypeError):
         raise RuntimeError("EncryptionKeyInvalid") from None
 
 
@@ -4143,15 +4146,6 @@ async def handle_nobitex_callback(query, context):
                 InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_nbx_home")]])
             )
             return True
-        if not nobitex_encryption_ready():
-            await safe_callback_edit_or_reply(
-                query,
-                "🔐 رمزگذاری امن روی میزبان آماده نیست.\n\n"
-                f"متغیر `{NOBITEX_ENCRYPTION_ENV}` باید در Environment variables تنظیم شده باشد و کتابخانهٔ `cryptography` روی هاست نصب باشد.\n"
-                "پس از اصلاح، ربات را Restart کن. کلید رمزگذاری را در تلگرام ارسال نکن.",
-                InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_nbx_home")]])
-            )
-            return True
         if not isinstance(getattr(context, "user_data", None), dict):
             await safe_callback_edit_or_reply(
                 query,
@@ -4165,8 +4159,8 @@ async def handle_nobitex_callback(query, context):
             "حالا یک پیام شامل دقیقاً دو خط بفرست؛ بدون عنوان یا فاصلهٔ اضافی:\n\n"
             "خط ۱: API Key (مقدار عمومی فیلد `key`)\n"
             "خط ۲: Private Key که نوبیتکس برای امضای API داده است\n\n"
-            "این مرحله فقط برای دسترسی READ است. کلید را در گروه نفرست و رمز ورود حساب نوبیتکس را هرگز ارسال نکن.\n"
-            "ربات تلاش می‌کند پیام را پس از دریافت حذف کند، اما حذف تلگرام تضمین‌شده نیست.\n\n"
+            "این مرحله فقط برای دسترسی READ است. رمز ورود حساب نوبیتکس را هرگز ارسال نکن.\n"
+            "ربات تلاش می‌کند پیام ورودی را حذف کند و فقط پس از رمزگذاری موفق، کلیدها را ذخیره می‌کند؛ حذف پیام تلگرام تضمین‌شده نیست.\n\n"
             "برای لغو، /cancel بفرست."
         )
         await safe_callback_edit_or_reply(
@@ -11786,7 +11780,7 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 reply_markup=nobitex_admin_keyboard(),
             )
         except Exception as exc:
-            code = str(exc) if str(exc) in {"InvalidPublicKey", "InvalidPrivateKey", "EncryptionKeyMissing", "EncryptionKeyInvalid"} else type(exc).__name__
+            code = str(exc) if str(exc) in {"InvalidPublicKey", "InvalidPrivateKey", "EncryptionKeyMissing", "EncryptionKeyInvalid", "EncryptionLibraryMissing"} else type(exc).__name__
             if code == "InvalidCredentialFormat":
                 help_text = "قالب پیام درست نبود؛ دقیقاً دو خط لازم است: خط اول API Key و خط دوم Private Key. درخواست حذف پیام فرستاده شد؛ دوباره وارد کن."
             elif code == "InvalidPublicKey":
@@ -11796,7 +11790,9 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             elif code == "EncryptionKeyMissing":
                 help_text = f"متغیر محیطی {NOBITEX_ENCRYPTION_ENV} تنظیم نیست؛ هیچ کلیدی ذخیره نشد."
             elif code == "EncryptionKeyInvalid":
-                help_text = "کلید رمزگذاری میزبان معتبر نیست؛ هیچ کلیدی ذخیره نشد."
+                help_text = "کلید رمزگذاری میزبان معتبر نیست؛ هیچ کلیدی ذخیره نشد. مقدار متغیر محیطی را در FadeHost بررسی کن."
+            elif code == "EncryptionLibraryMissing":
+                help_text = "کتابخانهٔ رمزگذاری روی هاست نصب نیست؛ هیچ کلیدی ذخیره نشد. cryptography باید در requirements.txt باشد و پس از Redeploy نصب شود."
             else:
                 help_text = "ثبت امن کلیدها انجام نشد؛ کلید قبلی در صورت وجود حفظ شده است."
             await context.bot.send_message(chat_id=ADMIN_ID, text="❌ " + help_text, reply_markup=nobitex_admin_keyboard())
