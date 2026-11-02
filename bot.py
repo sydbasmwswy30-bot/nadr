@@ -3082,6 +3082,7 @@ STARS_DEFAULT_SETTINGS = {
     "usd_rate_attempted_at": "",
     "usd_rate_error": "نرخ دلار آزاد هنوز دریافت نشده است.",
     "usd_rate_last_alert_at": "",
+    "refresh_minutes": 30,
     "margin_percent": "30",
     "min_order": 50,
     "max_order": 1000000,
@@ -3089,8 +3090,8 @@ STARS_DEFAULT_SETTINGS = {
     "support_text": "📩 سفارش شما ثبت شد و تحویل آن به‌صورت دستی پیگیری می‌شود. برای هماهنگی بیشتر با پشتیبانی در ارتباط باش.",
     "support_username": "",
 }
-STARS_USD_MAX_AGE_SECONDS = 45 * 60
-STARS_USD_REFRESH_SECONDS = 15 * 60
+STARS_USD_MAX_AGE_SECONDS = 3 * 60 * 60
+STARS_USD_REFRESH_SECONDS = 30 * 60
 _STARS_USD_REFRESH_LOCK = None
 
 
@@ -3147,6 +3148,11 @@ def load_stars_settings():
         maximum = max(minimum, 1_000_000)
     cfg["min_order"] = minimum
     cfg["max_order"] = maximum
+    try:
+        rm = int(cfg.get("refresh_minutes", 30))
+        cfg["refresh_minutes"] = rm if 1 <= rm <= 120 else 30
+    except (TypeError, ValueError, OverflowError):
+        cfg["refresh_minutes"] = 30
     rate = _pricing_decimal(cfg.get("usd_rate_toman"))
     cfg["usd_rate_toman"] = str(rate) if rate is not None else ""
     if not isinstance(cfg.get("usd_rate_sources_status"), dict):
@@ -3181,6 +3187,11 @@ def save_stars_settings(cfg):
     if not 0 <= rate <= 100_000_000:
         raise ValueError("نرخ دستی دلار معتبر نیست.")
     normalized["usd_toman_manual"] = rate
+    try:
+        rm = int(normalized.get("refresh_minutes", 30))
+        normalized["refresh_minutes"] = rm if 1 <= rm <= 120 else 30
+    except (TypeError, ValueError, OverflowError):
+        normalized["refresh_minutes"] = 30
     normalized["auto_enabled"] = bool(normalized.get("auto_enabled"))
     normalized["support_first"] = bool(normalized.get("support_first"))
     normalized["support_text"] = str(normalized.get("support_text") or STARS_DEFAULT_SETTINGS["support_text"])[:1500]
@@ -3209,75 +3220,67 @@ def _stars_source_rate_record(value, source, observed_at, max_age_seconds):
 
 
 async def _fetch_stars_free_usd_bundle(client):
-    """Fetch free-market USD/Toman from two separate public feeds; never substitute USDT."""
+    """Single source: Nobitex public API (USDT/IRT market). No API key is required for public prices."""
     headers = {"Accept": "application/json", "Cache-Control": "no-cache", "Pragma": "no-cache",
-               "User-Agent": "SEYED-PREMIUM-Stars-FX/1.0"}
+               "User-Agent": NOBITEX_USER_AGENT}
+    source_name = "Nobitex"
+    hosts = ("https://apiv2.nobitex.ir", "https://api.nobitex.ir")
 
-    async def fetch_iran_market():
-        response = await client.get(
-            "https://raw.githubusercontent.com/iran-market/iran-market.github.io/main/data/popular.json",
-            headers=headers,
-        )
+    def check_rate(rial_value, label):
+        rate = _pricing_decimal(rial_value)
+        if rate is None:
+            raise ValueError(f"قیمت {label} نوبیتکس موجود نیست.")
+        toman_rate = rate / Decimal(10)  # Nobitex RLS prices are in Rial
+        if not Decimal("1000") <= toman_rate <= Decimal("100000000"):
+            raise ValueError("نرخ نوبیتکس خارج از محدودهٔ مجاز است.")
+        return toman_rate
+
+    async def from_stats(host):
+        response = await client.get(host + "/market/stats", params={"srcCurrency": "usdt", "dstCurrency": "rls"}, headers=headers)
         response.raise_for_status()
         payload = response.json()
-        if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
-            raise ValueError("ساختار پاسخ Iran Market Data معتبر نیست.")
-        meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
-        if meta.get("stale") is True or str(meta.get("unit") or "").casefold() != "toman":
-            raise ValueError("خوراک Iran Market Data قدیمی یا فاقد واحد تومان است.")
-        row = next((item for item in payload["data"] if isinstance(item, dict) and item.get("symbol") == "USD_IRR_FREE"), None)
-        if not row or row.get("stale") is True or row.get("suspicious") is True:
-            raise ValueError("نماد دلار آزاد تازه و معتبر در Iran Market Data موجود نیست.")
-        if str(row.get("currency") or "").upper() not in {"IRT", "TOMAN"}:
-            raise ValueError("واحد نرخ دلار آزاد مورد انتظار نیست.")
-        return _stars_source_rate_record(row.get("price"), "Iran Market Data / TGJU", row.get("timestamp"), 45 * 60)
+        if not isinstance(payload, dict) or str(payload.get("status", "")).lower() != "ok":
+            raise ValueError("پاسخ آمار بازار نوبیتکس معتبر نیست.")
+        stats = payload.get("stats") if isinstance(payload.get("stats"), dict) else {}
+        row = stats.get("usdt-rls") or stats.get("USDT-RLS") or {}
+        if not isinstance(row, dict) or row.get("isClosed") is True:
+            raise ValueError("بازار USDT نوبیتکس بسته یا در دسترس نیست.")
+        buy, sell = _pricing_decimal(row.get("bestBuy")), _pricing_decimal(row.get("bestSell"))
+        if buy is not None and sell is not None and sell >= buy and (sell - buy) / ((sell + buy) / Decimal(2)) <= Decimal("0.08"):
+            return check_rate((buy + sell) / Decimal(2), "میانگین خرید/فروش"), "آمار بازار USDT/IRT"
+        return check_rate(row.get("latest"), "آخرین معامله"), "آخرین معامله USDT/IRT"
 
-    async def fetch_nerkhsanj():
-        response = await client.get("https://nerkh.jahankhahan.shop/data/live.json", headers=headers)
+    async def from_orderbook(host):
+        response = await client.get(host + "/v3/orderbook/USDTIRT", headers=headers)
         response.raise_for_status()
         payload = response.json()
-        if not isinstance(payload, dict) or not isinstance(payload.get("rates"), dict):
-            raise ValueError("ساختار پاسخ نرخ‌سنج معتبر نیست.")
-        # Its documentation states that time is empty outside market hours; such a
-        # closing quote is deliberately not treated as a fresh live quote.
-        date_text = str(payload.get("date") or "").strip()
-        time_text = str(payload.get("time") or "").strip()
-        if not re.fullmatch(r"\d{4}/\d{2}/\d{2}", date_text) or not re.fullmatch(r"\d{2}:\d{2}", time_text):
-            raise ValueError("زمان تازهٔ بازار در خوراک نرخ‌سنج موجود نیست.")
-        jy, jm, jd = (int(part) for part in date_text.split("/"))
-        hh, mm = (int(part) for part in time_text.split(":"))
-        observed = jalali_to_gregorian(jy, jm, jd).replace(hour=hh, minute=mm, second=0)
-        if observed > utc_now().astimezone(IRAN_TZ) + timedelta(minutes=1):
-            raise ValueError("زمان نرخ‌سنج در آینده قرار دارد.")
-        return _stars_source_rate_record(payload["rates"].get("dollar"), "نرخ‌سنج", observed.astimezone(timezone.utc).isoformat(), 20 * 60)
+        if not isinstance(payload, dict) or str(payload.get("status", "")).lower() != "ok":
+            raise ValueError("پاسخ دفتر سفارش نوبیتکس معتبر نیست.")
+        bids, asks = payload.get("bids") or [], payload.get("asks") or []
+        bid = _pricing_decimal(bids[0][0]) if bids else None
+        ask = _pricing_decimal(asks[0][0]) if asks else None
+        if bid is None or ask is None or ask < bid or (ask - bid) / ((ask + bid) / Decimal(2)) > Decimal("0.08"):
+            raise ValueError("قیمت دفتر سفارش نوبیتکس معتبر نیست.")
+        return check_rate((bid + ask) / Decimal(2), "دفتر سفارش"), "دفتر سفارش USDT/IRT"
 
-    results = await asyncio.gather(fetch_iran_market(), fetch_nerkhsanj(), return_exceptions=True)
-    statuses = {}
-    quotes = []
-    for name, result in zip(("Iran Market Data / TGJU", "نرخ‌سنج"), results):
-        if isinstance(result, asyncio.CancelledError):
-            raise result
-        if isinstance(result, BaseException):
-            statuses[name] = f"ناموفق: {type(result).__name__}: {str(result)[:120]}"
-            logger.warning("Stars free USD source %s failed: %s", name, result)
-        else:
-            statuses[name] = f"معتبر: {toman(result['rate'])} تومان"
-            quotes.append(result)
-    if len(quotes) < 2:
-        raise RuntimeError("برای تأیید نرخ دلار آزاد، هر دو خوراک عمومی مجزا باید دادهٔ تازه بدهند؛ آخرین نرخ ذخیره‌شده حفظ شد. "
-                           + " | ".join(f"{name}: {state}" for name, state in statuses.items()))
-    low = min(item["rate"] for item in quotes)
-    high = max(item["rate"] for item in quotes)
-    middle = (low + high) / Decimal(2)
-    spread = (high - low) / middle if middle else Decimal("1")
-    if spread > Decimal("0.03"):
-        raise RuntimeError("اختلاف دو منبع دلار آزاد بیش از ۳٪ است؛ نرخ پرت پذیرفته نشد و نرخ قبلی حفظ شد. "
-                           + " | ".join(f"{item['source']}={toman(item['rate'])}" for item in quotes))
-    selected = (low + high) / Decimal(2)
-    oldest = min(item["updated_at"] for item in quotes)
-    return {"rate": selected, "updated_at": oldest,
-            "source": " + ".join(item["source"] for item in quotes),
-            "sources_status": statuses}
+    last_exc = None
+    for attempt in range(2):
+        for host in hosts:
+            for fn in (from_stats, from_orderbook):
+                try:
+                    rate, note = await fn(host)
+                    # The quote was just fetched live from the exchange API, so its timestamp is the fetch time.
+                    now_iso = utc_now().isoformat(timespec="seconds")
+                    return {"rate": rate, "updated_at": now_iso, "source": f"{source_name} (تتر/تومان)",
+                            "sources_status": {source_name: f"معتبر: {toman(rate)} تومان | {note}"}}
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    last_exc = exc
+                    logger.warning("Nobitex rate %s via %s failed: %s", fn.__name__, host, exc)
+        await asyncio.sleep(2)
+    raise RuntimeError("دریافت نرخ از نوبیتکس ناموفق بود؛ آخرین نرخ ذخیره‌شده حفظ شد. "
+                       f"{type(last_exc).__name__}: {str(last_exc)[:200]}")
 
 
 async def _refresh_stars_usd_rate_locked(application=None, force=False):
@@ -3287,7 +3290,7 @@ async def _refresh_stars_usd_rate_locked(application=None, force=False):
     cfg["usd_rate_attempted_at"] = attempted
     try:
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(7.0, connect=4.0),
+            timeout=httpx.Timeout(15.0, connect=10.0),
             limits=httpx.Limits(max_connections=4, max_keepalive_connections=2),
             follow_redirects=True,
         ) as client:
@@ -3353,7 +3356,11 @@ async def stars_usd_refresh_loop(application):
             raise
         except Exception:
             logger.exception("Stars free-USD refresh loop failed")
-        await asyncio.sleep(STARS_USD_REFRESH_SECONDS)
+        try:
+            delay = int(load_stars_settings().get("refresh_minutes", 30)) * 60
+        except Exception:
+            delay = STARS_USD_REFRESH_SECONDS
+        await asyncio.sleep(max(60, delay))
 
 
 def stars_effective_usd_rate(cfg=None):
@@ -3489,7 +3496,8 @@ def stars_admin_text(cfg=None, note=""):
         f"⚙️ قیمت‌گذاری خودکار استارز: {auto_label}",
         f"🔧 روش قیمت‌گذاری: {price_mode}",
         f"💵 قیمت پایه دلاری هر استارز: {cfg.get('base_usd_per_star')} دلار",
-        f"💱 نرخ دلار آزاد مؤثر: {toman(rate) if rate is not None else 'ناموجود'} تومان | {rate_source}",
+        f"⏱ به‌روزرسانی خودکار نرخ: هر {cfg.get('refresh_minutes', 30)} دقیقه | منبع: نوبیتکس",
+        f"💱 نرخ دلار مؤثر: {toman(rate) if rate is not None else 'ناموجود'} تومان | {rate_source}",
         f"🕒 زمان آخرین نرخ معتبر خودکار: {updated}",
         "🔎 وضعیت خوراک‌ها: " + " | ".join(f"{name}: {str(state)[:65]}" for name, state in (cfg.get("usd_rate_sources_status") or {}).items()) if cfg.get("usd_rate_sources_status") else "🔎 وضعیت خوراک‌ها: هنوز دریافت نشده",
         f"📈 سود: {cfg.get('margin_percent')}٪",
@@ -3511,7 +3519,8 @@ def stars_admin_keyboard(cfg=None):
     cfg = cfg or load_stars_settings()
     auto_label = "⏸ خاموش‌کردن قیمت‌گذاری خودکار" if cfg.get("auto_enabled") else "▶️ روشن‌کردن قیمت‌گذاری خودکار"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 دریافت نرخ دلار آزاد", callback_data="admin_stars_refresh_usd", style="success")],
+        [InlineKeyboardButton("🔄 دریافت نرخ از نوبیتکس", callback_data="admin_stars_refresh_usd", style="success")],
+        [InlineKeyboardButton("⏱ زمان به‌روزرسانی خودکار نرخ", callback_data="admin_stars_refresh_minutes", style="primary")],
         [InlineKeyboardButton(auto_label, callback_data="admin_stars_toggle_auto", style="primary")],
         [InlineKeyboardButton("💱 قیمت دستی هر استارز", callback_data="admin_stars_manual_price", style="primary"),
          InlineKeyboardButton("💵 قیمت پایه دلاری", callback_data="admin_stars_base_usd", style="primary")],
@@ -3561,7 +3570,7 @@ async def finish_stars_usd_refresh(query, context):
     try:
         ok = await refresh_stars_usd_rate(application=context.application, force=True)
         cfg = load_stars_settings()
-        note = "✅ نرخ دلار آزاد با دو خوراک عمومی تازه و هم‌خوان تأیید شد." if ok else "⚠️ نرخ جدید تأیید نشد؛ آخرین نرخ معتبر قبلی حفظ شد."
+        note = "✅ نرخ از API نوبیتکس دریافت و ذخیره شد." if ok else "⚠️ نرخ جدید تأیید نشد؛ آخرین نرخ معتبر قبلی حفظ شد."
         await safe_callback_edit_or_reply(query, stars_admin_text(cfg, note), stars_admin_keyboard(cfg))
     except asyncio.CancelledError:
         raise
@@ -3572,769 +3581,8 @@ async def finish_stars_usd_refresh(query, context):
 
 
 
-# ==========================================
-# مدیریت امن اتصال و داشبورد فقط‌خواندنی نوبیتکس
-# Uses the existing app_settings row only; no shop.db schema changes.
-# ==========================================
+NOBITEX_USER_AGENT = "SEYED-PREMIUM-Nobitex-Rates/1.0"
 
-NOBITEX_MANAGER_KEY = "nobitex_manager_v1"
-NOBITEX_API_BASE = "https://apiv2.nobitex.ir"
-NOBITEX_ENCRYPTION_ENV = "SEYED_NOBITEX_ENCRYPTION_KEY"
-NOBITEX_USER_AGENT = "SEYED-PREMIUM-Nobitex-Manager/1.0"
-
-
-class NobitexAPIError(Exception):
-    """Sanitized Nobitex transport/API error; never retains raw response bodies."""
-    def __init__(self, code="UnknownError", http_status=None):
-        self.code = re.sub(r"[^A-Za-z0-9_:-]", "", str(code or "UnknownError"))[:80] or "UnknownError"
-        self.http_status = int(http_status) if http_status is not None else None
-        super().__init__(self.code)
-
-
-def nobitex_load_settings():
-    cfg = {
-        "api_key_ciphertext": "",
-        "private_key_ciphertext": "",
-        "local_permissions": ["READ"],
-        "credentials_saved_at": "",
-        "last_success_at": "",
-        "last_attempt_at": "",
-        "last_error_code": "",
-        "rates_history": [],
-    }
-    try:
-        with db() as con:
-            row = con.execute("SELECT value FROM app_settings WHERE key=?", (NOBITEX_MANAGER_KEY,)).fetchone()
-        if row:
-            stored = json.loads(row["value"] or "{}")
-            if isinstance(stored, dict):
-                cfg.update(stored)
-    except (sqlite3.Error, ValueError, TypeError, KeyError):
-        logger.warning("Nobitex manager settings could not be loaded")
-    cfg["api_key_ciphertext"] = str(cfg.get("api_key_ciphertext") or "")
-    cfg["private_key_ciphertext"] = str(cfg.get("private_key_ciphertext") or "")
-    cfg["local_permissions"] = ["READ"]
-    if not isinstance(cfg.get("rates_history"), list):
-        cfg["rates_history"] = []
-    cfg["rates_history"] = cfg["rates_history"][-120:]
-    return cfg
-
-
-def nobitex_save_settings(cfg):
-    safe = dict(cfg or {})
-    safe["local_permissions"] = ["READ"]
-    safe["rates_history"] = (safe.get("rates_history") if isinstance(safe.get("rates_history"), list) else [])[-120:]
-    with db() as con:
-        con.execute(
-            "INSERT INTO app_settings(key,value) VALUES(?,?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (NOBITEX_MANAGER_KEY, json.dumps(safe, ensure_ascii=False, separators=(",", ":"))),
-        )
-    return safe
-
-
-def _nobitex_fernet():
-    """Encryption key must be provided by the host environment, never stored in shop.db."""
-    master_key = str(os.environ.get(NOBITEX_ENCRYPTION_ENV) or "").strip()
-    if not master_key:
-        raise RuntimeError("EncryptionKeyMissing")
-    try:
-        from cryptography.fernet import Fernet
-    except ImportError:
-        raise RuntimeError("EncryptionLibraryMissing") from None
-    try:
-        return Fernet(master_key.encode("ascii"))
-    except (ValueError, UnicodeEncodeError, TypeError):
-        raise RuntimeError("EncryptionKeyInvalid") from None
-
-
-def nobitex_encryption_ready():
-    try:
-        _nobitex_fernet()
-        return True
-    except Exception:
-        return False
-
-
-def nobitex_save_credentials(api_key, private_key):
-    api_key = str(api_key or "").strip()
-    private_key = str(private_key or "").strip()
-    if not api_key or len(api_key) > 512 or any(ch.isspace() for ch in api_key):
-        raise ValueError("InvalidPublicKey")
-    # Validate the official URL-safe Base64 Ed25519 private seed before storage.
-    private_raw = base64.urlsafe_b64decode(private_key + ("=" * (-len(private_key) % 4)))
-    if len(private_raw) != 32:
-        raise ValueError("InvalidPrivateKey")
-    try:
-        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-        Ed25519PrivateKey.from_private_bytes(private_raw)
-    except Exception:
-        raise ValueError("InvalidPrivateKey") from None
-    fernet = _nobitex_fernet()
-    cfg = nobitex_load_settings()
-    cfg["api_key_ciphertext"] = fernet.encrypt(api_key.encode("utf-8")).decode("ascii")
-    cfg["private_key_ciphertext"] = fernet.encrypt(private_key.encode("ascii")).decode("ascii")
-    cfg["local_permissions"] = ["READ"]
-    cfg["credentials_saved_at"] = utc_now().isoformat(timespec="seconds")
-    cfg["last_success_at"] = ""
-    cfg["last_error_code"] = ""
-    cfg["last_attempt_at"] = ""
-    return nobitex_save_settings(cfg)
-
-
-def nobitex_get_credentials():
-    cfg = nobitex_load_settings()
-    if not cfg.get("api_key_ciphertext") or not cfg.get("private_key_ciphertext"):
-        raise RuntimeError("CredentialsMissing")
-    fernet = _nobitex_fernet()
-    try:
-        api_key = fernet.decrypt(cfg["api_key_ciphertext"].encode("ascii")).decode("utf-8")
-        private_key = fernet.decrypt(cfg["private_key_ciphertext"].encode("ascii")).decode("ascii")
-    except Exception:
-        raise RuntimeError("CredentialsDecryptFailed") from None
-    return api_key, private_key
-
-
-def nobitex_clear_local_credentials():
-    """Remove only this bot's encrypted copy; it does not revoke the key at Nobitex."""
-    with db() as con:
-        con.execute("DELETE FROM app_settings WHERE key=?", (NOBITEX_MANAGER_KEY,))
-
-
-def _nobitex_build_signature(private_key_b64, timestamp, method, full_path, raw_body=""):
-    """Official Ed25519 signing: timestamp + METHOD + full_path + exact raw body."""
-    private_raw = base64.urlsafe_b64decode(str(private_key_b64).strip() + ("=" * (-len(str(private_key_b64).strip()) % 4)))
-    if len(private_raw) != 32:
-        raise ValueError("InvalidPrivateKey")
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-    signing_key = Ed25519PrivateKey.from_private_bytes(private_raw)
-    signed_payload = f"{timestamp}{str(method).upper()}{full_path}{raw_body}".encode("utf-8")
-    signature = signing_key.sign(signed_payload)
-    return base64.urlsafe_b64encode(signature).decode("ascii")
-
-
-def _nobitex_error_code(payload, http_status):
-    if http_status == 401:
-        return "AuthenticationFailed"
-    if http_status == 403:
-        return "PermissionDenied"
-    if http_status == 429:
-        return "RateLimitExceeded"
-    if isinstance(payload, dict):
-        # Only expose machine-readable error codes; never relay arbitrary API messages.
-        code = payload.get("code") or payload.get("errorCode")
-        if code and str(code).lower() not in {"failed", "error"}:
-            return re.sub(r"[^A-Za-z0-9_:-]", "", str(code))[:80] or "APIError"
-    return "APIError"
-
-
-async def nobitex_api_request(method, path, payload=None, params=None):
-    """Signed API-Key request. Only READ endpoints are used by this phase."""
-    api_key, private_key = nobitex_get_credentials()
-    method = str(method or "GET").upper()
-    if not str(path).startswith("/") or ".." in str(path).split("/"):
-        raise ValueError("InvalidAPIPath")
-    query = urlencode(sorted((str(k), str(v)) for k, v in (params or {}).items() if v is not None))
-    full_path = str(path) + ("?" + query if query else "")
-    raw_body = "" if payload is None else json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    timestamp = str(int(time.time()))
-    signature = _nobitex_build_signature(private_key, timestamp, method, full_path, raw_body)
-    headers = {
-        "Accept": "application/json",
-        "User-Agent": NOBITEX_USER_AGENT,
-        "Nobitex-Key": api_key,
-        "Nobitex-Signature": signature,
-        "Nobitex-Timestamp": timestamp,
-    }
-    request_kwargs = {"headers": headers}
-    if method in {"POST", "PUT", "PATCH"}:
-        headers["Content-Type"] = "application/json"
-        request_kwargs["content"] = raw_body.encode("utf-8")
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=8.0), follow_redirects=False) as client:
-            response = await client.request(method, NOBITEX_API_BASE + full_path, **request_kwargs)
-    except asyncio.CancelledError:
-        raise
-    except httpx.TimeoutException:
-        raise NobitexAPIError("RequestTimeout") from None
-    except httpx.RequestError:
-        raise NobitexAPIError("NetworkUnavailable") from None
-    try:
-        response_payload = response.json()
-    except Exception:
-        response_payload = {}
-    status_value = str(response_payload.get("status", "")).lower() if isinstance(response_payload, dict) else ""
-    if response.status_code >= 400 or status_value in {"failed", "error"}:
-        raise NobitexAPIError(_nobitex_error_code(response_payload, response.status_code), response.status_code)
-    if not isinstance(response_payload, dict):
-        raise NobitexAPIError("InvalidResponse", response.status_code)
-    return response_payload
-
-
-async def nobitex_public_market_stats(params=None):
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=7.0), follow_redirects=False) as client:
-            response = await client.get(
-                NOBITEX_API_BASE + "/market/stats",
-                params=params or {},
-                headers={"Accept": "application/json", "User-Agent": NOBITEX_USER_AGENT, "Cache-Control": "no-cache"},
-            )
-        response.raise_for_status()
-        payload = response.json()
-    except asyncio.CancelledError:
-        raise
-    except httpx.TimeoutException:
-        raise NobitexAPIError("PublicMarketTimeout") from None
-    except httpx.RequestError:
-        raise NobitexAPIError("PublicMarketUnavailable") from None
-    except Exception:
-        raise NobitexAPIError("InvalidPublicMarketResponse") from None
-    if not isinstance(payload, dict) or str(payload.get("status", "")).lower() not in {"ok", "success"}:
-        raise NobitexAPIError(_nobitex_error_code(payload, response.status_code), response.status_code)
-    if not isinstance(payload.get("stats"), dict):
-        raise NobitexAPIError("MarketStatsMissing", response.status_code)
-    return payload
-
-
-def _nobitex_decimal(value):
-    try:
-        number = Decimal(str(value))
-        return number if number.is_finite() and number >= 0 else None
-    except (InvalidOperation, TypeError, ValueError):
-        return None
-
-
-def _nobitex_market_symbol_parts(symbol):
-    value = re.sub(r"[^A-Z0-9]", "", str(symbol or "").upper())
-    for quote in ("USDT", "IRT", "RLS"):
-        if value.endswith(quote) and len(value) > len(quote):
-            return value[:-len(quote)], quote
-    return "", ""
-
-
-def nobitex_market_asset_rows(stats):
-    rows = []
-    if not isinstance(stats, dict):
-        return rows
-    for symbol, record in stats.items():
-        if not isinstance(record, dict):
-            continue
-        base, quote = _nobitex_market_symbol_parts(symbol)
-        if not base or not quote:
-            market_name = record.get("market") or record.get("symbol")
-            if market_name:
-                base, quote = _nobitex_market_symbol_parts(market_name)
-        if not base or not quote:
-            continue
-        if record.get("isClosed") is True:
-            continue
-        buy = _nobitex_decimal(record.get("bestBuy"))
-        sell = _nobitex_decimal(record.get("bestSell"))
-        latest = _nobitex_decimal(record.get("latest"))
-        if buy is None and sell is None and latest is None:
-            continue
-        rows.append({"symbol": str(symbol), "base": base, "quote": quote, "best_buy": buy,
-                     "best_sell": sell, "latest": latest, "is_closed": bool(record.get("isClosed"))})
-    return rows
-
-
-def nobitex_market_support_for_asset(stats, asset):
-    asset = re.sub(r"[^A-Z0-9]", "", str(asset or "").upper())
-    if not asset:
-        return []
-    return [row for row in nobitex_market_asset_rows(stats) if row["base"] == asset]
-
-
-def nobitex_dashboard_text(title, payload, key_name, note=None):
-    items = payload.get(key_name) if isinstance(payload, dict) else None
-    if not isinstance(items, list):
-        # A few APIs wrap results in `result`; accept only an actual list, never invent rows.
-        result = payload.get("result") if isinstance(payload, dict) else None
-        items = result.get(key_name) if isinstance(result, dict) else None
-    if not isinstance(items, list) or not items:
-        text_value = f"{title}\n\nاز API نوبیتکس داده‌ای برای نمایش برنگشت."
-        if note:
-            text_value += "\n" + note
-        return text_value, InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_nbx_home")]])
-    lines = [title, "━━━━━━━━━━━━━━━━━━"]
-    for item in items[:20]:
-        if not isinstance(item, dict):
-            continue
-        transaction = item.get("transaction") if isinstance(item.get("transaction"), dict) else {}
-        currency = str(item.get("currency") or transaction.get("currency") or item.get("srcCurrency") or item.get("market") or "—")[:24]
-        amount = str(item.get("amount") or transaction.get("amount") or item.get("balance") or item.get("totalPrice") or "—")[:40]
-        status_value = item.get("status") or item.get("type") or item.get("execution")
-        if status_value in (None, "") and "confirmed" in item:
-            status_value = "تأییدشده" if item.get("confirmed") is True else "در انتظار تأیید"
-        status = str(status_value or "—")[:30]
-        item_id = str(item.get("id") or item.get("txHash") or "—")[:48]
-        date_value = str(item.get("created_at") or item.get("createdAt") or transaction.get("created_at") or "")[:30]
-        extra = ""
-        fee_value = item.get("fee") if item.get("fee") not in (None, "") else transaction.get("calculatedFee")
-        if fee_value not in (None, ""):
-            extra = f" | کارمزد: {str(fee_value)[:24]}"
-        if item.get("confirmations") is not None:
-            extra += f" | تأیید شبکه: {str(item.get('confirmations'))[:8]}/{str(item.get('requiredConfirmations') or '؟')[:8]}"
-        if item.get("matchedAmount") not in (None, ""):
-            extra += f" | انجام‌شده: {str(item.get('matchedAmount'))[:24]}"
-        lines.append(f"\n• {currency} | {amount}\nوضعیت: {status}{extra}\nشناسه: {item_id}" + (f"\nزمان: {date_value}" if date_value else ""))
-    if len(items) > 20:
-        lines.append(f"\n… {len(items) - 20} مورد دیگر در پاسخ API وجود دارد؛ این صفحه ۲۰ مورد اول را نشان می‌دهد.")
-    if note:
-        lines.append("\n" + note)
-    lines.append("\nمنبع: API احراز هویت‌شدهٔ نوبیتکس | فقط‌خواندنی")
-    return "\n".join(lines)[:3900], InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_nbx_home")]])
-
-
-def nobitex_wallets_text(payload):
-    wallets = payload.get("wallets") if isinstance(payload, dict) else None
-    if isinstance(wallets, dict):
-        wallets = list(wallets.values())
-    if not isinstance(wallets, list):
-        result = payload.get("result") if isinstance(payload, dict) else None
-        wallets = result.get("wallets") if isinstance(result, dict) else None
-    if not isinstance(wallets, list):
-        return "💰 موجودی کیف پول نوبیتکس\n\nساختار موجودی در پاسخ API قابل تشخیص نبود؛ هیچ عددی حدس زده نشد.", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_nbx_home")]])
-    lines = ["💰 موجودی واقعی کیف پول اسپات نوبیتکس", "━━━━━━━━━━━━━━━━━━"]
-    total_wallets = 0
-    for wallet in wallets:
-        if not isinstance(wallet, dict):
-            continue
-        currency = str(wallet.get("currency") or "—").upper()
-        total = _nobitex_decimal(wallet.get("balance"))
-        frozen = _nobitex_decimal(wallet.get("blockedBalance"))
-        available = _nobitex_decimal(wallet.get("activeBalance"))
-        if total is None:
-            continue
-        total_wallets += 1
-        def fmt(value):
-            if value is None:
-                return "—"
-            return format(value.normalize(), "f")
-        line = f"\n{currency}\nکل: {fmt(total)} | آزاد: {fmt(available)} | قفل: {fmt(frozen)}"
-        rial_value = _nobitex_decimal(wallet.get("rialBalanceSell"))
-        if rial_value is not None and rial_value > 0:
-            line += f"\nارزش فروش تخمینی API: {toman((rial_value / Decimal(10)).quantize(Decimal('1'), rounding=ROUND_CEILING))} تومان"
-        # These are the account owner's Nobitex deposit addresses, not customer payout addresses.
-        deposit_info = wallet.get("depositInfo")
-        if isinstance(deposit_info, dict):
-            address_count = 0
-            for network, address_data in deposit_info.items():
-                if not isinstance(address_data, dict) or not address_data.get("address"):
-                    continue
-                address = str(address_data.get("address"))[:180]
-                tag = str(address_data.get("tag") or "")[:80]
-                line += f"\nآدرس واریز حساب مدیر ({str(network)[:24]}): {address}"
-                if tag:
-                    line += f" | تگ: {tag}"
-                address_count += 1
-                if address_count >= 4:
-                    break
-        elif wallet.get("depositAddress"):
-            line += f"\nآدرس واریز حساب مدیر: {str(wallet.get('depositAddress'))[:180]}"
-            if wallet.get("depositTag"):
-                line += f" | تگ: {str(wallet.get('depositTag'))[:80]}"
-        lines.append(line)
-    if total_wallets == 0:
-        lines.append("\nکیف پولی در پاسخ API موجود نبود.")
-    lines.append("\n\nمنبع: /users/wallets/list | ارزش ریالی API به ریال است و برای تومان بر ۱۰ تقسیم شده است.")
-    lines.append("آدرس‌های بالا متعلق به حساب نوبیتکس مدیر هستند؛ مقصد کیف پول مشتری جداگانه از سفارش مشتری خوانده می‌شود.")
-    return "\n".join(lines)[:3900], InlineKeyboardMarkup([[InlineKeyboardButton("🔄 تازه‌سازی", callback_data="admin_nbx_wallets")], [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_nbx_home")]])
-
-
-def nobitex_admin_text(note=None):
-    cfg = nobitex_load_settings()
-    connected = bool(cfg.get("api_key_ciphertext") and cfg.get("private_key_ciphertext"))
-    encryption_ok = nobitex_encryption_ready()
-    if connected:
-        status = "🔐 کلید رمزگذاری‌شده در تنظیمات محلی موجود است" if encryption_ok else "⚠️ کلید رمزگذاری محیطی تنظیم نیست؛ رمزگشایی ممکن نیست"
-    else:
-        status = "⛔ هنوز اتصالی ذخیره نشده است"
-    last_success = cfg.get("last_success_at") or "ثبت نشده"
-    last_attempt = cfg.get("last_attempt_at") or "ثبت نشده"
-    error = cfg.get("last_error_code") or "ندارد"
-    lines = [
-        "💎 مدیریت جامع نوبیتکس و کیف پول | SEYED PREMIUM",
-        "━━━━━━━━━━━━━━━━━━",
-        f"وضعیت اتصال: {status}",
-        "سطح استفادهٔ این مرحله: فقط READ (بدون معامله/برداشت)",
-        f"آخرین اتصال موفق: {last_success}",
-        f"آخرین تلاش: {last_attempt}",
-        f"کد آخرین خطا: {error}",
-        "",
-        "🔒 API Key و کلید خصوصی با Fernet رمزگذاری و فقط در app_settings ذخیره می‌شوند؛ کلید رمزگذاری باید در متغیر محیطی میزبان باشد.",
-        "مجوزهای واقعی API Key از این داشبورد قابل استعلام نیستند؛ هنگام ساخت کلید در نوبیتکس، READ را انتخاب و با تست endpoint آن را کنترل کن.",
-        "🛑 عملیات خرید، انتقال و برداشت در این مرحله عمداً غیرفعال‌اند تا مجوز و مقصد واقعی جداگانه بررسی شوند.",
-    ]
-    if note:
-        lines.extend(["", str(note)])
-    return "\n".join(lines)[:3900]
-
-
-def nobitex_admin_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔐 ثبت / ویرایش اتصال", callback_data="admin_nbx_connect", style="primary"),
-         InlineKeyboardButton("🧪 تست اتصال واقعی", callback_data="admin_nbx_test", style="success")],
-        [InlineKeyboardButton("💰 موجودی واقعی کیف پول", callback_data="admin_nbx_wallets", style="success")],
-        [InlineKeyboardButton("📥 تاریخچه واریزها", callback_data="admin_nbx_deposits"),
-         InlineKeyboardButton("📤 تاریخچه برداشت‌ها", callback_data="admin_nbx_withdrawals")],
-        [InlineKeyboardButton("🧾 قابلیت‌ها و محدودیت حساب", callback_data="admin_nbx_limits")],
-        [InlineKeyboardButton("📑 سفارش‌های خرید و فروش", callback_data="admin_nbx_orders"),
-         InlineKeyboardButton("📚 تاریخچه تراکنش‌ها", callback_data="admin_nbx_history")],
-        [InlineKeyboardButton("📈 نرخ‌ها و بازارهای زنده", callback_data="admin_nbx_rates", style="primary"),
-         InlineKeyboardButton("🪙 بررسی بازار TON / GRAM", callback_data="admin_nbx_assets")],
-        [InlineKeyboardButton("📨 درخواست‌های TON مشتریان", callback_data="admin_nbx_customer_requests")],
-        [InlineKeyboardButton("🗑 پاک‌کردن اتصال محلی", callback_data="admin_nbx_delete", style="danger"),
-         InlineKeyboardButton("⬅️ بازگشت به مدیریت", callback_data="admin")],
-    ])
-
-
-def nobitex_limitations_text(payload):
-    data = payload.get("limitations") if isinstance(payload, dict) else None
-    if not isinstance(data, dict):
-        data = payload.get("result") if isinstance(payload, dict) else None
-    if not isinstance(data, dict):
-        return "🧾 محدودیت‌های حساب\n\nساختار پاسخ API قابل تشخیص نبود؛ عددی حدس زده نمی‌شود."
-    lines = ["🧾 قابلیت‌ها و محدودیت‌های حساب نوبیتکس", "━━━━━━━━━━━━━━━━━━"]
-    if data.get("userLevel"):
-        lines.append(f"سطح حساب: {str(data['userLevel'])[:40]}")
-    features = data.get("features") if isinstance(data.get("features"), dict) else {}
-    if features:
-        lines.append("\nقابلیت‌های حساب:")
-        for key, enabled in features.items():
-            label = "✅ فعال" if enabled is True else "⛔ غیرفعال" if enabled is False else "نامشخص"
-            lines.append(f"• {str(key)[:40]}: {label}")
-    limits = data.get("limits") if isinstance(data.get("limits"), dict) else {}
-    if limits:
-        lines.append("\nسقف‌ها و مصرف:")
-        for key, value in limits.items():
-            if isinstance(value, dict):
-                used = value.get("used", "—"); limit = value.get("limit", "—")
-                lines.append(f"• {str(key)[:48]}: مصرف {str(used)[:32]} از {str(limit)[:32]}")
-            else:
-                lines.append(f"• {str(key)[:48]}: {str(value)[:64]}")
-    lines.append("\nواحد مبالغ محدودیت در پاسخ مستندات قدیمی API ریال است. این داده‌ها قابلیت‌های حساب را نشان می‌دهند، نه فهرست مجوزهای خود API Key؛ مجوز کلید باید در پنل ساخت کلید کنترل شود.")
-    return "\n".join(lines)[:3900]
-
-
-async def nobitex_admin_rates_text():
-    payload = await nobitex_public_market_stats()
-    stats = payload.get("stats") or {}
-    rows = nobitex_market_asset_rows(stats)
-    cfg = nobitex_load_settings()
-    snapshot = {"fetched_at": utc_now().isoformat(timespec="seconds"), "markets": {}}
-    for row in rows:
-        def safe_decimal(value):
-            return str(value) if value is not None else ""
-        snapshot["markets"][row["symbol"]] = {
-            "base": row["base"], "quote": row["quote"],
-            "best_buy": safe_decimal(row["best_buy"]),
-            "best_sell": safe_decimal(row["best_sell"]),
-            "latest": safe_decimal(row["latest"]),
-        }
-    history = cfg.get("rates_history") if isinstance(cfg.get("rates_history"), list) else []
-    history.append(snapshot)
-    cfg["rates_history"] = history[-120:]
-    nobitex_save_settings(cfg)
-
-    lines = ["📈 نرخ‌های زندهٔ نوبیتکس", "━━━━━━━━━━━━━━━━━━", f"زمان دریافت داده: {snapshot['fetched_at']}", "منبع: API عمومی `/market/stats`"]
-    usdt_rows = [row for row in rows if row["base"] == "USDT" and row["quote"] in {"IRT", "RLS"}]
-    if usdt_rows:
-        row = usdt_rows[0]
-        buy, sell, last = row["best_buy"], row["best_sell"], row["latest"]
-        def rial_to_toman(value):
-            return toman((value / Decimal(10)).quantize(Decimal("1"), rounding=ROUND_CEILING)) if value is not None else "—"
-        lines.append(f"\nUSDT به تومان (از بازار {row['symbol']}؛ ریال ÷ ۱۰): خرید {rial_to_toman(buy)} | فروش {rial_to_toman(sell)} | آخرین {rial_to_toman(last)}")
-    else:
-        lines.append("\nUSDT/IRT: در پاسخ فعلی بازار نوبیتکس پیدا نشد.")
-
-    # Use the separately validated free-USD cache from the Stars manager; never equate USD with USDT.
-    try:
-        stars_cfg = load_stars_settings()
-        usd_rate = _nobitex_decimal(stars_cfg.get("usd_rate_toman")) if stars_cfg.get("usd_rate_valid") else None
-        if usd_rate is not None and _pricing_timestamp_fresh(stars_cfg.get("usd_rate_source_updated_at"), STARS_USD_MAX_AGE_SECONDS):
-            lines.append(f"\nدلار آزاد (منبع مستقل بخش نرخ دلار): {toman(usd_rate)} تومان | منبع: {stars_cfg.get('usd_rate_source_name') or 'ثبت‌شده در کش معتبر'} | زمان منبع: {stars_cfg.get('usd_rate_source_updated_at') or '—'}")
-        else:
-            lines.append("\nدلار آزاد: نرخ معتبر تازه در کش موجود نیست؛ با نرخ تتر جایگزین نشد.")
-    except Exception:
-        lines.append("\nدلار آزاد: خواندن کش مستقل ناموفق بود؛ با نرخ تتر یکی فرض نشد.")
-
-    try:
-        pricing_cfg = load_auto_pricing_config()
-        ref_fresh = bool(pricing_cfg.get("fx_valid") and _pricing_timestamp_fresh(pricing_cfg.get("fx_source_updated_at"), _PRICING_FX_MAX_AGE_SECONDS))
-        ref_usdt = _nobitex_decimal(pricing_cfg.get("fx_rate_toman")) if ref_fresh else None
-        if ref_usdt is not None and usdt_rows:
-            row = usdt_rows[0]
-            api_mid = None
-            if row["best_buy"] is not None and row["best_sell"] is not None:
-                api_mid = (row["best_buy"] + row["best_sell"]) / Decimal(20)
-            if api_mid and api_mid > 0:
-                diff = abs(api_mid - ref_usdt) / api_mid * Decimal(100)
-                lines.append(f"\nاختلاف با نرخ مرجع چندمنبعیِ تازه: {diff.quantize(Decimal('0.01'))}٪ | منبع مرجع: {pricing_cfg.get('fx_source_name') or '—'} | تعداد منابع تأییدشده: {pricing_cfg.get('fx_sources_ok', '—')}")
-    except Exception:
-        pass
-
-    lines.append("\n\nنمونهٔ بازارهای فعال موجود در پاسخ:")
-    for row in rows[:18]:
-        value = row["best_sell"] or row["latest"] or row["best_buy"]
-        lines.append(f"• {row['symbol']}: {value if value is not None else '—'} {row['quote']}")
-    lines.append("\nتوجه: نرخ‌های ریالی API به ریال هستند. ساعت بالا زمان دریافت ربات است، مگر آنکه خود API زمان بازار را در پاسخ داده باشد.")
-    return "\n".join(lines)[:3900]
-
-
-def nobitex_rate_history_text():
-    cfg = nobitex_load_settings()
-    history = cfg.get("rates_history") if isinstance(cfg.get("rates_history"), list) else []
-    if not history:
-        return "🕘 تاریخچه نرخ نوبیتکس\n\nهنوز نرخ زنده‌ای از طریق پنل دریافت و ذخیره نشده است."
-    lines = ["🕘 تاریخچه نرخ‌های دریافت‌شده از نوبیتکس", "━━━━━━━━━━━━━━━━━━", "این تاریخچه در هر بار تازه‌سازی دستی ثبت می‌شود؛ آرشیو پیوسته/ساعتی نیست."]
-    for snapshot in reversed(history[-10:]):
-        if not isinstance(snapshot, dict):
-            continue
-        lines.append(f"\n⏱ {str(snapshot.get('fetched_at') or '—')[:32]}")
-        markets = snapshot.get("markets") if isinstance(snapshot.get("markets"), dict) else {}
-        for symbol in list(markets.keys())[:8]:
-            record = markets.get(symbol) if isinstance(markets.get(symbol), dict) else {}
-            value = record.get("best_sell") or record.get("latest") or record.get("best_buy") or "—"
-            lines.append(f"• {str(symbol)[:24]}: {str(value)[:32]}")
-    return "\n".join(lines)[:3900]
-
-
-async def nobitex_market_assets_text():
-    payload = await nobitex_public_market_stats()
-    stats = payload.get("stats") or {}
-    ton_rows = nobitex_market_support_for_asset(stats, "TON")
-    gram_rows = nobitex_market_support_for_asset(stats, "GRAM")
-    lines = ["🪙 بررسی پشتیبانی واقعی TON و GRAM در نوبیتکس", "━━━━━━━━━━━━━━━━━━"]
-    for label, asset_rows in (("TON", ton_rows), ("GRAM", gram_rows)):
-        if asset_rows:
-            lines.append(f"\n✅ {label}: بازار در پاسخ زندهٔ نوبیتکس دیده شد.")
-            for row in asset_rows:
-                px = row["best_sell"] or row["latest"] or row["best_buy"]
-                lines.append(f"• نماد: {row['symbol']} | بازار: {row['base']}/{row['quote']} | قیمت ثبت‌شده: {px if px is not None else '—'}")
-        else:
-            lines.append(f"\n⛔ {label}: در فهرست بازارهای بازگشتی فعلی نوبیتکس بازار قابل‌استفاده‌ای دیده نشد؛ سفارش خرید برای این نماد ساخته نمی‌شود.")
-    lines.append("\nاین بررسی از `/market/stats` عمومی انجام شد. وجود بازار، به‌تنهایی به معنی مجاز بودن معامله برای حساب شما نیست؛ مجوز TRADE و محدودیت حساب جداگانه‌اند.")
-    return "\n".join(lines)[:3900]
-
-
-async def handle_nobitex_callback(query, context):
-    data = str(query.data or "")
-    if not data.startswith("admin_nbx_"):
-        return False
-    if query.from_user.id != ADMIN_ID:
-        await query.answer("این بخش فقط برای مدیر اصلی در دسترس است.", show_alert=True)
-        return True
-
-    if data == "admin_nbx_home":
-        context.user_data.pop("nobitex_admin_input", None)
-        await query.edit_message_text(nobitex_admin_text(), reply_markup=nobitex_admin_keyboard())
-        return True
-
-    if data == "admin_nbx_connect":
-        # Acknowledge immediately, then render with a fallback so Telegram never leaves
-        # the admin with an unresponsive inline button if editing the old message fails.
-        try:
-            await query.answer()
-        except Exception:
-            pass
-        chat = getattr(getattr(query, "message", None), "chat", None)
-        if getattr(chat, "type", None) != "private":
-            await safe_callback_edit_or_reply(
-                query,
-                "برای امنیت، ثبت کلیدها فقط از گفت‌وگوی خصوصی ربات انجام می‌شود. ربات را در چت خصوصی باز کن و دوباره وارد پنل شو.",
-                InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_nbx_home")]])
-            )
-            return True
-        if not isinstance(getattr(context, "user_data", None), dict):
-            await safe_callback_edit_or_reply(
-                query,
-                "❌ نشست مدیر در دسترس نیست؛ ربات را یک‌بار Restart کن و دوباره امتحان کن.",
-                InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_nbx_home")]])
-            )
-            return True
-        context.user_data["nobitex_admin_input"] = {"field": "credentials"}
-        prompt = (
-            "🔐 ثبت / ویرایش اتصال نوبیتکس\n\n"
-            "حالا یک پیام شامل دقیقاً دو خط بفرست؛ بدون عنوان یا فاصلهٔ اضافی:\n\n"
-            "خط ۱: API Key (مقدار عمومی فیلد `key`)\n"
-            "خط ۲: Private Key که نوبیتکس برای امضای API داده است\n\n"
-            "این مرحله فقط برای دسترسی READ است. رمز ورود حساب نوبیتکس را هرگز ارسال نکن.\n"
-            "ربات تلاش می‌کند پیام ورودی را حذف کند و فقط پس از رمزگذاری موفق، کلیدها را ذخیره می‌کند؛ حذف پیام تلگرام تضمین‌شده نیست.\n\n"
-            "برای لغو، /cancel بفرست."
-        )
-        await safe_callback_edit_or_reply(
-            query,
-            prompt,
-            InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="admin_nbx_home")]])
-        )
-        return True
-
-    if data == "admin_nbx_delete":
-        await query.edit_message_text(
-            "⚠️ این عملیات فقط نسخهٔ رمزگذاری‌شدهٔ اتصال را از ربات پاک می‌کند.\n"
-            "کلید در پنل نوبیتکس باطل نمی‌شود؛ برای ابطال واقعی باید آن را از پنل API نوبیتکس حذف کنی.\n\nآیا نسخهٔ محلی پاک شود؟",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("بله، پاک کن", callback_data="admin_nbx_delete_yes", style="danger")],
-                [InlineKeyboardButton("انصراف", callback_data="admin_nbx_home")],
-            ])
-        )
-        return True
-    if data == "admin_nbx_delete_yes":
-        nobitex_clear_local_credentials()
-        await query.edit_message_text("✅ نسخهٔ محلی اتصال پاک شد. برای لغو/ابطال خود API Key باید از پنل نوبیتکس اقدام کنی.", reply_markup=nobitex_admin_keyboard())
-        return True
-
-    if data == "admin_nbx_test":
-        await query.edit_message_text("🧪 در حال تست امضای API Key و دسترسی READ با endpoint پروفایل نوبیتکس…")
-        try:
-            payload = await nobitex_api_request("GET", "/users/profile")
-            profile = payload.get("profile") if isinstance(payload.get("profile"), dict) else {}
-            cfg = nobitex_load_settings()
-            cfg["last_success_at"] = utc_now().isoformat(timespec="seconds")
-            cfg["last_attempt_at"] = cfg["last_success_at"]
-            cfg["last_error_code"] = ""
-            nobitex_save_settings(cfg)
-            label = str(profile.get("username") or profile.get("email") or "حساب احراز هویت شد")[:100]
-            await query.edit_message_text(
-                nobitex_admin_text(f"✅ تست واقعی امضای Ed25519 و endpoint `/users/profile` موفق بود. شناسه نمایشی: {label}. فقط مجوز READ آزمایش شده است؛ مجوزهای TRADE/WITHDRAW/DEPOSIT آزمایش یا فعال نشده‌اند."),
-                reply_markup=nobitex_admin_keyboard()
-            )
-        except Exception as exc:
-            cfg = nobitex_load_settings()
-            cfg["last_attempt_at"] = utc_now().isoformat(timespec="seconds")
-            code = exc.code if isinstance(exc, NobitexAPIError) else str(exc) if str(exc) in {"CredentialsMissing", "EncryptionKeyMissing", "EncryptionKeyInvalid", "CredentialsDecryptFailed"} else type(exc).__name__
-            cfg["last_error_code"] = re.sub(r"[^A-Za-z0-9_:-]", "", str(code))[:80]
-            nobitex_save_settings(cfg)
-            note_map = {
-                "CredentialsMissing": "اطلاعات اتصال ثبت نشده است.",
-                "EncryptionKeyMissing": f"متغیر محیطی {NOBITEX_ENCRYPTION_ENV} تنظیم نیست.",
-                "EncryptionKeyInvalid": "کلید رمزگذاری میزبان معتبر نیست.",
-                "CredentialsDecryptFailed": "کلیدهای ذخیره‌شده با کلید رمزگذاری فعلی باز نمی‌شوند.",
-                "AuthenticationFailed": "نوبیتکس احراز هویت را نپذیرفت؛ API Key و Private Key را از نظر تطابق بررسی کن.",
-                "PermissionDenied": "کلید به endpoint پروفایل دسترسی READ ندارد.",
-                "RequestTimeout": "پاسخ نوبیتکس در مهلت مقرر نرسید.",
-                "NetworkUnavailable": "ارتباط شبکه با API برقرار نشد.",
-            }
-            safe_note = note_map.get(str(code), f"تست ناموفق بود؛ کد تشخیصی: {cfg['last_error_code'] or 'UnknownError'}")
-            await query.edit_message_text(nobitex_admin_text("❌ " + safe_note), reply_markup=nobitex_admin_keyboard())
-        return True
-
-    if data == "admin_nbx_wallets":
-        try:
-            payload = await nobitex_api_request("POST", "/users/wallets/list", payload={"type": "spot"})
-            cfg = nobitex_load_settings(); cfg["last_success_at"] = utc_now().isoformat(timespec="seconds"); cfg["last_error_code"] = ""; nobitex_save_settings(cfg)
-            text_value, markup = nobitex_wallets_text(payload)
-            await query.edit_message_text(text_value, reply_markup=markup)
-        except Exception as exc:
-            code = exc.code if isinstance(exc, NobitexAPIError) else type(exc).__name__
-            await query.edit_message_text(f"❌ دریافت موجودی واقعی انجام نشد. کد تشخیصی: {code}\nهیچ موجودی فرضی نمایش داده نشد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_nbx_home")]]))
-        return True
-
-    if data == "admin_nbx_limits":
-        try:
-            payload = await nobitex_api_request("POST", "/users/limitations", payload={})
-            cfg = nobitex_load_settings(); cfg["last_success_at"] = utc_now().isoformat(timespec="seconds"); cfg["last_error_code"] = ""; nobitex_save_settings(cfg)
-            await query.edit_message_text(nobitex_limitations_text(payload), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_nbx_home")]]))
-        except Exception as exc:
-            code = exc.code if isinstance(exc, NobitexAPIError) else type(exc).__name__
-            await query.edit_message_text(f"❌ دریافت محدودیت‌های حساب ناموفق بود. کد تشخیصی: {code}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_nbx_home")]]))
-        return True
-
-    endpoint_map = {
-        "admin_nbx_deposits": ("GET", "/users/wallets/deposits/list", None, {"wallet": "all"}, "📥 واریزهای کیف پول نوبیتکس", "deposits"),
-        "admin_nbx_withdrawals": ("GET", "/users/wallets/withdraws/list", None, {"page": 1, "pageSize": 20}, "📤 برداشت‌های کیف پول نوبیتکس", "withdraws"),
-        "admin_nbx_orders": ("GET", "/market/orders/list", None, {"status": "all", "page": 1, "pageSize": 20}, "📑 سفارش‌های خرید و فروش نوبیتکس", "orders"),
-        "admin_nbx_history": ("GET", "/users/transactions-history", None, {"page": 1, "pageSize": 20}, "📚 تاریخچه تراکنش‌های کیف پول", "transactions"),
-    }
-    if data in endpoint_map:
-        method, path, body, params, title, key = endpoint_map[data]
-        try:
-            payload = await nobitex_api_request(method, path, payload=body, params=params)
-            cfg = nobitex_load_settings(); cfg["last_success_at"] = utc_now().isoformat(timespec="seconds"); cfg["last_error_code"] = ""; nobitex_save_settings(cfg)
-            text_value, markup = nobitex_dashboard_text(title, payload, key)
-            await query.edit_message_text(text_value, reply_markup=markup)
-        except Exception as exc:
-            code = exc.code if isinstance(exc, NobitexAPIError) else type(exc).__name__
-            await query.edit_message_text(f"❌ دریافت داده از API موفق نشد. کد تشخیصی: {code}\nپاسخ خام API و جزئیات حساس نمایش داده نمی‌شوند.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_nbx_home")]]))
-        return True
-
-    if data == "admin_nbx_rates":
-        await query.edit_message_text("🔄 در حال دریافت نرخ‌های بازار از API عمومی نوبیتکس…")
-        try:
-            rates_text = await nobitex_admin_rates_text()
-            await query.edit_message_text(rates_text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 تازه‌سازی", callback_data="admin_nbx_rates")], [InlineKeyboardButton("🕘 تاریخچه نرخ‌های ذخیره‌شده", callback_data="admin_nbx_rates_history")], [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_nbx_home")]]))
-        except Exception as exc:
-            code = exc.code if isinstance(exc, NobitexAPIError) else type(exc).__name__
-            await query.edit_message_text(f"❌ دریافت نرخ زنده از نوبیتکس ناموفق بود. کد تشخیصی: {code}\nآخرین نرخ ذخیره‌شده حذف نشده است؛ نرخ جدید یا ساختگی نمایش داده نمی‌شود.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_nbx_home")]]))
-        return True
-
-    if data == "admin_nbx_rates_history":
-        await query.edit_message_text(
-            nobitex_rate_history_text(),
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 تازه‌سازی بازار", callback_data="admin_nbx_rates")], [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_nbx_home")]])
-        )
-        return True
-
-    if data == "admin_nbx_assets":
-        await query.edit_message_text("🔎 در حال بررسی بازارهای TON و GRAM در فهرست زندهٔ نوبیتکس…")
-        try:
-            text_value = await nobitex_market_assets_text()
-            await query.edit_message_text(text_value, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 بررسی مجدد", callback_data="admin_nbx_assets")], [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_nbx_home")]]))
-        except Exception as exc:
-            code = exc.code if isinstance(exc, NobitexAPIError) else type(exc).__name__
-            await query.edit_message_text(f"❌ فهرست بازار زنده دریافت نشد. کد تشخیصی: {code}\nدر نتیجه پشتیبانی TON/GRAM قابل تأیید نیست و هیچ عملیات خریدی پیشنهاد نمی‌شود.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_nbx_home")]]))
-        return True
-
-    if data == "admin_nbx_customer_requests":
-        try:
-            with db() as con:
-                rows = con.execute(
-                    "SELECT r.id,r.user_id,r.username,r.amount_ton,r.wallet_address,r.status,r.created_at,u.username AS current_username "
-                    "FROM ton_purchase_requests r LEFT JOIN users u ON u.user_id=r.user_id ORDER BY r.id DESC LIMIT 15"
-                ).fetchall()
-        except sqlite3.Error:
-            rows = []
-        if not rows:
-            text_value = "📨 درخواست‌های خرید TON مشتریان\n\nدرخواستی در جدول موجود پیدا نشد."
-            markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_nbx_home")]])
-        else:
-            lines = ["📨 درخواست‌های خرید TON مشتریان (ذخیره‌شده در ربات)", "━━━━━━━━━━━━━━━━━━"]
-            buttons = []
-            for row in rows:
-                buyer = "@" + str(row["current_username"] or row["username"] or "بدون‌آیدی")
-                lines.append(f"\n#{row['id']} | {buyer} | UID: {row['user_id']}\nمقدار: {row['amount_ton']} TON | وضعیت: {row['status']}")
-                buttons.append([InlineKeyboardButton(f"🔎 درخواست #{row['id']}", callback_data=f"admin_nbx_req_{row['id']}")])
-            buttons.append([InlineKeyboardButton("🔙 بازگشت", callback_data="admin_nbx_home")])
-            text_value, markup = "\n".join(lines)[:3500], InlineKeyboardMarkup(buttons)
-        await query.edit_message_text(text_value, reply_markup=markup)
-        return True
-
-    if data.startswith("admin_nbx_req_"):
-        try:
-            request_id = int(data.rsplit("_", 1)[1])
-            with db() as con:
-                row = con.execute(
-                    "SELECT r.*,u.username AS current_username FROM ton_purchase_requests r LEFT JOIN users u ON u.user_id=r.user_id WHERE r.id=?",
-                    (request_id,),
-                ).fetchone()
-        except (ValueError, sqlite3.Error):
-            row = None
-        if not row:
-            await query.edit_message_text("درخواست موردنظر پیدا نشد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_nbx_customer_requests")]]))
-        else:
-            await query.edit_message_text(
-                f"🪙 جزئیات درخواست TON مشتری #{row['id']}\n━━━━━━━━━━━━━━━━━━\n"
-                f"کاربر: @{row['current_username'] or row['username'] or 'بدون‌آیدی'}\n"
-                f"شناسه تلگرام: {row['user_id']}\nمقدار درخواستی: {row['amount_ton']} TON\n"
-                f"آدرس کیف پول مشتری: {row['wallet_address']}\nشبکه درخواستی: TON (صرفاً از متن درخواست؛ هنوز در مقصد/شبکه API اعتبارسنجی نشده)\n"
-                f"وضعیت فعلی: {row['status']}\nزمان ثبت: {row['created_at']}\n\n"
-                "این آدرس، آدرس کیف پول مشتری است؛ با آدرس واریز حساب نوبیتکس مدیر یکی نیست. در این مرحله هیچ انتقالی انجام نمی‌شود.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_nbx_customer_requests")]])
-            )
-        return True
-
-    return True
 
 def _saved_stars_pack_quote(amount):
     """Use a saved pack price only in explicit manual mode, never as stale auto-price fallback."""
@@ -6603,7 +5851,6 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("🏷️ مدیریت کدهای تخفیف", callback_data="admin_coupons", style="primary")],
         [InlineKeyboardButton("⚙️ مدیریت قیمت‌گذاری خودکار", callback_data="admin_auto_prices", style="primary"),
          InlineKeyboardButton("💬 پیام‌های پشتیبانی", callback_data="admin_support_tickets", style="success")],
-        [InlineKeyboardButton("💎 مدیریت جامع نوبیتکس و کیف پول", callback_data="admin_nbx_home", style="primary")],
         [InlineKeyboardButton(f"⌨️ تغییر به کیبورد معمولی{' ✅' if current_mode == MENU_TYPE_KEYBOARD else ''}", callback_data="admin_menu_set_keyboard", style="success"),
          InlineKeyboardButton(f"💎 تغییر به شیشه‌ای{' ✅' if current_mode == MENU_TYPE_INLINE else ''}", callback_data="admin_menu_set_inline", style="success")],
         [InlineKeyboardButton("📝 ویرایش متن‌ها و دکمه‌ها", callback_data="uiadm_home", style="primary")],
@@ -7618,12 +6865,9 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     data = query.data
 
-    if (data.startswith(("premium_", "admin_stars_", "admin_order_", "admin_nbx_"))
+    if (data.startswith(("premium_", "admin_stars_", "admin_order_"))
             or data in {"admin_auto_prices", "admin_orders"} or data.startswith("admin_auto_cat|")) and user_id != ADMIN_ID:
         await query.answer("این بخش فقط برای مدیر ربات در دسترس است.", show_alert=True)
-        return
-
-    if await handle_nobitex_callback(query, context):
         return
 
     if await handle_gift_support_callback(query, context):
@@ -9990,7 +9234,6 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                  InlineKeyboardButton("🏷️ مدیریت کدهای تخفیف", callback_data="admin_coupons")],
                 [InlineKeyboardButton("⚙️ مدیریت قیمت‌گذاری خودکار", callback_data="admin_auto_prices", style="primary"),
                  InlineKeyboardButton("💬 پیام‌های پشتیبانی", callback_data="admin_support_tickets", style="success")],
-                [InlineKeyboardButton("💎 مدیریت جامع نوبیتکس و کیف پول", callback_data="admin_nbx_home", style="primary")],
                 [InlineKeyboardButton(f"⌨️ تغییر به کیبورد معمولی{' ✅' if current_mode == MENU_TYPE_KEYBOARD else ''}", callback_data="admin_menu_set_keyboard"),
                  InlineKeyboardButton(f"💎 تغییر به شیشه‌ای{' ✅' if current_mode == MENU_TYPE_INLINE else ''}", callback_data="admin_menu_set_inline")],
                         [InlineKeyboardButton("📝 ویرایش متن‌ها و دکمه‌ها", callback_data="uiadm_home")],
@@ -10074,6 +9317,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "admin_stars_manual_price": ("manual_unit_price_toman", "💱 هر یک استارز چند تومان فروخته شود؟\nفقط عدد بفرست. مثال: 4500"),
             "admin_stars_base_usd": ("base_usd_per_star", "💵 قیمت پایه دلاری هر استارز را وارد کن.\nفقط عدد اعشاری بفرست. مثال: 0.015"),
             "admin_stars_manual_usd": ("usd_toman_manual", "💲 نرخ دستی دلار آزاد را وارد کن.\nمثال: دلار 165000\nبرای برگشت به نرخ خودکار: دلار 0"),
+            "admin_stars_refresh_minutes": ("refresh_minutes", "⏱ هر چند دقیقه نرخ از نوبیتکس به‌روز شود؟\nعدد بین 1 تا 120 بفرست. مثال: 30"),
             "admin_stars_margin": ("margin_percent", "📈 چند درصد سود روی نرخ بازار گذاشته شود؟\nفقط عدد بفرست. مثال: 60"),
             "admin_stars_min": ("min_order", "🔽 حداقل تعداد استارز هر سفارش را وارد کن.\nفقط عدد صحیح مثبت بفرست."),
             "admin_stars_max": ("max_order", "🔼 حداکثر تعداد استارز هر سفارش را وارد کن.\nحداکثر مجاز برنامه 1,000,000 است و سقف واقعی تأمین‌کننده نیز اعمال می‌شود."),
@@ -11743,61 +10987,6 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if user:
         register_user(user)
 
-    # API credentials are accepted only in the private admin chat, immediately deleted,
-    # encrypted with a host environment key, and never echoed or written to application logs.
-    nobitex_admin_input = user_data.get("nobitex_admin_input") if user and user.id == ADMIN_ID else None
-    if message and message.text and nobitex_admin_input and getattr(getattr(message, "chat", None), "type", None) != "private":
-        user_data.pop("nobitex_admin_input", None)
-        try:
-            await message.delete()
-        except Exception:
-            pass
-        try:
-            await context.bot.send_message(chat_id=ADMIN_ID, text="⚠️ برای امنیت، کلیدهای نوبیتکس فقط در گفت‌وگوی خصوصی ربات دریافت می‌شوند. پیام ورودی برای حذف فرستاده شد و ورود لغو شد.")
-        except Exception:
-            pass
-        return
-    if message and message.text and nobitex_admin_input:
-        raw_credentials = message.text.strip()
-        try:
-            await message.delete()
-        except Exception:
-            # Deletion can fail due to Telegram permissions; never log the message contents.
-            pass
-        if raw_credentials.casefold() in {"لغو", "cancel", "/cancel"}:
-            user_data.pop("nobitex_admin_input", None)
-            await context.bot.send_message(chat_id=ADMIN_ID, text="❌ ورود اطلاعات اتصال لغو شد؛ کلید قبلی دست‌نخورده ماند.", reply_markup=nobitex_admin_keyboard())
-            return
-        try:
-            credential_lines = [line.strip() for line in raw_credentials.splitlines() if line.strip()]
-            if len(credential_lines) != 2:
-                raise ValueError("InvalidCredentialFormat")
-            nobitex_save_credentials(credential_lines[0], credential_lines[1])
-            user_data.pop("nobitex_admin_input", None)
-            await context.bot.send_message(
-                chat_id=ADMIN_ID,
-                text=nobitex_admin_text("✅ اطلاعات اتصال در حافظهٔ محلی رمزگذاری شد. هنوز تست نشده؛ حالا «تست اتصال واقعی» را اجرا کن."),
-                reply_markup=nobitex_admin_keyboard(),
-            )
-        except Exception as exc:
-            code = str(exc) if str(exc) in {"InvalidPublicKey", "InvalidPrivateKey", "EncryptionKeyMissing", "EncryptionKeyInvalid", "EncryptionLibraryMissing"} else type(exc).__name__
-            if code == "InvalidCredentialFormat":
-                help_text = "قالب پیام درست نبود؛ دقیقاً دو خط لازم است: خط اول API Key و خط دوم Private Key. درخواست حذف پیام فرستاده شد؛ دوباره وارد کن."
-            elif code == "InvalidPublicKey":
-                help_text = "فرمت API Key معتبر نیست. درخواست حذف پیام فرستاده شد؛ دوباره با کلید عمومی کامل تلاش کن."
-            elif code == "InvalidPrivateKey":
-                help_text = "Private Key با قالب Ed25519/Base64URL مستندشده سازگار نیست یا طول آن نادرست است. درخواست حذف پیام فرستاده شد؛ کلید را دوباره از پنل نوبیتکس بردار."
-            elif code == "EncryptionKeyMissing":
-                help_text = f"متغیر محیطی {NOBITEX_ENCRYPTION_ENV} تنظیم نیست؛ هیچ کلیدی ذخیره نشد."
-            elif code == "EncryptionKeyInvalid":
-                help_text = "کلید رمزگذاری میزبان معتبر نیست؛ هیچ کلیدی ذخیره نشد. مقدار متغیر محیطی را در FadeHost بررسی کن."
-            elif code == "EncryptionLibraryMissing":
-                help_text = "کتابخانهٔ رمزگذاری روی هاست نصب نیست؛ هیچ کلیدی ذخیره نشد. cryptography باید در requirements.txt باشد و پس از Redeploy نصب شود."
-            else:
-                help_text = "ثبت امن کلیدها انجام نشد؛ کلید قبلی در صورت وجود حفظ شده است."
-            await context.bot.send_message(chat_id=ADMIN_ID, text="❌ " + help_text, reply_markup=nobitex_admin_keyboard())
-        return
-
     # Dedicated Stars management inputs; all fields persist under one app_settings key.
     stars_admin_input = user_data.get("stars_admin_input") if user and user.id == ADMIN_ID else None
     if message and message.text and stars_admin_input:
@@ -11843,6 +11032,12 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             else:
                 await message.reply_text("❌ نرخ دلار باید ۰ یا عددی بین ۱٬۰۰۰ تا ۱۰۰٬۰۰۰٬۰۰۰ تومان باشد.")
                 return
+        elif field == "refresh_minutes":
+            if not clean.isdigit() or not 1 <= int(clean) <= 120:
+                await message.reply_text("❌ عدد صحیح بین ۱ تا ۱۲۰ دقیقه بفرست.")
+                return
+            cfg["refresh_minutes"] = int(clean)
+            note = f"✅ نرخ از این به بعد هر {int(clean)} دقیقه از نوبیتکس به‌روز می‌شود."
         elif field == "margin_percent":
             try:
                 value = Decimal(clean.replace("٪", "").replace("%", ""))
