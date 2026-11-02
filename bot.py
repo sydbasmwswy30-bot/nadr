@@ -4129,31 +4129,50 @@ async def handle_nobitex_callback(query, context):
         return True
 
     if data == "admin_nbx_connect":
+        # Acknowledge immediately, then render with a fallback so Telegram never leaves
+        # the admin with an unresponsive inline button if editing the old message fails.
+        try:
+            await query.answer()
+        except Exception:
+            pass
         chat = getattr(getattr(query, "message", None), "chat", None)
         if getattr(chat, "type", None) != "private":
-            await query.answer("برای ثبت کلیدها فقط از گفت‌وگوی خصوصی ربات استفاده کن.", show_alert=True)
+            await safe_callback_edit_or_reply(
+                query,
+                "برای امنیت، ثبت کلیدها فقط از گفت‌وگوی خصوصی ربات انجام می‌شود. ربات را در چت خصوصی باز کن و دوباره وارد پنل شو.",
+                InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_nbx_home")]])
+            )
             return True
         if not nobitex_encryption_ready():
-            await query.edit_message_text(
-                "🔐 قبل از ثبت کلیدهای نوبیتکس، رمزگذاری امن میزبان باید تنظیم شود.\n\n"
-                "۱) روی سرور اجرا کن:\n"
-                "`python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\"`\n\n"
-                f"۲) خروجی را با نام `{NOBITEX_ENCRYPTION_ENV}` به‌عنوان Environment Variable در پنل هاست قرار بده.\n"
-                "۳) ربات را مجدداً اجرا کن. این مقدار را در چت تلگرام نفرست.\n\n"
-                "بدون این کلید، اطلاعات اتصال ذخیره نمی‌شوند.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_nbx_home")]])
+            await safe_callback_edit_or_reply(
+                query,
+                "🔐 رمزگذاری امن روی میزبان آماده نیست.\n\n"
+                f"متغیر `{NOBITEX_ENCRYPTION_ENV}` باید در Environment variables تنظیم شده باشد و کتابخانهٔ `cryptography` روی هاست نصب باشد.\n"
+                "پس از اصلاح، ربات را Restart کن. کلید رمزگذاری را در تلگرام ارسال نکن.",
+                InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_nbx_home")]])
+            )
+            return True
+        if not isinstance(getattr(context, "user_data", None), dict):
+            await safe_callback_edit_or_reply(
+                query,
+                "❌ نشست مدیر در دسترس نیست؛ ربات را یک‌بار Restart کن و دوباره امتحان کن.",
+                InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_nbx_home")]])
             )
             return True
         context.user_data["nobitex_admin_input"] = {"field": "credentials"}
-        await query.edit_message_text(
-            "🔐 اتصال API نوبیتکس\n\n"
-            "یک پیام شامل دقیقاً دو خط بفرست:\n"
-            "خط اول: API Key عمومی (فیلد `key` در پنل نوبیتکس)\n"
-            "خط دوم: Private Key (کلید خصوصی Ed25519 با فرمت Base64URL)\n\n"
-            "برای این مرحله، کلید را با مجوز `READ` و در صورت امکان IP Whitelist و تاریخ انقضا بساز. رمز/رمزعبور حساب نوبیتکس را ارسال نکن.\n\n"
-            "پس از دریافت، ربات درخواست حذف پیام را به تلگرام می‌فرستد؛ حذف پیام از سمت تلگرام تضمین‌شده نیست. کلید خصوصی در دیتابیس به‌صورت رمزگذاری‌شده نگهداری می‌شود، اما تلگرام همچنان مسیر انتقال کلید است. برای امنیت بالاتر، کلیدها را فقط در گفت‌وگوی خصوصی با ربات وارد کن.\n\n"
-            "برای لغو /cancel بفرست.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="admin_nbx_home", style="danger")]])
+        prompt = (
+            "🔐 ثبت / ویرایش اتصال نوبیتکس\n\n"
+            "حالا یک پیام شامل دقیقاً دو خط بفرست؛ بدون عنوان یا فاصلهٔ اضافی:\n\n"
+            "خط ۱: API Key (مقدار عمومی فیلد `key`)\n"
+            "خط ۲: Private Key که نوبیتکس برای امضای API داده است\n\n"
+            "این مرحله فقط برای دسترسی READ است. کلید را در گروه نفرست و رمز ورود حساب نوبیتکس را هرگز ارسال نکن.\n"
+            "ربات تلاش می‌کند پیام را پس از دریافت حذف کند، اما حذف تلگرام تضمین‌شده نیست.\n\n"
+            "برای لغو، /cancel بفرست."
+        )
+        await safe_callback_edit_or_reply(
+            query,
+            prompt,
+            InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="admin_nbx_home")]])
         )
         return True
 
