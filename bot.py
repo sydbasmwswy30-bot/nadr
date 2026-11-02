@@ -4609,6 +4609,14 @@ _ORIGINAL_BOT_SEND_MESSAGE = Bot.send_message
 _ORIGINAL_BOT_EDIT_MESSAGE_TEXT = Bot.edit_message_text
 _ORIGINAL_BOT_EDIT_MESSAGE_REPLY_MARKUP = Bot.edit_message_reply_markup
 
+
+def _is_group_chat_id(chat_id):
+    """Telegram group/supergroup/channel chat IDs are negative integers."""
+    try:
+        return int(chat_id) < 0
+    except (TypeError, ValueError):
+        return False
+
 def _route_from_button(button):
     label = str(getattr(button, "text", "") or "").strip()
     if not label:
@@ -4917,7 +4925,12 @@ async def _mode_aware_send_message(self, *args, **kwargs):
     markup = kwargs.get("reply_markup")
     chat_id = _bot_argument(args, kwargs, "chat_id", 0)
     mode = get_main_menu_type()
-    if mode == MENU_TYPE_INLINE and not isinstance(markup, ReplyKeyboardRemove):
+    # Never display inline or reply keyboards in groups. Purchase/admin flows are private-chat only.
+    if _is_group_chat_id(chat_id) and isinstance(markup, (InlineKeyboardMarkup, ReplyKeyboardMarkup)):
+        kwargs = dict(kwargs)
+        kwargs["reply_markup"] = None
+        markup = None
+    if mode == MENU_TYPE_INLINE and not isinstance(markup, ReplyKeyboardRemove) and not _is_group_chat_id(chat_id):
         await _remove_stale_reply_keyboard(self, chat_id)
     if isinstance(markup, (InlineKeyboardMarkup, ReplyKeyboardMarkup)):
         kwargs = dict(kwargs)
@@ -4936,7 +4949,12 @@ async def _mode_aware_edit_message_text(self, *args, **kwargs):
     text_value = _bot_argument(args, kwargs, "text", 0)
     message_id = _bot_argument(args, kwargs, "message_id", 2)
     mode = get_main_menu_type()
-    if mode == MENU_TYPE_INLINE and not isinstance(markup, ReplyKeyboardRemove):
+    # Remove existing buttons as well as preventing new keyboards in group chats.
+    if _is_group_chat_id(chat_id) and isinstance(markup, (InlineKeyboardMarkup, ReplyKeyboardMarkup)):
+        kwargs = dict(kwargs)
+        kwargs["reply_markup"] = None
+        markup = None
+    if mode == MENU_TYPE_INLINE and not isinstance(markup, ReplyKeyboardRemove) and not _is_group_chat_id(chat_id):
         await _remove_stale_reply_keyboard(self, chat_id)
     if mode == MENU_TYPE_KEYBOARD and isinstance(markup, (InlineKeyboardMarkup, ReplyKeyboardMarkup)) and chat_id is not None and not _is_custom_stars_markup(markup):
         converted = _prepare_outgoing_markup(chat_id, markup)
@@ -5227,6 +5245,14 @@ async def require_channel_membership(update, context):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if chat and chat.type in {"group", "supergroup"}:
+        if update.effective_message:
+            await update.effective_message.reply_text(
+                "🔒 منوی خرید و خدمات فقط در گفت‌وگوی خصوصی ربات فعال است. برای ورود، روی نام ربات بزن و در پی‌وی دستور /start را ارسال کن.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+        return
     if update.effective_user and is_user_blocked(update.effective_user.id):
         await update.effective_message.reply_text("⛔ دسترسی شما به این ربات توسط مدیریت محدود شده است.")
         return
@@ -5827,6 +5853,9 @@ GLOBAL_CANCEL_STATE_KEYS = (
     "config_wait_duration", "config_wait_volume", "vip_duration", "vip_invoice_amount",
     "vip_payment_open", "vip_plan_type", "vip_price", "vip_volume",
     "vip_wait_duration", "vip_wait_volume",
+    "adm_state", "product_profit_admin_state", "pending_receipt_input",
+    "pending_payment_proof", "pending_coupon_input", "waiting_for_recipient",
+    "waiting_for_quantity", "waiting_for_link", "waiting_for_amount", "waiting_for_wallet",
 )
 
 
@@ -5879,12 +5908,13 @@ async def handle_global_cancel_callback(update, context):
         return
     await _safe_callback_answer(query)
     cleared = clear_active_operation_state(context)
-    if "support_form_active" in cleared:
+    if user:
         try:
             with db() as con:
                 con.execute("DELETE FROM support_form_sessions WHERE user_id=?", (user.id,))
+                con.execute("DELETE FROM support_active_tickets WHERE user_id=?", (user.id,))
         except Exception:
-            logger.exception("Could not remove cancelled support form session")
+            logger.exception("Could not close support session during callback cancellation")
 
     if user.id == ADMIN_ID:
         if "premium_admin_input" in cleared:
@@ -6547,6 +6577,17 @@ def order_search_results_keyboard(rows):
 
 async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    source_chat = getattr(getattr(query, "message", None), "chat", None) if query else None
+    if source_chat and source_chat.type in {"group", "supergroup"}:
+        try:
+            await query.answer("خدمات و پنل‌های ربات فقط در پی‌وی فعال هستند.", show_alert=True)
+        except Exception:
+            pass
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
     if query and query.data == "global_cancel":
         await handle_global_cancel_callback(update, context)
         return
@@ -10429,124 +10470,41 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cancel_coupon_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_data = context.user_data if isinstance(getattr(context, "user_data", None), dict) else {}
+    """Universal /cancel: stop every unfinished flow for this user without undoing saved orders/payments."""
     user = update.effective_user
     message = update.effective_message
-    if user and user.id == ADMIN_ID:
-        cleared = False
-        for key in ("gift_admin_input", "premium_admin_input", "gift_custom_state", "support_admin_reply_state", "support_admin_search_state", "gift_order_search_state"):
-            if user_data.pop(key, None) is not None:
-                cleared = True
-        if cleared and message:
-            await message.reply_text("❌ عملیات مدیریتی لغو شد؛ مرحلهٔ ناقص ذخیره نشد.")
-            return
-    if user and user.id != ADMIN_ID:
+    if not user:
+        return
+
+    cleared = clear_active_operation_state(context)
+    extra_keys = (
+        "adm_state", "product_profit_admin_state", "support_admin_reply_state",
+        "support_admin_search_state", "gift_order_search_state", "gift_admin_input",
+        "premium_admin_input", "gift_custom_state", "stars_custom_chat_id",
+        "stars_custom_message_id", "pending_receipt_input", "pending_payment_proof",
+        "pending_coupon_input", "waiting_for_recipient", "waiting_for_quantity",
+        "waiting_for_link", "waiting_for_amount", "waiting_for_wallet",
+    )
+    for key in extra_keys:
+        if context.user_data.pop(key, None) is not None:
+            cleared.append(key)
+
+    # Close unfinished support form/chat sessions, but retain the ticket history.
+    try:
         with db() as con:
             con.execute("DELETE FROM support_form_sessions WHERE user_id=?", (user.id,))
-            active_ticket = con.execute("SELECT ticket_id FROM support_active_tickets WHERE user_id=?", (user.id,)).fetchone()
-            if active_ticket:
-                con.execute("DELETE FROM support_active_tickets WHERE user_id=?", (user.id,))
-        user_data.pop("support_form_active", None)
-        if active_ticket and message:
-            await message.reply_text("✅ گفت‌وگوی پشتیبانی پایان یافت؛ تیکت و سوابق آن برای مدیریت محفوظ است.", reply_markup=main_menu())
-            return
-    # /cancel exits transient Stars quantity/recipient forms without creating an order.
-    if user and user.id != ADMIN_ID and (user_data.get("stars_custom_amount") is not None or user_data.get("stars_custom_order") or user_data.get("stars_custom_wait_recipient") or user_data.get("stars_fixed_wait_recipient")):
-        was_waiting_fixed_recipient = bool(user_data.get("stars_fixed_wait_recipient"))
-        user_data.pop("stars_custom_amount", None)
-        user_data.pop("stars_custom_order", None)
-        user_data.pop("stars_custom_wait_recipient", None)
-        user_data.pop("stars_fixed_wait_recipient", None)
-        if message:
-            cancel_text = "✅ انتخاب گیرنده لغو شد؛ سفارشی ثبت نشد." if was_waiting_fixed_recipient else "✅ مرحلهٔ مقدار دلخواه لغو شد؛ سفارشی ثبت نشد."
-            await message.reply_text(cancel_text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⭐ بازگشت به استارز", callback_data="service_stars", style="primary")]]))
-        return
-    # Customer can cancel an order that is still awaiting a receipt; preserve its history.
-    if user and user.id != ADMIN_ID and user_data.get("pending_receipt_order_id"):
-        order_id = int(user_data.pop("pending_receipt_order_id"))
-        with db() as con:
-            con.execute(
-                "UPDATE orders SET status='لغو شده' WHERE id=? AND user_id=? AND status='در انتظار ارسال رسید'",
-                (order_id, user.id),
-            )
-        if message:
-            await message.reply_text(f"سفارش #{order_id} لغو شد؛ سوابق برای پیگیری محفوظ می‌ماند.")
-        return
-    # The shared /cancel command also exits customer-side mediator and TON forms.
-    if user_data.get("mediator_request_state") or user_data.get("ton_purchase_state"):
-        user_data.pop("mediator_request_state", None)
-        user_data.pop("ton_purchase_state", None)
-        if message:
-            await message.reply_text(
-                "درخواست لغو شد؛ هیچ پرداخت یا سفارشی ایجاد نشد.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 منوی اصلی", callback_data="home", style="primary")]]),
-            )
-        return
-    if not user or user.id != ADMIN_ID:
-        return
+            con.execute("DELETE FROM support_active_tickets WHERE user_id=?", (user.id,))
+    except Exception:
+        logger.exception("Could not close support session during universal cancel")
 
-    pricing_admin_state = user_data.pop("pricing_admin_state", None)
-    product_state = user_data.pop("product_admin_state", None)
-    ui_state = user_data.pop("uiadm_state", None)
-    editor_wait_key = user_data.pop("editor_wait_key", None)
-    if pricing_admin_state:
-        if message:
-            await message.reply_text("❌ تنظیم قیمت‌گذاری لغو شد؛ مقدار قبلی حفظ شد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💹 بازگشت به قیمت‌گذاری", callback_data="admin_auto_pricing", style="primary")]]))
-        return
-    if product_state or ui_state or editor_wait_key:
-        if message:
-            await message.reply_text("✅ عملیات ویرایش لغو شد؛ اطلاعات قبلی حفظ شدند.")
-        return
-
-    edit_state = user_data.pop("coupon_edit_state", None)
-    if edit_state:
-        if message:
-            await message.reply_text(
-                "❌ ویرایش لغو شد.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ بازگشت به کد", callback_data="admin_coupon_view_" + str(edit_state["code"]))]])
-            )
-        return
-
-    category_state = user_data.pop("coupon_category_add_state", None)
-    if category_state:
-        scope_state = user_data.get("coupon_scope_state")
-        if scope_state:
-            try:
-                with db() as con:
-                    ensure_discount_schema(con)
-                    categories = list_coupon_categories(con)
-                    row = con.execute("SELECT category FROM discount_codes WHERE code=?", (scope_state["code"],)).fetchone()
-                if row:
-                    selected = coupon_selected_categories(row["category"])
-                    scope_state.update(categories=categories, selected=selected)
-                    await context.bot.edit_message_text(
-                        chat_id=category_state["chat_id"], message_id=category_state["message_id"],
-                        text=coupon_scope_text(None, scope_state["code"], categories, selected),
-                        reply_markup=coupon_scope_keyboard(scope_state["code"], categories, selected),
-                    )
-            except Exception:
-                logger.exception("Could not restore category editor after /cancel")
-        if message:
-            await message.reply_text("❌ افزودن دسته لغو شد.")
-        return
-
-    if user_data.get("admin_coupon_state"):
-        user_data.pop("admin_coupon_state", None)
-        if message:
-            await message.reply_text("❌ ساخت کد تخفیف لغو شد. هیچ کدی ساخته نشد.")
-        return
-
-    remaining = clear_active_operation_state(context)
-    if "support_form_active" in remaining and user:
-        try:
-            with db() as con:
-                con.execute("DELETE FROM support_form_sessions WHERE user_id=?", (user.id,))
-        except Exception:
-            logger.exception("Could not remove support session during /cancel")
-    if remaining and message:
-        await message.reply_text("❌ عملیات جاری لغو شد؛ هیچ مقدار ذخیره‌نشده‌ای ثبت نشد.")
-    elif message:
-        await message.reply_text("عملیات در حال انجامی برای لغو وجود ندارد.")
+    if message:
+        if cleared:
+            response = "❌ تمام مراحل و ورودی‌های درحال انجام لغو شدند؛ هیچ اطلاعاتِ ذخیره‌نشده‌ای ثبت نشد."
+        else:
+            response = "عملیاتِ درحال انجامی برای لغو وجود نداشت."
+        if context.user_data.get("pending_receipt_order_id"):
+            response += "\n\nℹ️ سفارش ثبت‌شده و منتظر رسید، با این دستور حذف نمی‌شود؛ برای لغو آن از گزینهٔ لغو سفارش استفاده کن."
+        await message.reply_text(response, reply_markup=ReplyKeyboardRemove())
 
 
 async def _handle_public_request_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -10686,11 +10644,20 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_data = context.user_data if isinstance(getattr(context, "user_data", None), dict) else {}
     user = update.effective_user
     message = update.effective_message
+    chat = update.effective_chat
+    if chat and chat.type in {"group", "supergroup"}:
+        # No shopping, admin or conversational input flows are processed in groups.
+        return
     if user and is_user_blocked(user.id):
         if message: await message.reply_text("⛔ دسترسی شما به این ربات توسط مدیریت محدود شده است.")
         return
     if user:
         register_user(user)
+
+    # The plain word «لغو» has the same global effect as /cancel in every private flow.
+    if message and user and message.text and _is_customer_cancel_text(message.text):
+        await cancel_coupon_creation(update, context)
+        return
 
     if message and user and await handle_admin_tool_text(update, context):
         return
@@ -12747,7 +12714,8 @@ def main():
 
     async def set_commands(application):
         await application.bot.set_my_commands([
-            BotCommand("start", "نمایش منوی فروشگاه"),
+            BotCommand("start", "نمایش منوی فروشگاه (فقط پی‌وی)"),
+            BotCommand("cancel", "لغو کامل عملیات جاری"),
             BotCommand("admin", "پنل مدیریت"),
         ])
 
