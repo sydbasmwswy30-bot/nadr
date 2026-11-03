@@ -2,6 +2,12 @@ import logging
 import asyncio
 import os
 import base64
+import csv
+import io
+import secrets
+import threading
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from copy import deepcopy
 import sqlite3
 import time
@@ -1291,8 +1297,8 @@ def init_db():
 GIFT_SETTINGS_KEY = "gift_management_settings_v1"
 GIFT_DEFAULT_SETTINGS = {
     "base_star_rate_toman": 1000,
-    "profit_percent": 20,
-    "auto_rate_enabled": False,
+    "profit_percent": 30,
+    "auto_rate_enabled": True,
     "usd_per_star_override": "",
     "usd_toman_manual": 0,
     "manual_delivery_all": False,
@@ -1447,18 +1453,12 @@ def load_gift_settings():
         cfg["profit_percent"] = max(0, min(1000, int(cfg.get("profit_percent", 20))))
     except (TypeError, ValueError):
         cfg["profit_percent"] = 20
-    try:
-        cfg["usd_toman_manual"] = max(0, int(cfg.get("usd_toman_manual", 0)))
-    except (TypeError, ValueError):
-        cfg["usd_toman_manual"] = 0
+    # Legacy manually entered FX is retained in storage for compatibility but is never used.
+    cfg["usd_toman_manual"] = 0
     for key in ("manual_delivery_all", "customer_delivery_choice", "support_first"):
         cfg[key] = bool(cfg.get(key))
-    # Gift auto-pricing is now controlled only by the central pricing center.
-    # Keep the old database fields for compatibility, but never let them override it.
-    try:
-        cfg["auto_rate_enabled"] = bool(load_auto_pricing_config().get("enabled"))
-    except Exception:
-        cfg["auto_rate_enabled"] = False
+    # Gift pricing uses the single validated Nobitex USDT/IRT snapshot shared with Stars.
+    cfg["auto_rate_enabled"] = True
     cfg["usd_per_star_override"] = str(cfg.get("usd_per_star_override") or "").strip()
     cfg["support_text"] = str(cfg.get("support_text") or GIFT_DEFAULT_SETTINGS["support_text"])
     return cfg
@@ -1517,55 +1517,56 @@ def normalize_optional_username(value):
 
 
 def _central_stars_quote_for_quantity(star_count, auto_cfg=None):
-    """Gift/internal Stars quote using the exact central FX, fee and margin rules."""
-    cfg = auto_cfg or load_auto_pricing_config()
-    try:
-        amount = int(star_count)
-    except (TypeError, ValueError):
-        return None
-    if not 1 <= amount <= 1_000_000 or not auto_pricing_ready(cfg):
-        return None
-    prices = cfg.get("catalog_prices") or {}
-    unit_usd = _pricing_decimal(prices.get("stars_price_per_star_usd"))
-    fx = _pricing_decimal(cfg.get("fx_rate_toman"))
-    if unit_usd is None or fx is None:
-        return None
-    components = _pricing_sale_components(
-        unit_usd * Decimal(amount), fx,
-        cfg.get("margin_percent", "30"),
-        cfg.get("fee_percent", "1"),
-    )
-    if components is None:
-        return None
-    return {"quantity": amount, **components}
+    """Compatibility wrapper: compute gift cost from the Nobitex Tether/Toman rate only."""
+    return gift_price_quote_for_stars(star_count)
 
 
 def gift_base_unit_price(settings=None):
-    """Current central Stars cost per unit; legacy gift-specific rates are not used."""
-    cfg = load_auto_pricing_config()
-    if not auto_pricing_ready(cfg):
+    settings = settings or load_gift_settings()
+    usd = _pricing_decimal(settings.get("usd_per_star_override"))
+    if usd is None:
+        usd = _pricing_decimal(load_stars_settings().get("base_usd_per_star", "0.015"))
+    fx, _, valid = stars_effective_usd_rate()
+    if usd is None or fx is None or not valid:
         return None
-    prices = cfg.get("catalog_prices") or {}
-    usd = _pricing_decimal(prices.get("stars_price_per_star_usd"))
-    fx = _pricing_decimal(cfg.get("fx_rate_toman"))
-    return usd * fx if usd is not None and fx is not None else None
+    return usd * fx
+
+
+def gift_price_quote_for_stars(star_count, settings=None):
+    settings = settings or load_gift_settings()
+    try:
+        amount = int(star_count)
+        margin = Decimal(str(settings.get("profit_percent", 30)))
+    except (TypeError, ValueError, InvalidOperation):
+        return None
+    if not 1 <= amount <= 1_000_000 or not margin.is_finite() or not 0 <= margin <= 1000:
+        return None
+    usd = _pricing_decimal(settings.get("usd_per_star_override"))
+    if usd is None:
+        usd = _pricing_decimal(load_stars_settings().get("base_usd_per_star", "0.015"))
+    fx, source, valid = stars_effective_usd_rate()
+    if usd is None or fx is None or not valid:
+        return None
+    cost = usd * Decimal(amount) * fx
+    sale = _ceil_toman(cost * (Decimal(100) + margin) / Decimal(100))
+    return {"quantity": amount, "cost_toman": _ceil_toman(cost), "sale_toman": sale,
+            "profit_toman": sale - _ceil_toman(cost), "margin_percent": str(margin),
+            "source": source, "unit_usd": str(usd), "fx_rate_toman": str(fx)}
 
 
 def gift_unit_sale_price(settings=None):
-    quote = _central_stars_quote_for_quantity(1)
+    quote = gift_price_quote_for_stars(1, settings)
     return Decimal(quote["sale_toman"]) if quote else None
 
 
 def gift_price_for_stars(star_count, settings=None):
-    quote = _central_stars_quote_for_quantity(star_count)
+    quote = gift_price_quote_for_stars(star_count, settings)
     return int(quote["sale_toman"]) if quote else None
 
+
 def sync_gift_prices_in_db():
-    if not load_auto_pricing_config().get("enabled"):
-        return 0
     settings = load_gift_settings()
-    unit_price = gift_unit_sale_price(settings)
-    if unit_price is None:
+    if gift_unit_sale_price(settings) is None:
         return 0
     changed = 0
     with db() as con:
@@ -1613,35 +1614,33 @@ async def get_real_bot_star_balance(bot):
 
 def gift_admin_home_text(catalog_count, active_count, balance_text, note=""):
     settings = load_gift_settings()
-    auto_cfg = load_auto_pricing_config()
+    fx, fx_source, fx_valid = stars_effective_usd_rate()
     unit = gift_unit_sale_price(settings)
-    unit_text = f"{toman(unit)} تومان" if unit is not None else "در دسترس نیست؛ منبع مرکزی را بررسی کن"
+    unit_text = f"{toman(unit)} تومان" if unit is not None else "فعلاً نرخ معتبر نوبیتکس در دسترس نیست"
+    usd_unit = settings.get("usd_per_star_override") or load_stars_settings().get("base_usd_per_star", "0.015")
+    fx_text = f"{toman(fx)} تومان" if fx is not None and fx_valid else "نامعتبر/منقضی"
     manual_text = "روشن" if settings["manual_delivery_all"] else "خاموش"
     customer_text = "روشن" if settings["customer_delivery_choice"] else "خاموش"
     support_text = "روشن" if settings["support_first"] else "خاموش"
     updated = format_iran_jalali_datetime(settings.get("catalog_last_sync")) if settings.get("catalog_last_sync") else "هنوز همگام‌سازی نشده"
-    fx_ok = bool(auto_cfg.get("fx_valid") and _pricing_timestamp_fresh(auto_cfg.get("fx_source_updated_at"), _PRICING_FX_MAX_AGE_SECONDS))
-    fx_fresh = bool(fx_ok and _pricing_timestamp_fresh(auto_cfg.get("fx_source_updated_at"), _PRICING_MAX_AGE_SECONDS))
-    fx_label = "✅ تازه" if fx_fresh else ("⚠️ آخرین نرخ تأییدشده (پشتیبان)" if fx_ok else "❌ نرخ معتبر نیست")
-    fx_rate_value = _pricing_decimal(auto_cfg.get("fx_rate_toman"))
-    fx_rate_display = f"{toman(fx_rate_value)} تومان" if fx_rate_value is not None else "ثبت نشده/نامعتبر"
     lines = [
         "🎁 مدیریت گیفت تلگرام | SEYED PREMIUM",
         "━━━━━━━━━━━━━━━━━━",
         f"📚 تعداد گیفت‌های شناسایی‌شده: {catalog_count}",
         f"✅ گیفت‌های فعال برای فروش: {active_count}",
-        f"💱 نرخ تتر مرکزی: {fx_rate_display} | {fx_label}",
-        f"📈 سود مرکزی: {auto_cfg.get('margin_percent')}٪ | کارمزد: {auto_cfg.get('fee_percent')}٪",
-        f"💵 قیمت نهایی محاسباتی هر ⭐: {unit_text}",
-        f"🌐 منبع نرخ: {auto_cfg.get('fx_source_name') or 'تأیید نشده'}",
-        f"🕒 آخرین نرخ: {_pricing_time_text(auto_cfg.get('fx_source_updated_at'))}",
+        f"💱 نرخ نوبیتکس USDT/IRT: {fx_text}",
+        f"💵 قیمت پایه هر ⭐: {usd_unit} USDT",
+        f"📈 سود گیفت: {settings.get('profit_percent', 30)}٪",
+        f"💰 قیمت نهایی محاسباتی هر ⭐: {unit_text}",
+        f"🌐 منبع نرخ: {fx_source}",
+        f"🕒 آخرین نرخ: {_pricing_time_text(load_stars_settings().get('usd_rate_source_updated_at'))}",
         f"✋ تحویل دستی همه: {manual_text}",
         f"🧑‍💻 انتخاب روش ارسال توسط مشتری: {customer_text}",
         f"📩 پیام به پشتیبانی قبل از تحویل: {support_text}",
         f"⭐ موجودی واقعی Stars ربات: {balance_text}",
         f"🕒 آخرین همگام‌سازی کاتالوگ: {updated}",
         "",
-        "نرخ، هزینه، سود و کارمزد گیفت‌های رسمی از مرکز یکپارچهٔ قیمت‌گذاری خوانده می‌شود.",
+        "تمام تبدیل‌ها با نرخ بازار USDT/IRT نوبیتکس انجام می‌شود؛ USDT معادل دقیق و تضمین‌شدهٔ دلار بانکی نیست.",
     ]
     if settings.get("catalog_last_error"):
         lines.extend(["", "⚠️ آخرین خطای کاتالوگ: " + str(settings["catalog_last_error"])[:250]])
@@ -1653,6 +1652,10 @@ def gift_admin_home_text(catalog_count, active_count, balance_text, note=""):
 def gift_admin_home_keyboard():
     settings = load_gift_settings()
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💵 قیمت پایه هر ⭐ (USDT)", callback_data="gift_usd_settings", style="primary")],
+        [InlineKeyboardButton("📈 درصد سود گیفت", callback_data="gift_profit", style="primary")],
+        [InlineKeyboardButton("⏱ فاصله به‌روزرسانی نرخ", callback_data="gift_refresh_minutes", style="primary")],
+        [InlineKeyboardButton("🔄 دریافت فوری نرخ نوبیتکس", callback_data="gift_refresh_now", style="success")],
         [InlineKeyboardButton("🔄 به‌روزرسانی فهرست از تلگرام", callback_data="gift_sync", style="success")],
         [InlineKeyboardButton("⚙️ مدیریت گیفت‌ها (فعال/غیرفعال)", callback_data="gift_catalog_page_1", style="primary")],
         [InlineKeyboardButton(f"🔵 حالت تحویل دستی همه: {'روشن' if settings['manual_delivery_all'] else 'خاموش'}", callback_data="gift_global_manual", style="primary")],
@@ -2811,7 +2814,7 @@ PREMIUM_MANAGER_DEFAULTS = {
     "fragment_manual_usd": {},
     "base_star_usd_manual": "",
     "usd_toman_manual": 0,
-    "profit_percent": "20",
+    "profit_percent": "30",
     "plan_price_toman_manual": {},
 }
 
@@ -2914,26 +2917,13 @@ def _premium_catalog_is_fresh(cfg):
 def premium_effective_star_rate_toman(settings=None, auto_cfg=None):
     settings = settings or load_premium_manager_settings()
     auto_cfg, prices, catalog_ok, fx_ok = _premium_feed_parts(auto_cfg)
-    if settings.get("auto_star_rate_enabled"):
-        star_usd = _pricing_decimal(settings.get("base_star_usd_manual")) if settings.get("base_star_usd_manual") else None
-        if star_usd is None and catalog_ok:
-            star_usd = _pricing_decimal(prices.get("stars_price_per_star_usd"))
-        fx = _pricing_decimal(settings.get("usd_toman_manual")) or (_effective_fx_rate(auto_cfg) if fx_ok else None)
-        if star_usd is None or fx is None:
-            return None
-        return (star_usd * fx).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
-    if settings.get("base_star_usd_manual"):
-        star_usd = _pricing_decimal(settings.get("base_star_usd_manual"))
-        fx = _pricing_decimal(settings.get("usd_toman_manual")) or (_effective_fx_rate(auto_cfg) if fx_ok else None)
-        if star_usd is not None and fx is not None:
-            return (star_usd * fx).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
-    if settings.get("star_rate_toman_explicit"):
-        try:
-            value = Decimal(str(settings.get("star_rate_toman", 0)))
-            return value if value.is_finite() and value > 0 else None
-        except (InvalidOperation, TypeError, ValueError):
-            return None
-    return None
+    star_usd = _pricing_decimal(settings.get("base_star_usd_manual")) if settings.get("base_star_usd_manual") else None
+    if star_usd is None and catalog_ok:
+        star_usd = _pricing_decimal(prices.get("stars_price_per_star_usd"))
+    fx, _source, valid = stars_effective_usd_rate()
+    if star_usd is None or fx is None or not valid:
+        return None
+    return (star_usd * fx).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
 
 
 def premium_price_quote(months, settings=None, auto_cfg=None):
@@ -2952,10 +2942,25 @@ def premium_price_quote(months, settings=None, auto_cfg=None):
         return {"product_type": "premium", "quantity": months, "cost_toman": amount, "sale_toman": amount,
                 "profit_toman": 0, "margin_percent": "0", "source": "قیمت اختصاصی مدیر", "manual_price": True}
 
-    # Premium automatic prices have exactly one cost/margin/fee path: the shared
-    # central engine. Historical legacy settings remain stored for compatibility,
-    # but are no longer silently used as a second price calculator. An explicit
-    # final Toman price entered by the administrator above remains supported.
+    # Explicit per-plan USDT base cost, multiplied by the live validated Nobitex USDT/IRT rate.
+    usd = _pricing_decimal(settings.get("fragment_manual_usd", {}).get(str(months)))
+    if usd is not None:
+        fx, source, valid = stars_effective_usd_rate()
+        try:
+            margin = Decimal(str(settings.get("profit_percent", "30")))
+        except (InvalidOperation, TypeError, ValueError):
+            margin = Decimal("30")
+        if fx is None or not valid or not margin.is_finite() or not 0 <= margin <= 1000:
+            return None
+        cost = usd * fx
+        sale = _ceil_toman(cost * (Decimal(100) + margin) / Decimal(100))
+        return {"product_type": "premium", "quantity": months, "cost_toman": _ceil_toman(cost),
+                "sale_toman": sale, "profit_toman": sale - _ceil_toman(cost),
+                "margin_percent": str(margin), "source": f"قیمت پایه {usd} USDT × نرخ {source}",
+                "manual_price": False, "base_usd": str(usd), "fx_rate_toman": str(fx)}
+
+    # Backward-compatible fallback to the existing automatic catalog engine until
+    # the administrator enters a plan-specific USD cost.
     central_quote = auto_pricing_quote("premium", months, auto_cfg)
     if central_quote is None:
         return None
@@ -2965,8 +2970,6 @@ def premium_price_quote(months, settings=None, auto_cfg=None):
 
 
 def sync_premium_prices_in_db():
-    if not load_auto_pricing_config().get("enabled"):
-        return 0
     settings = load_premium_manager_settings()
     auto_cfg = load_auto_pricing_config()
     changed = 0
@@ -2990,41 +2993,37 @@ def premium_delivery_label(months, settings=None):
 def premium_admin_text(note=""):
     settings = load_premium_manager_settings()
     auto_cfg = load_auto_pricing_config()
-    fx_ok = bool(auto_cfg.get("fx_valid") and _pricing_timestamp_fresh(auto_cfg.get("fx_source_updated_at"), _PRICING_FX_MAX_AGE_SECONDS))
-    fx_fresh = bool(fx_ok and _pricing_timestamp_fresh(auto_cfg.get("fx_source_updated_at"), _PRICING_MAX_AGE_SECONDS))
-    fx_label = "✅ تازه" if fx_fresh else ("⚠️ آخرین نرخ تأییدشده (پشتیبان)" if fx_ok else "❌ نرخ معتبر نیست")
+    fx_value, fx_source, fx_valid = stars_effective_usd_rate()
     lines = [
         "🌟 مدیریت تلگرام پرمیوم | SEYED PREMIUM",
         "━━━━━━━━━━━━━━━━━━",
-        "قیمت پایه، نرخ تتر، منبع قیمت و درصد سود از مرکز یکپارچهٔ قیمت‌گذاری مدیریت می‌شود.",
-        f"💱 نرخ تتر: {toman(auto_cfg.get('fx_rate_toman') or 0)} تومان | {fx_label}",
-        f"🌐 منبع نرخ: {auto_cfg.get('fx_source_name') or 'تأیید نشده'} ({auto_cfg.get('fx_source_symbol') or '—'})",
-        f"🕒 آخرین نرخ: {_pricing_time_text(auto_cfg.get('fx_source_updated_at'))}",
-        f"📈 سود مرکزی: {auto_cfg.get('margin_percent')}٪ | کارمزد مرکزی: {auto_cfg.get('fee_percent')}٪",
+        "قیمت پلن‌ها با نرخ بازار USDT/IRT نوبیتکس و درصد سود اختصاصی پرمیوم محاسبه می‌شود.",
+        f"💱 نرخ نوبیتکس USDT/IRT: {toman(fx_value or 0)} تومان {'✅ معتبر' if fx_valid else '❌ نامعتبر/منقضی'}",
+        f"🌐 منبع نرخ: {fx_source}",
+        f"🕒 آخرین نرخ: {_pricing_time_text(load_stars_settings().get('usd_rate_source_updated_at'))}",
+        f"📈 سود پرمیوم: {settings.get('profit_percent', '30')}٪",
         "",
     ]
     for months, stars in PREMIUM_PLAN_STARS.items():
         quote = premium_price_quote(months, settings, auto_cfg)
         stale_preview = False
-        if quote is None:
-            quote = auto_pricing_quote("premium", months, auto_cfg, allow_stale=True)
-            stale_preview = quote is not None
         mode_label, _ = premium_delivery_label(months, settings)
         manual_price = settings["plan_price_toman_manual"].get(str(months))
         if quote:
             price_text = f"{toman(quote['sale_toman'])} تومان" + (" ⚠️ آخرین نرخ ذخیره‌شده" if stale_preview else "")
         else:
             price_text = "قیمت هنوز ثبت نشده است"
-        lines.append(f"• پرمیوم {months} ماهه ({toman(stars)} ⭐): {price_text} | {mode_label}")
+        usd_cost = settings.get("fragment_manual_usd", {}).get(str(months)) or "ثبت‌نشده"
+        lines.append(f"• پرمیوم {months} ماهه ({toman(stars)} ⭐): {price_text} | پایه: {usd_cost} USDT | {mode_label}")
         if manual_price:
             lines.append("  └ قیمت اختصاصی مدیر (اولویت بالاتر از محاسبهٔ خودکار)")
     lines.extend([
         "",
-        "قیمت‌های مرجع پرمیوم از موتور مرکزی دریافت می‌شوند؛ قیمت اختصاصی هر پلن همچنان از همین بخش قابل تنظیم است.",
+        "قیمت دستی نهایی تومان اولویت دارد؛ در غیر این صورت قیمت پایه USDT هر پلن × نرخ نوبیتکس × (۱ + سود) محاسبه می‌شود.",
         "تحویل خودکار فقط پس از تأیید پرداخت و کنترل موجودی واقعی Stars انجام می‌شود.",
     ])
-    if not fx_ok and auto_cfg.get("fx_error"):
-        lines.append("⚠️ وضعیت نرخ تتر: " + str(auto_cfg.get("fx_error"))[:180])
+    if not fx_valid and load_stars_settings().get("usd_rate_error"):
+        lines.append("⚠️ وضعیت نرخ نوبیتکس: " + str(load_stars_settings().get("usd_rate_error"))[:180])
     if note:
         lines.extend(["", note])
     return "\n".join(lines)[:3900]
@@ -3036,7 +3035,12 @@ def premium_admin_keyboard():
         [InlineKeyboardButton("⚙️ مدیریت تحویل پلن‌های ۳، ۶ و ۱۲ ماهه", callback_data="premium_delivery_menu", style="primary")],
         [InlineKeyboardButton("💰 قیمت شخصی برای ۳ ماهه", callback_data="premium_plan_price_3", style="primary")],
         [InlineKeyboardButton("💰 قیمت شخصی برای ۶ ماهه", callback_data="premium_plan_price_6", style="primary")],
-        [InlineKeyboardButton("💰 قیمت شخصی برای ۱۲ ماهه", callback_data="premium_plan_price_12", style="primary")],
+        [InlineKeyboardButton("💰 قیمت پایه USDT برای پلن ۳ ماهه", callback_data="premium_plan_usd_3", style="primary")],
+        [InlineKeyboardButton("💰 قیمت پایه USDT برای پلن ۶ ماهه", callback_data="premium_plan_usd_6", style="primary")],
+        [InlineKeyboardButton("💰 قیمت پایه USDT برای پلن ۱۲ ماهه", callback_data="premium_plan_usd_12", style="primary")],
+        [InlineKeyboardButton("📈 درصد سود پرمیوم", callback_data="premium_profit", style="primary"),
+         InlineKeyboardButton("⏱ فاصله نرخ", callback_data="premium_refresh_minutes", style="primary")],
+        [InlineKeyboardButton("🔄 دریافت فوری نرخ نوبیتکس", callback_data="premium_refresh_now", style="success")],
         [InlineKeyboardButton("🔙 بازگشت به مدیریت قیمت‌گذاری", callback_data="admin_auto_prices", style="danger")],
     ])
 
@@ -3086,7 +3090,7 @@ STARS_DEFAULT_SETTINGS = {
     "usd_rate_source_name": "",
     "usd_rate_sources_status": {},
     "usd_rate_attempted_at": "",
-    "usd_rate_error": "نرخ دلار آزاد هنوز دریافت نشده است.",
+    "usd_rate_error": "نرخ بازار USDT/IRT نوبیتکس هنوز دریافت نشده است.",
     "usd_rate_last_alert_at": "",
     "refresh_minutes": 30,
     "margin_percent": "30",
@@ -3312,6 +3316,11 @@ async def _refresh_stars_usd_rate_locked(application=None, force=False):
         latest["usd_rate_sources_status"] = fresh["sources_status"]
         latest["usd_rate_error"] = ""
         save_stars_settings(latest)
+        try:
+            sync_gift_prices_in_db()
+            sync_premium_prices_in_db()
+        except Exception:
+            logger.exception("Could not sync gift/premium catalog after Nobitex rate refresh")
         return True
     except asyncio.CancelledError:
         raise
@@ -3331,7 +3340,7 @@ async def _refresh_stars_usd_rate_locked(application=None, force=False):
             try:
                 await application.bot.send_message(
                     chat_id=ADMIN_ID,
-                    text=("⚠️ هشدار خصوصی مدیر | نرخ دلار آزاد استارز\n\n"
+                    text=("⚠️ هشدار خصوصی مدیر | نرخ USDT/IRT نوبیتکس استارز\n\n"
                           "دریافت و اعتبارسنجی منابع نرخ ناموفق بود. آخرین نرخ معتبر قبلی حذف یا جایگزین نشده است.\n"
                           f"خطا: {type(exc).__name__}: {str(exc)[:500]}\n\n"
                           "در صورت منقضی‌شدن timestamp، سفارش جدید خودکار با این نرخ محاسبه نمی‌شود."),
@@ -3371,11 +3380,10 @@ async def stars_usd_refresh_loop(application):
 
 def stars_effective_usd_rate(cfg=None):
     cfg = cfg or load_stars_settings()
-    manual = _pricing_decimal(cfg.get("usd_toman_manual"))
-    if manual is not None:
-        return manual, "نرخ دستی مدیر", True
+    # Strict source policy: use only the validated Nobitex USDT/IRT market snapshot.
     cached = _pricing_decimal(cfg.get("usd_rate_toman"))
-    fresh = bool(cfg.get("usd_rate_valid") and cached and
+    source_name = str(cfg.get("usd_rate_source_name") or "")
+    fresh = bool(cfg.get("usd_rate_valid") and cached and source_name.lower().startswith("nobitex") and
                  _pricing_timestamp_fresh(cfg.get("usd_rate_source_updated_at"), STARS_USD_MAX_AGE_SECONDS))
     if not fresh:
         return None, "نرخ خودکار نامعتبر/منقضی", False
@@ -3428,8 +3436,8 @@ def stars_pricing_quote(quantity, cfg=None):
             if base_usd is None or not rate_ok or usd_rate is None:
                 return None
             cost_unit = base_usd * usd_rate
-            source = f"قیمت پایه {base_usd} دلار × نرخ دلار آزاد {toman(usd_rate)} تومان"
-            currency = "USD/دلار آزاد"
+            source = f"قیمت پایه {base_usd} USDT × نرخ نوبیتکس {toman(usd_rate)} تومان"
+            currency = "USDT/تومان"
         else:
             cost_unit = _pricing_decimal(cfg.get("manual_unit_price_toman"))
             if cost_unit is None:
@@ -3493,7 +3501,7 @@ def stars_admin_text(cfg=None, note=""):
         cost_unit = _pricing_decimal(cfg.get("manual_unit_price_toman"))
     margin = Decimal(str(cfg.get("margin_percent", "30")))
     sale_unit = (cost_unit * (Decimal(100) + margin) / Decimal(100)) if cost_unit is not None else None
-    price_mode = "خودکار بر اساس دلار آزاد" if cfg.get("auto_enabled") else "قیمت دستی هر استارز"
+    price_mode = "خودکار بر اساس نرخ USDT/IRT نوبیتکس" if cfg.get("auto_enabled") else "قیمت دستی فروش هر استارز"
     support = "روشن" if cfg.get("support_first") else "خاموش"
     max_order = min(int(cfg.get("max_order", 1_000_000)), stars_effective_max_order(cfg))
     lines = [
@@ -3501,9 +3509,9 @@ def stars_admin_text(cfg=None, note=""):
         "━━━━━━━━━━━━━━━━━━",
         f"⚙️ قیمت‌گذاری خودکار استارز: {auto_label}",
         f"🔧 روش قیمت‌گذاری: {price_mode}",
-        f"💵 قیمت پایه دلاری هر استارز: {cfg.get('base_usd_per_star')} دلار",
+        f"💵 قیمت پایه هر استارز: {cfg.get('base_usd_per_star')} USDT",
         f"⏱ به‌روزرسانی خودکار نرخ: هر {cfg.get('refresh_minutes', 30)} دقیقه | منبع: نوبیتکس",
-        f"💱 نرخ دلار مؤثر: {toman(rate) if rate is not None else 'ناموجود'} تومان | {rate_source}",
+        f"💱 نرخ USDT/IRT نوبیتکس: {toman(rate) if rate is not None else 'ناموجود'} تومان | {rate_source}",
         f"🕒 زمان آخرین نرخ معتبر خودکار: {updated}",
         "🔎 وضعیت خوراک‌ها: " + " | ".join(f"{name}: {str(state)[:65]}" for name, state in (cfg.get("usd_rate_sources_status") or {}).items()) if cfg.get("usd_rate_sources_status") else "🔎 وضعیت خوراک‌ها: هنوز دریافت نشده",
         f"📈 سود: {cfg.get('margin_percent')}٪",
@@ -3530,8 +3538,7 @@ def stars_admin_keyboard(cfg=None):
         [InlineKeyboardButton(auto_label, callback_data="admin_stars_toggle_auto", style="primary")],
         [InlineKeyboardButton("💱 قیمت دستی هر استارز", callback_data="admin_stars_manual_price", style="primary"),
          InlineKeyboardButton("💵 قیمت پایه دلاری", callback_data="admin_stars_base_usd", style="primary")],
-        [InlineKeyboardButton("💲 نرخ دستی دلار", callback_data="admin_stars_manual_usd", style="primary"),
-         InlineKeyboardButton("📈 درصد سود", callback_data="admin_stars_margin", style="primary")],
+        [InlineKeyboardButton("📈 درصد سود", callback_data="admin_stars_margin", style="primary")],
         [InlineKeyboardButton("🔽 حداقل سفارش", callback_data="admin_stars_min", style="primary"),
          InlineKeyboardButton("🔼 حداکثر سفارش", callback_data="admin_stars_max", style="primary")],
         [InlineKeyboardButton("📩 پیام اول پشتیبانی: " + ("روشن" if cfg.get("support_first") else "خاموش"), callback_data="admin_stars_support_toggle", style="primary")],
@@ -5857,6 +5864,7 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("🏷️ مدیریت کدهای تخفیف", callback_data="admin_coupons", style="primary")],
         [InlineKeyboardButton("⚙️ مدیریت قیمت‌گذاری خودکار", callback_data="admin_auto_prices", style="primary"),
          InlineKeyboardButton("💬 پیام‌های پشتیبانی", callback_data="admin_support_tickets", style="success")],
+        [InlineKeyboardButton("👛 مدیریت کیف پول و پرداخت‌ها", callback_data="admin_wallet_home", style="success")],
         [InlineKeyboardButton(f"⌨️ تغییر به کیبورد معمولی{' ✅' if current_mode == MENU_TYPE_KEYBOARD else ''}", callback_data="admin_menu_set_keyboard", style="success"),
          InlineKeyboardButton(f"💎 تغییر به شیشه‌ای{' ✅' if current_mode == MENU_TYPE_INLINE else ''}", callback_data="admin_menu_set_inline", style="success")],
         [InlineKeyboardButton("📝 ویرایش متن‌ها و دکمه‌ها", callback_data="uiadm_home", style="primary")],
@@ -6097,6 +6105,7 @@ async def _safe_callback_answer(query):
 GLOBAL_CANCEL_STATE_KEYS = (
     # Admin forms and editors
     "gift_admin_input", "premium_admin_input", "stars_admin_input", "gift_custom_state",
+    "wallet_admin_state", "wallet_topup_custom", "wallet_topup_amount",
     "support_admin_reply_state", "support_admin_search_state", "gift_order_search_state",
     "pricing_admin_state", "product_admin_state", "uiadm_state", "editor_wait_key",
     "coupon_edit_state", "coupon_edit_categories", "coupon_category_add_state",
@@ -6488,13 +6497,26 @@ async def handle_gift_support_callback(query, context):
         await query.edit_message_text(text_value, reply_markup=markup)
         return True
 
-    if data in {"gift_base_rate", "gift_auto_rate", "gift_profit", "gift_usd_settings"}:
-        await safe_callback_edit_or_reply(
-            query,
-            "💹 نرخ و سود همهٔ قیمت‌های خودکار، از جمله گیفت‌های رسمی، یکپارچه شده است.\n"
-            "برای مدیریت محصولات از مرکز مدیریت قیمت‌گذاری خودکار وارد شو:",
-            auto_price_categories_markup(context),
-        )
+    if data == "gift_usd_settings":
+        current = load_gift_settings().get("usd_per_star_override") or load_stars_settings().get("base_usd_per_star", "0.015")
+        context.user_data["gift_admin_input"] = {"field": "usd_settings"}
+        await query.edit_message_text(f"💵 قیمت پایهٔ فعلی هر ⭐: {current} USDT\n\nقیمت جدید را به USDT بفرست؛ نمونه: 0.015\nبرای حذف قیمت اختصاصی و استفاده از مقدار Stars، عدد 0 را بفرست.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="gift_input_cancel")]]))
+        return True
+    if data == "gift_profit":
+        context.user_data["gift_admin_input"] = {"field": "profit_percent"}
+        await query.edit_message_text("📈 درصد سود گیفت را بین ۰ تا ۱۰۰۰ بفرست. نمونه: 30", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="gift_input_cancel")]]))
+        return True
+    if data == "gift_refresh_minutes":
+        context.user_data["gift_admin_input"] = {"field": "refresh_minutes"}
+        await query.edit_message_text(f"⏱ فاصلهٔ فعلی به‌روزرسانی نرخ: {load_stars_settings().get('refresh_minutes', 30)} دقیقه\nعدد جدید بین ۱ تا ۱۲۰ دقیقه را بفرست.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="gift_input_cancel")]]))
+        return True
+    if data == "gift_refresh_now":
+        ok = await refresh_stars_usd_rate(context.application, force=True)
+        sync_gift_prices_in_db()
+        await _show_gift_admin_home(query, context.bot, "✅ نرخ نوبیتکس به‌روزرسانی شد." if ok else "⚠️ دریافت نرخ شکست خورد؛ نرخ قبلی حفظ شد و اگر منقضی باشد فروش خودکار متوقف می‌ماند.")
+        return True
+    if data == "gift_base_rate":
+        await query.edit_message_text("ℹ️ نرخ تبدیل فقط از بازار USDT/IRT نوبیتکس خوانده می‌شود و قابل ورود دستی نیست.", reply_markup=gift_admin_home_keyboard())
         return True
 
     if data == "gift_support_first":
@@ -6871,9 +6893,12 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     data = query.data
 
-    if (data.startswith(("premium_", "admin_stars_", "admin_order_"))
+    if (data.startswith(("premium_", "admin_stars_", "admin_order_", "admin_wallet_"))
             or data in {"admin_auto_prices", "admin_orders"} or data.startswith("admin_auto_cat|")) and user_id != ADMIN_ID:
         await query.answer("این بخش فقط برای مدیر ربات در دسترس است.", show_alert=True)
+        return
+
+    if await handle_wallet_callback(query, context):
         return
 
     if await handle_gift_support_callback(query, context):
@@ -6943,6 +6968,25 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "از مرکز مدیریت قیمت‌گذاری خودکار استفاده کن:",
             auto_price_categories_markup(context),
         )
+        return
+    if data == "premium_profit":
+        context.user_data["premium_admin_input"] = {"field": "profit_percent"}
+        await query.edit_message_text("📈 درصد سود پرمیوم را بین ۰ تا ۱۰۰۰ بفرست. نمونه: 30", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="premium_input_cancel")]]))
+        return
+    if data == "premium_refresh_minutes":
+        context.user_data["premium_admin_input"] = {"field": "refresh_minutes"}
+        await query.edit_message_text(f"⏱ فاصلهٔ فعلی: {load_stars_settings().get('refresh_minutes',30)} دقیقه\nفاصلهٔ جدید بین ۱ تا ۱۲۰ دقیقه را بفرست.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="premium_input_cancel")]]))
+        return
+    if data == "premium_refresh_now":
+        ok = await refresh_stars_usd_rate(context.application, force=True)
+        sync_premium_prices_in_db()
+        await query.edit_message_text(premium_admin_text("✅ نرخ نوبیتکس به‌روزرسانی شد." if ok else "⚠️ دریافت نرخ ناموفق بود؛ آخرین نرخ ذخیره‌شده حفظ شد."), reply_markup=premium_admin_keyboard())
+        return
+    if data in {"premium_plan_usd_3", "premium_plan_usd_6", "premium_plan_usd_12"}:
+        months = data.rsplit("_",1)[1]
+        current = load_premium_manager_settings().get("fragment_manual_usd",{}).get(months) or "ثبت‌نشده"
+        context.user_data["premium_admin_input"] = {"field": f"plan_usd_{months}"}
+        await query.edit_message_text(f"💵 قیمت پایهٔ فعلی پلن {months} ماهه: {current} USDT\n\nقیمت جدید را فقط به USDT بفرست؛ نمونه: 11.99\nبرای پاک‌کردن و بازگشت به قیمت مرجع قبلی عدد 0 را بفرست.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="premium_input_cancel")]]))
         return
     if data in {"premium_plan_price_3", "premium_plan_price_6", "premium_plan_price_12"}:
         cfg = load_premium_manager_settings()
@@ -9105,6 +9149,8 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "wallet":
+        context.user_data.pop("wallet_topup_custom", None)
+        context.user_data.pop("wallet_topup_amount", None)
         with db() as con:
             row = con.execute(
                 "SELECT balance FROM users WHERE user_id=?",
@@ -9269,7 +9315,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if token == "stars":
                 cfg = load_stars_settings()
                 await query.edit_message_text(stars_admin_text(cfg), reply_markup=stars_admin_keyboard(cfg))
-                if not cfg.get("usd_toman_manual") and not _pricing_timestamp_fresh(cfg.get("usd_rate_source_updated_at"), STARS_USD_MAX_AGE_SECONDS):
+                if not stars_effective_usd_rate(cfg)[2]:
                     context.application.create_task(refresh_stars_usd_rate(application=context.application, force=True))
                 return
             if token == "gifts":
@@ -9282,6 +9328,10 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             text_value, markup = auto_price_category_screen(context, token, page)
             await query.edit_message_text(text_value, reply_markup=markup)
+            return
+
+        if data == "admin_stars_manual_usd":
+            await query.answer("نرخ تبدیل دستی غیرفعال است؛ فقط نرخ زندهٔ USDT/IRT نوبیتکس استفاده می‌شود.", show_alert=True)
             return
 
         if data == "admin_stars_home":
@@ -9300,7 +9350,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             context.user_data["_stars_usd_refresh_pending"] = True
             cfg = load_stars_settings()
-            await safe_callback_edit_or_reply(query, stars_admin_text(cfg, "🔄 دریافت نرخ دلار آزاد در پس‌زمینه شروع شد."), stars_admin_keyboard(cfg))
+            await safe_callback_edit_or_reply(query, stars_admin_text(cfg, "🔄 دریافت نرخ USDT/IRT نوبیتکس در پس‌زمینه شروع شد."), stars_admin_keyboard(cfg))
             async def _run_stars_refresh():
                 try:
                     await finish_stars_usd_refresh(query, context)
@@ -9313,7 +9363,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cfg = load_stars_settings()
             cfg["auto_enabled"] = not bool(cfg.get("auto_enabled"))
             cfg = save_stars_settings(cfg)
-            if cfg["auto_enabled"] and not cfg.get("usd_toman_manual"):
+            if cfg["auto_enabled"] and not stars_effective_usd_rate(cfg)[2]:
                 context.application.create_task(refresh_stars_usd_rate(application=context.application, force=True))
             note = "✅ قیمت‌گذاری خودکار استارز روشن شد." if cfg["auto_enabled"] else "⏸ قیمت‌گذاری خودکار خاموش شد؛ قیمت دستی فقط در صورت ثبت معتبر استفاده می‌شود."
             await query.edit_message_text(stars_admin_text(cfg, note), reply_markup=stars_admin_keyboard(cfg))
@@ -9322,7 +9372,6 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stars_input_prompts = {
             "admin_stars_manual_price": ("manual_unit_price_toman", "💱 هر یک استارز چند تومان فروخته شود؟\nفقط عدد بفرست. مثال: 4500"),
             "admin_stars_base_usd": ("base_usd_per_star", "💵 قیمت پایه دلاری هر استارز را وارد کن.\nفقط عدد اعشاری بفرست. مثال: 0.015"),
-            "admin_stars_manual_usd": ("usd_toman_manual", "💲 نرخ دستی دلار آزاد را وارد کن.\nمثال: دلار 165000\nبرای برگشت به نرخ خودکار: دلار 0"),
             "admin_stars_refresh_minutes": ("refresh_minutes", "⏱ هر چند دقیقه نرخ از نوبیتکس به‌روز شود؟\nعدد بین 1 تا 120 بفرست. مثال: 30"),
             "admin_stars_margin": ("margin_percent", "📈 چند درصد سود روی نرخ بازار گذاشته شود؟\nفقط عدد بفرست. مثال: 60"),
             "admin_stars_min": ("min_order", "🔽 حداقل تعداد استارز هر سفارش را وارد کن.\nفقط عدد صحیح مثبت بفرست."),
@@ -10992,6 +11041,8 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
     message = update.effective_message
     if user:
         register_user(user)
+    if await handle_wallet_text(update, context):
+        return
 
     # Dedicated Stars management inputs; all fields persist under one app_settings key.
     stars_admin_input = user_data.get("stars_admin_input") if user and user.id == ADMIN_ID else None
@@ -11024,20 +11075,8 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             cfg["base_usd_per_star"] = str(value)
             note = "✅ قیمت پایهٔ دلاری هر استارز ذخیره شد."
         elif field == "usd_toman_manual":
-            match = re.fullmatch(r"دلار\s+([0-9,٬،]+)", normalize_ascii_digits(raw), re.IGNORECASE)
-            if not match:
-                await message.reply_text("❌ قالب نامعتبر است. نمونه: دلار 165000 یا دلار 0")
-                return
-            value = int(re.sub(r"[,٬،]", "", match.group(1)) or "0")
-            if value == 0:
-                cfg["usd_toman_manual"] = 0
-                note = "✅ نرخ دلار به حالت خودکار برگشت؛ نرخ تتر در این محاسبه استفاده نمی‌شود."
-            elif 1000 <= value <= 100_000_000:
-                cfg["usd_toman_manual"] = value
-                note = f"✅ نرخ دستی دلار آزاد {toman(value)} تومان ذخیره شد."
-            else:
-                await message.reply_text("❌ نرخ دلار باید ۰ یا عددی بین ۱٬۰۰۰ تا ۱۰۰٬۰۰۰٬۰۰۰ تومان باشد.")
-                return
+            cfg["usd_toman_manual"] = 0
+            note = "ℹ️ نرخ دستی غیرفعال است؛ نرخ فقط از بازار USDT/IRT نوبیتکس خوانده می‌شود."
         elif field == "refresh_minutes":
             if not clean.isdigit() or not 1 <= int(clean) <= 120:
                 await message.reply_text("❌ عدد صحیح بین ۱ تا ۱۲۰ دقیقه بفرست.")
@@ -11282,7 +11321,9 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             normalized = normalize_ascii_digits(raw).strip()
             price_match = re.fullmatch(r"قیمت\s+([0-9]+(?:\.[0-9]+)?)", normalized, re.IGNORECASE)
             dollar_match = re.fullmatch(r"دلار\s+([0-9,٬،]+)", normalized, re.IGNORECASE)
-            if price_match:
+            bare_price_match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)", normalized)
+            if price_match or bare_price_match:
+                raw_price = price_match.group(1) if price_match else bare_price_match.group(1)
                 value = _pricing_decimal(price_match.group(1))
                 if value is None or value > Decimal("100"):
                     await message.reply_text("❌ قیمت دلاری معتبر نیست. نمونه: قیمت 0.0155")
@@ -11290,19 +11331,31 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 cfg["base_star_usd_manual"] = str(value)
                 note = "✅ قیمت پایهٔ دلاری پرمیوم ذخیره شد."
             elif dollar_match:
-                amount = int(re.sub(r"[,٬،]", "", dollar_match.group(1)) or "0")
-                if amount == 0:
-                    cfg["usd_toman_manual"] = 0
-                    note = "✅ نرخ دلار/تتر به حالت خودکار برگشت."
-                elif 1000 <= amount <= 100_000_000:
-                    cfg["usd_toman_manual"] = amount
-                    note = "✅ نرخ دستی دلار/تتر ویژهٔ پرمیوم ذخیره شد."
-                else:
-                    await message.reply_text("❌ نرخ دلار باید ۰ یا عددی بین ۱٬۰۰۰ تا ۱۰۰٬۰۰۰٬۰۰۰ تومان باشد.")
-                    return
+                await message.reply_text("⛔ ورود دستی نرخ تبدیل غیرفعال است؛ نرخ فقط از بازار USDT/IRT نوبیتکس دریافت می‌شود. قیمت پایهٔ خود پلن را از گزینهٔ «قیمت پایه USDT» تنظیم کن.")
+                return
             else:
                 await message.reply_text("❌ دستور معتبر نیست. نمونه‌ها:\nقیمت 0.0155\nدلار 165000\nدلار 0")
                 return
+        elif field == "refresh_minutes":
+            if not clean.isdigit() or not 1 <= int(clean) <= 120:
+                await message.reply_text("❌ فاصله باید عدد صحیح بین ۱ تا ۱۲۰ دقیقه باشد.")
+                return
+            stars_cfg = load_stars_settings(); stars_cfg["refresh_minutes"] = int(clean); save_stars_settings(stars_cfg)
+            note = f"✅ نرخ نوبیتکس از این پس هر {int(clean)} دقیقه به‌روزرسانی می‌شود."
+        elif field.startswith("plan_usd_"):
+            months = field.rsplit("_", 1)[1]
+            if months not in {"3", "6", "12"}:
+                await message.reply_text("❌ پلن نامعتبر است."); return
+            if clean == "0":
+                cfg["fragment_manual_usd"][months] = ""
+                note = f"✅ قیمت پایه USDT پلن {months} ماهه حذف شد."
+            else:
+                value = _pricing_decimal(clean)
+                if value is None or value <= 0 or value > Decimal("10000"):
+                    await message.reply_text("❌ قیمت USDT معتبر نیست. نمونه: 11.99")
+                    return
+                cfg["fragment_manual_usd"][months] = str(value)
+                note = f"✅ قیمت پایه {value} USDT برای پلن {months} ماهه ذخیره شد."
         elif field == "profit_percent":
             try:
                 value = Decimal(clean)
@@ -11358,6 +11411,15 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             user_data.pop("gift_admin_input", None)
             await message.reply_text("✅ نرخ پایه ذخیره شد و قیمت گیفت‌های رسمی بر اساس نرخ جدید محاسبه شد.", reply_markup=gift_admin_home_keyboard())
             return
+        if field == "refresh_minutes":
+            clean = normalize_ascii_digits(raw).strip()
+            if not clean.isdigit() or not 1 <= int(clean) <= 120:
+                await message.reply_text("❌ فاصله باید عدد صحیح بین ۱ تا ۱۲۰ دقیقه باشد.")
+                return
+            stars_cfg = load_stars_settings(); stars_cfg["refresh_minutes"] = int(clean); save_stars_settings(stars_cfg)
+            user_data.pop("gift_admin_input", None)
+            await message.reply_text(f"✅ نرخ نوبیتکس هر {int(clean)} دقیقه به‌روزرسانی خواهد شد.", reply_markup=gift_admin_home_keyboard())
+            return
         if field == "profit_percent":
             clean = normalize_ascii_digits(raw).replace("٪", "").replace("%", "").strip()
             if not clean.isdigit() or not 0 <= int(clean) <= 1000:
@@ -11372,27 +11434,21 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             normalized = normalize_ascii_digits(raw).strip()
             price_match = re.fullmatch(r"قیمت\s+([0-9]+(?:\.[0-9]+)?)", normalized, re.IGNORECASE)
             dollar_match = re.fullmatch(r"دلار\s+([0-9,٬،]+)", normalized, re.IGNORECASE)
-            if price_match:
+            bare_price_match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)", normalized)
+            if price_match or bare_price_match:
+                raw_price = price_match.group(1) if price_match else bare_price_match.group(1)
                 try:
-                    value = Decimal(price_match.group(1))
-                    if not value.is_finite() or value <= 0 or value > Decimal("100"):
+                    value = Decimal(raw_price)
+                    if not value.is_finite() or value < 0 or value > Decimal("100"):
                         raise InvalidOperation
                 except (InvalidOperation, ValueError):
-                    await message.reply_text("❌ قیمت دلاری معتبر نیست. نمونه: قیمت 0.0155")
+                    await message.reply_text("❌ قیمت USDT معتبر نیست. نمونه: قیمت 0.0155 یا قیمت 0 برای حذف.")
                     return
-                cfg = load_gift_settings(); cfg["usd_per_star_override"] = str(value); save_gift_settings(cfg)
-                note = "✅ قیمت پایه دلاری هر ⭐ ذخیره شد."
+                cfg = load_gift_settings(); cfg["usd_per_star_override"] = "" if value == 0 else str(value); save_gift_settings(cfg)
+                note = "✅ قیمت پایهٔ اختصاصی حذف شد و مقدار پایهٔ بخش Stars اعمال می‌شود." if value == 0 else "✅ قیمت پایه USDT هر ⭐ ذخیره شد."
             elif dollar_match:
-                amount = int(re.sub(r"[,٬،]", "", dollar_match.group(1)) or "0")
-                if amount == 0:
-                    cfg = load_gift_settings(); cfg["usd_toman_manual"] = 0; save_gift_settings(cfg)
-                    note = "✅ نرخ دلار به حالت خودکار برگشت."
-                elif 1000 <= amount <= 100000000:
-                    cfg = load_gift_settings(); cfg["usd_toman_manual"] = amount; save_gift_settings(cfg)
-                    note = "✅ نرخ دستی دلار ذخیره شد."
-                else:
-                    await message.reply_text("❌ نرخ دلار باید ۰ یا عددی بین ۱٬۰۰۰ تا ۱۰۰٬۰۰۰٬۰۰۰ تومان باشد.")
-                    return
+                await message.reply_text("⛔ نرخ تبدیل دستی غیرفعال است؛ فقط بازار USDT/IRT نوبیتکس استفاده می‌شود. فقط قیمت پایه USDT را با قالب «قیمت 0.015» وارد کن.")
+                return
             else:
                 await message.reply_text("❌ دستور معتبر نیست. نمونه‌ها:\nقیمت 0.0155\nدلار 165000\nدلار 0")
                 return
@@ -13099,26 +13155,778 @@ async def _text_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 # ==========================================
+# کیف پول، شارژ BluPal و Webhook امن (افزایشی و بدون حذف داده‌های قبلی)
+# ==========================================
+
+_BLUPAL_SERVER = None
+_BLUPAL_LOOP = None
+_BLUPAL_APPLICATION = None
+
+
+def ensure_wallet_payment_schema():
+    """Create only new wallet ledger/top-up tables; preserve existing users/orders/balances."""
+    with db() as con:
+        con.execute("""CREATE TABLE IF NOT EXISTS wallet_transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            amount INTEGER NOT NULL,
+            balance_after INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            reference TEXT NOT NULL UNIQUE,
+            reason TEXT NOT NULL DEFAULT '',
+            actor_admin_id INTEGER,
+            created_at TEXT NOT NULL,
+            metadata TEXT NOT NULL DEFAULT '{}'
+        )""")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_wallet_transactions_user ON wallet_transactions(user_id,id DESC)")
+        con.execute("""CREATE TABLE IF NOT EXISTS wallet_topups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            method TEXT NOT NULL,
+            amount_toman INTEGER NOT NULL,
+            requested_amount_rial INTEGER NOT NULL DEFAULT 0,
+            final_amount_rial INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL,
+            invoice_id TEXT UNIQUE,
+            payment_link TEXT NOT NULL DEFAULT '',
+            card_number TEXT NOT NULL DEFAULT '',
+            mode TEXT NOT NULL DEFAULT '',
+            gateway_transaction_id TEXT NOT NULL DEFAULT '',
+            receipt_file_id TEXT NOT NULL DEFAULT '',
+            receipt_media_type TEXT NOT NULL DEFAULT '',
+            payer_name TEXT NOT NULL DEFAULT '',
+            payer_card TEXT NOT NULL DEFAULT '',
+            payer_bank_name TEXT NOT NULL DEFAULT '',
+            reject_reason TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            paid_at TEXT NOT NULL DEFAULT '',
+            reviewed_by INTEGER,
+            reviewed_at TEXT NOT NULL DEFAULT ''
+        )""")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_wallet_topups_user ON wallet_topups(user_id,id DESC)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_wallet_topups_status ON wallet_topups(status,id DESC)")
+        con.execute("""CREATE TABLE IF NOT EXISTS wallet_webhook_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            invoice_id TEXT NOT NULL DEFAULT '',
+            event_name TEXT NOT NULL DEFAULT '',
+            payload_sha256 TEXT NOT NULL UNIQUE,
+            received_at TEXT NOT NULL,
+            result TEXT NOT NULL DEFAULT ''
+        )""")
+
+
+def wallet_apply_transaction(user_id, delta, kind, reference, reason='', actor_admin_id=None, metadata=None, username=''):
+    """Atomic, idempotent balance change with an immutable ledger entry."""
+    user_id = int(user_id); delta = int(delta); reference = str(reference).strip()
+    if user_id <= 0 or delta == 0 or not reference:
+        raise ValueError("تراکنش کیف پول نامعتبر است.")
+    with db() as con:
+        con.execute("BEGIN IMMEDIATE")
+        existing = con.execute("SELECT id,balance_after FROM wallet_transactions WHERE reference=?", (reference,)).fetchone()
+        if existing:
+            row = con.execute("SELECT balance FROM users WHERE user_id=?", (user_id,)).fetchone()
+            return {"duplicate": True, "balance": int(row["balance"] if row else existing["balance_after"])}
+        con.execute("INSERT OR IGNORE INTO users(user_id,username,balance,joined_at) VALUES(?,?,0,?)",
+                    (user_id, str(username or ''), utc_now().isoformat(timespec='seconds')))
+        row = con.execute("SELECT balance FROM users WHERE user_id=?", (user_id,)).fetchone()
+        old_balance = int(row["balance"] or 0)
+        new_balance = old_balance + delta
+        if new_balance < 0:
+            raise ValueError("موجودی کیف پول برای این برداشت کافی نیست؛ موجودی منفی مجاز نیست.")
+        con.execute("UPDATE users SET balance=? WHERE user_id=?", (new_balance, user_id))
+        con.execute("""INSERT INTO wallet_transactions(user_id,amount,balance_after,kind,reference,reason,actor_admin_id,created_at,metadata)
+                      VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (user_id, delta, new_balance, str(kind), reference, str(reason or '')[:500], actor_admin_id,
+                     utc_now().isoformat(timespec='seconds'), json.dumps(metadata or {}, ensure_ascii=False)))
+        return {"duplicate": False, "balance": new_balance}
+
+
+def _wallet_credit_verified_topup(topup_id, gateway_transaction_id=''):
+    """Credit an online topup exactly once; status and balance ledger commit together."""
+    with db() as con:
+        con.execute("BEGIN IMMEDIATE")
+        topup = con.execute("SELECT * FROM wallet_topups WHERE id=?", (int(topup_id),)).fetchone()
+        if not topup:
+            raise ValueError("درخواست شارژ پیدا نشد.")
+        if topup["status"] == "PAID":
+            row = con.execute("SELECT balance FROM users WHERE user_id=?", (topup["user_id"],)).fetchone()
+            return {"credited": False, "duplicate": True, "balance": int(row["balance"] if row else 0)}
+        if topup["status"] not in {"PENDING", "VERIFYING"}:
+            raise ValueError("وضعیت درخواست شارژ برای تأیید معتبر نیست.")
+        user_id = int(topup["user_id"])
+        con.execute("INSERT OR IGNORE INTO users(user_id,username,balance,joined_at) VALUES(?,?,0,?)",
+                    (user_id, '', utc_now().isoformat(timespec='seconds')))
+        user = con.execute("SELECT balance FROM users WHERE user_id=?", (user_id,)).fetchone()
+        amount = int(topup["amount_toman"])
+        new_balance = int(user["balance"] or 0) + amount
+        reference = f"blupal:{topup['invoice_id']}"
+        cur = con.execute("""INSERT OR IGNORE INTO wallet_transactions
+            (user_id,amount,balance_after,kind,reference,reason,actor_admin_id,created_at,metadata)
+            VALUES(?,?,?,'blupal_topup',?,'تأیید پرداخت آنلاین BluPal',NULL,?,?)""",
+            (user_id, amount, new_balance, reference, utc_now().isoformat(timespec='seconds'),
+             json.dumps({"invoice_id": topup["invoice_id"], "gateway_transaction_id": gateway_transaction_id,
+                         "final_amount_rial": int(topup["final_amount_rial"] or 0), "mode": topup["mode"]}, ensure_ascii=False)))
+        if cur.rowcount == 0:
+            con.execute("UPDATE wallet_topups SET status='PAID' WHERE id=?", (int(topup_id),))
+            current = con.execute("SELECT balance FROM users WHERE user_id=?", (user_id,)).fetchone()
+            return {"credited": False, "duplicate": True, "balance": int(current["balance"] or 0)}
+        con.execute("UPDATE users SET balance=? WHERE user_id=?", (new_balance, user_id))
+        con.execute("UPDATE wallet_topups SET status='PAID',gateway_transaction_id=?,paid_at=? WHERE id=?",
+                    (str(gateway_transaction_id or ''), utc_now().isoformat(timespec='seconds'), int(topup_id)))
+        return {"credited": True, "duplicate": False, "balance": new_balance, "user_id": user_id, "amount": amount}
+
+
+def wallet_find_user(raw):
+    value = str(raw or '').strip()
+    if value.isdigit():
+        with db() as con:
+            return con.execute("SELECT user_id,username,balance FROM users WHERE user_id=?", (int(value),)).fetchone()
+    username = value.lstrip('@').lower()
+    if not re.fullmatch(r'[A-Za-z0-9_]{5,32}', username):
+        return None
+    with db() as con:
+        return con.execute("SELECT user_id,username,balance FROM users WHERE lower(ltrim(username,'@'))=? LIMIT 1", (username,)).fetchone()
+
+
+def wallet_user_text(user_id):
+    with db() as con:
+        user = con.execute("SELECT user_id,username,balance FROM users WHERE user_id=?", (int(user_id),)).fetchone()
+        count = con.execute("SELECT COUNT(*) FROM wallet_transactions WHERE user_id=?", (int(user_id),)).fetchone()[0]
+        tops = con.execute("SELECT COUNT(*) FROM wallet_topups WHERE user_id=?", (int(user_id),)).fetchone()[0]
+    if not user:
+        return "کاربر پیدا نشد."
+    return ("👛 مدیریت کیف پول کاربر\n━━━━━━━━━━━━━━━━━━\n"
+            f"🆔 ID: {user['user_id']}\n👤 Username: @{user['username'] or 'ثبت‌نشده'}\n"
+            f"💰 موجودی: {toman(user['balance'])} تومان\n📚 تراکنش‌ها: {count}\n🧾 درخواست‌های شارژ: {tops}")
+
+
+def wallet_user_keyboard(user_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ افزایش موجودی", callback_data=f"admin_wallet_add_{int(user_id)}"),
+         InlineKeyboardButton("➖ کاهش موجودی", callback_data=f"admin_wallet_sub_{int(user_id)}")],
+        [InlineKeyboardButton("📜 تاریخچه تراکنش‌ها", callback_data=f"admin_wallet_hist_{int(user_id)}")],
+        [InlineKeyboardButton("🔎 جست‌وجوی کاربر دیگر", callback_data="admin_wallet_search"),
+         InlineKeyboardButton("🔙 مدیریت کیف پول", callback_data="admin_wallet_home")],
+    ])
+
+
+def wallet_admin_home_text():
+    with db() as con:
+        users = int(con.execute("SELECT COUNT(*) FROM users").fetchone()[0])
+        balance = int(con.execute("SELECT COALESCE(SUM(balance),0) FROM users").fetchone()[0])
+        pending = int(con.execute("SELECT COUNT(*) FROM wallet_topups WHERE status IN ('REVIEW','WAITING_RECEIPT')").fetchone()[0])
+        txs = int(con.execute("SELECT COUNT(*) FROM wallet_transactions").fetchone()[0])
+    return ("👛 مدیریت کیف پول | SEYED PREMIUM\n━━━━━━━━━━━━━━━━━━\n"
+            f"👥 کاربران: {users:,}\n💰 مجموع موجودی: {toman(balance)} تومان\n"
+            f"🔄 تراکنش‌های ثبت‌شده: {txs:,}\n🧾 شارژهای کارت‌به‌کارت در انتظار بررسی: {pending}")
+
+
+def wallet_admin_home_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔎 جست‌وجو با ID یا @username", callback_data="admin_wallet_search")],
+        [InlineKeyboardButton("🧾 شارژهای کارت‌به‌کارت در انتظار بررسی", callback_data="admin_wallet_pending")],
+        [InlineKeyboardButton("📤 خروجی CSV موجودی‌ها", callback_data="admin_wallet_export_balances"),
+         InlineKeyboardButton("📤 خروجی CSV تراکنش‌ها", callback_data="admin_wallet_export_txs")],
+        [InlineKeyboardButton("🏠 پنل مدیریت", callback_data="admin")],
+    ])
+
+
+def blupal_api_key():
+    return str(os.getenv("BLUPAL_API_KEY", "")).strip()
+
+
+async def blupal_request(method, path, payload=None, timeout_seconds=18):
+    key = blupal_api_key()
+    if not key:
+        raise RuntimeError("کلید BLUPAL_API_KEY در متغیرهای محیطی هاست تنظیم نشده است.")
+    if not (key.startswith("blu_test_") or key.startswith("blu_live_")):
+        raise RuntimeError("فرمت کلید BluPal معتبر نیست؛ از کلید blu_test_ یا blu_live_ استفاده کن.")
+    url = "https://blupal.top/api" + path
+    async with httpx.AsyncClient(timeout=httpx.Timeout(float(timeout_seconds), connect=min(3.0, float(timeout_seconds))), follow_redirects=False) as client:
+        response = await client.request(method, url, headers={"X-API-Key": key, "Accept": "application/json"}, json=payload)
+        response.raise_for_status()
+        data = response.json()
+    if isinstance(data, dict) and isinstance(data.get("data"), dict):
+        data = data["data"]
+    if not isinstance(data, dict):
+        raise RuntimeError("ساختار پاسخ BluPal معتبر نیست.")
+    if data.get("success") is False:
+        raise RuntimeError(str(data.get("message") or data.get("error") or "BluPal درخواست را نپذیرفت."))
+    return data
+
+
+async def wallet_create_blupal_invoice(user_id, amount_toman, username=''):
+    amount_toman = int(amount_toman)
+    if not 10_000 <= amount_toman <= 50_000_000:
+        raise ValueError("مبلغ شارژ باید بین ۱۰٬۰۰۰ تا ۵۰٬۰۰۰٬۰۰۰ تومان باشد.")
+    key = blupal_api_key()
+    if not key:
+        raise RuntimeError("درگاه هنوز روی هاست تنظیم نشده است.")
+    mode_expected = "sandbox" if key.startswith("blu_test_") else "live"
+    with db() as con:
+        cur = con.execute("""INSERT INTO wallet_topups(user_id,method,amount_toman,requested_amount_rial,status,mode,created_at)
+            VALUES(?,'blupal',?,?, 'CREATING', ?, ?)""", (int(user_id), amount_toman, amount_toman * 10, mode_expected, utc_now().isoformat(timespec='seconds')))
+        topup_id = int(cur.lastrowid)
+    try:
+        data = await blupal_request("POST", "/v1/invoices/create", {"amount": amount_toman * 10})
+        invoice_id = str(data.get("invoice_id") or data.get("id") or "").strip()
+        original = int(data.get("amount") or 0)
+        final_amount = int(data.get("final_amount") or 0)
+        link = str(data.get("payment_link") or "").strip()
+        card_number = str(data.get("card_number") or "").strip()
+        mode = str(data.get("mode") or "").lower()
+        parsed = urlsplit(link)
+        if not invoice_id.isdigit() or final_amount < original or final_amount > original + 999:
+            raise RuntimeError("پاسخ BluPal دارای شماره فاکتور یا مبلغ نهایی معتبر نیست.")
+        if original != amount_toman * 10:
+            raise RuntimeError("مبلغ فاکتور با مبلغ درخواستی کیف پول تطبیق ندارد.")
+        if parsed.scheme != "https" or not (parsed.hostname == "blupal.top" or (parsed.hostname or "").endswith(".blupal.top")):
+            raise RuntimeError("لینک پرداخت برگشتی از BluPal معتبر یا امن نیست.")
+        if mode != mode_expected:
+            raise RuntimeError("محیط فاکتور با نوع کلید API (آزمایشی/واقعی) تطبیق ندارد.")
+        with db() as con:
+            con.execute("UPDATE wallet_topups SET status='PENDING',invoice_id=?,requested_amount_rial=?,final_amount_rial=?,payment_link=?,card_number=?,mode=? WHERE id=?",
+                        (invoice_id, original, final_amount, link, card_number, mode, topup_id))
+        return topup_id, invoice_id, final_amount, link, card_number, mode
+    except Exception as exc:
+        with db() as con:
+            con.execute("UPDATE wallet_topups SET status='FAILED',reject_reason=? WHERE id=?", (str(exc)[:500], topup_id))
+        raise
+
+
+async def wallet_verify_blupal_invoice(invoice_id, app=None, webhook_payload=None, quick=False):
+    invoice_id = str(invoice_id or '').strip()
+    if not invoice_id:
+        raise ValueError("شماره فاکتور خالی است.")
+    with db() as con:
+        topup = con.execute("SELECT * FROM wallet_topups WHERE invoice_id=?", (invoice_id,)).fetchone()
+    if not topup:
+        raise ValueError("فاکتور در دیتابیس این ربات وجود ندارد.")
+    if topup["status"] == "PAID":
+        return {"credited": False, "duplicate": True, "user_id": int(topup["user_id"])}
+    if topup["mode"] == "sandbox" and not blupal_api_key().startswith("blu_test_"):
+        raise ValueError("فاکتور آزمایشی با کلید واقعی قابل تأیید نیست.")
+    data = await blupal_request("GET", f"/v1/invoices/{invoice_id}", timeout_seconds=6 if quick else 18)
+    api_id = str(data.get("invoice_id") or data.get("id") or invoice_id)
+    status = str(data.get("status") or '').upper()
+    amount = int(data.get("amount") or 0)
+    final_amount = int(data.get("final_amount") or 0)
+    mode = str(data.get("mode") or '').lower()
+    if api_id != invoice_id or status != "PAID":
+        if api_id == invoice_id and status in {"EXPIRED", "CANCELED"}:
+            with db() as con:
+                con.execute("UPDATE wallet_topups SET status=? WHERE id=? AND status='PENDING'", (status, int(topup["id"])))
+        return {"credited": False, "pending": status in {"PENDING", "CREATED", "PROCESSING"}, "status": status,
+                "user_id": int(topup["user_id"])}
+    if amount != int(topup["requested_amount_rial"]) or final_amount != int(topup["final_amount_rial"]):
+        raise ValueError("مبلغ فاکتور در API با رکورد ذخیره‌شده تطبیق ندارد.")
+    if mode != str(topup["mode"]).lower():
+        raise ValueError("محیط فاکتور در API با رکورد ذخیره‌شده تطبیق ندارد.")
+    if webhook_payload:
+        if webhook_payload.get("event") != "payment.completed" or webhook_payload.get("success") not in (True, "true", 1):
+            raise ValueError("رویداد Webhook موفق و معتبر نیست.")
+        if str(webhook_payload.get("status", "")).upper() != "PAID":
+            raise ValueError("وضعیت Webhook پرداخت را PAID اعلام نکرده است.")
+        for field, expected in (("invoice_id", invoice_id), ("amount", amount), ("final_amount", final_amount), ("mode", mode)):
+            incoming = str(webhook_payload.get(field, "")).lower()
+            if incoming != str(expected).lower():
+                raise ValueError(f"فیلد {field} در Webhook با استعلام API تطبیق ندارد.")
+    with db() as con:
+        con.execute("UPDATE wallet_topups SET payer_name=?,payer_card=?,payer_bank_name=? WHERE id=?",
+                    (str(data.get("payer_name") or "")[:160], str(data.get("payer_card") or "")[:80],
+                     str(data.get("payer_bank_name") or "")[:120], int(topup["id"])))
+    result = _wallet_credit_verified_topup(int(topup["id"]), str(data.get("transaction_id") or ""))
+    if result.get("credited") and app is not None:
+        try:
+            await app.bot.send_message(chat_id=result["user_id"], text=f"✅ پرداخت شما تأیید شد و کیف پول شارژ شد.\n\n💰 مبلغ شارژ: {toman(result['amount'])} تومان\n👛 موجودی جدید: {toman(result['balance'])} تومان\n🧾 فاکتور: {invoice_id}")
+        except Exception:
+            logger.exception("Could not notify user about paid BluPal invoice")
+        try:
+            await app.bot.send_message(chat_id=ADMIN_ID, text=f"✅ شارژ آنلاین BluPal تأیید شد.\nکاربر: {result['user_id']}\nمبلغ: {toman(result['amount'])} تومان\nفاکتور: {invoice_id}\nموجودی: {toman(result['balance'])} تومان")
+        except Exception:
+            logger.exception("Could not notify admin about paid BluPal invoice")
+    return {**result, "user_id": int(topup["user_id"]), "status": "PAID"}
+
+
+class _BluPalWebhookHandler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        # Do not log request paths: the endpoint path contains the webhook secret.
+        logger.info("BluPal webhook HTTP request handled")
+
+    def _send(self, status, body):
+        encoded = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def do_GET(self):
+        if self.path == "/healthz":
+            return self._send(200, {"ok": True, "service": "seyed-premium-wallet"})
+        return self._send(404, {"ok": False})
+
+    def do_POST(self):
+        token = str(os.getenv("BLUPAL_WEBHOOK_TOKEN", "")).strip()
+        expected_path = "/blupal/webhook/" + token
+        if not token or not secrets.compare_digest(self.path, expected_path):
+            return self._send(404, {"ok": False})
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 64_000:
+                return self._send(413, {"ok": False, "error": "invalid body size"})
+            raw = self.rfile.read(length)
+            payload = json.loads(raw.decode("utf-8"))
+            if not isinstance(payload, dict):
+                return self._send(400, {"ok": False})
+            loop = _BLUPAL_LOOP
+            app = _BLUPAL_APPLICATION
+            if loop is None or app is None or loop.is_closed():
+                return self._send(503, {"ok": False, "error": "application unavailable"})
+            future = asyncio.run_coroutine_threadsafe(wallet_verify_blupal_invoice(payload.get("invoice_id"), app, payload, quick=True), loop)
+            result = future.result(timeout=8)
+            digest = hashlib.sha256(raw).hexdigest()
+            with db() as con:
+                con.execute("INSERT OR IGNORE INTO wallet_webhook_events(invoice_id,event_name,payload_sha256,received_at,result) VALUES(?,?,?,?,?)",
+                            (str(payload.get("invoice_id") or ''), str(payload.get("event") or ''), digest,
+                             utc_now().isoformat(timespec='seconds'), str(result.get("status") or ('credited' if result.get('credited') else 'duplicate'))))
+            # A success event must be confirmed as PAID by BluPal's status API.
+            # Keep the webhook retryable if their status endpoint has not caught up yet.
+            if result.get("pending") or result.get("status") not in {"PAID", None}:
+                return self._send(503, {"ok": False, "result": result.get("status") or "not_confirmed"})
+            return self._send(200, {"ok": True, "result": result.get("status") or ("credited" if result.get("credited") else "already_processed")})
+        except Exception as exc:
+            logger.exception("BluPal webhook verification failed")
+            return self._send(503, {"ok": False, "error": str(exc)[:180]})
+
+
+def start_blupal_webhook_server(application):
+    global _BLUPAL_SERVER, _BLUPAL_LOOP, _BLUPAL_APPLICATION
+    token = str(os.getenv("BLUPAL_WEBHOOK_TOKEN", "")).strip()
+    if len(token) < 32:
+        logger.warning("BluPal webhook not started: BLUPAL_WEBHOOK_TOKEN must contain at least 32 characters")
+        return False
+    if _BLUPAL_SERVER is not None:
+        return True
+    _BLUPAL_LOOP = asyncio.get_running_loop()
+    _BLUPAL_APPLICATION = application
+    host = str(os.getenv("BLUPAL_BIND_HOST", "0.0.0.0"))
+    port = int(os.getenv("PORT", os.getenv("BLUPAL_WEBHOOK_PORT", "8080")))
+    server = ThreadingHTTPServer((host, port), _BluPalWebhookHandler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, name="blupal-webhook", daemon=True)
+    thread.start()
+    _BLUPAL_SERVER = server
+    public_base = str(os.getenv("BLUPAL_PUBLIC_BASE_URL", "")).rstrip("/")
+    if public_base:
+        # Never print the secret endpoint token to application logs.
+        logger.info("BluPal webhook listener active for public base URL %s (secret path configured in dashboard)", public_base)
+    else:
+        logger.warning("BluPal webhook listener active on port %s; set BLUPAL_PUBLIC_BASE_URL and configure public HTTPS proxy", port)
+    return True
+
+
+async def _wallet_show(update_or_query, text, markup=None):
+    if hasattr(update_or_query, "edit_message_text"):
+        try:
+            await update_or_query.edit_message_text(text=text, reply_markup=markup)
+            return
+        except Exception:
+            pass
+    message = getattr(update_or_query, "effective_message", None) or getattr(update_or_query, "message", None)
+    if message:
+        await message.reply_text(text, reply_markup=markup)
+
+
+async def wallet_safe_edit(query, text, reply_markup=None):
+    try:
+        await query.edit_message_text(text=text, reply_markup=reply_markup)
+        return
+    except Exception:
+        pass
+    try:
+        await query.edit_message_caption(caption=text, reply_markup=reply_markup)
+        return
+    except Exception:
+        pass
+    try:
+        if query.message:
+            await query.message.reply_text(text, reply_markup=reply_markup)
+    except Exception:
+        logger.exception("Could not update wallet admin message")
+
+
+async def wallet_start_topup(query, context, user_id):
+    await query.edit_message_text("💳 شارژ کیف پول\n\nمبلغ شارژ را انتخاب کن (تومان):",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("۵۰٬۰۰۰", callback_data="wallet_amount_50000"), InlineKeyboardButton("۱۰۰٬۰۰۰", callback_data="wallet_amount_100000")],
+            [InlineKeyboardButton("۲۰۰٬۰۰۰", callback_data="wallet_amount_200000"), InlineKeyboardButton("۵۰۰٬۰۰۰", callback_data="wallet_amount_500000")],
+            [InlineKeyboardButton("۱٬۰۰۰٬۰۰۰", callback_data="wallet_amount_1000000"), InlineKeyboardButton("۲٬۰۰۰٬۰۰۰", callback_data="wallet_amount_2000000")],
+            [InlineKeyboardButton("✍️ مبلغ دلخواه", callback_data="wallet_amount_custom")],
+            [InlineKeyboardButton("👛 بازگشت به کیف پول", callback_data="wallet")],
+        ]))
+
+
+async def wallet_prepare_payment(query, context, user_id, amount):
+    if not 10_000 <= int(amount) <= 50_000_000:
+        await query.answer("مبلغ باید بین ۱۰٬۰۰۰ تا ۵۰٬۰۰۰٬۰۰۰ تومان باشد.", show_alert=True); return
+    context.user_data["wallet_topup_amount"] = int(amount)
+    await query.edit_message_text(f"💳 مبلغ انتخابی: {toman(amount)} تومان\n\nروش پرداخت را انتخاب کن:", reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton("🌐 پرداخت آنلاین BluPal", callback_data="wallet_method_blupal")],
+        [InlineKeyboardButton("💳 کارت‌به‌کارت (تأیید دستی مدیر)", callback_data="wallet_method_card")],
+        [InlineKeyboardButton("⬅️ تغییر مبلغ", callback_data="topup")],
+    ]))
+
+
+async def handle_wallet_callback(query, context):
+    data = str(query.data or '')
+    user_id = int(query.from_user.id)
+    if data == "topup":
+        context.user_data.pop("wallet_topup_custom", None)
+        await wallet_start_topup(query, context, user_id)
+        return True
+    if data == "wallet":
+        context.user_data.pop("wallet_topup_custom", None)
+        with db() as con:
+            row = con.execute("SELECT balance FROM users WHERE user_id=?", (user_id,)).fetchone()
+            last = con.execute("SELECT id,invoice_id,amount_toman,status,created_at FROM wallet_topups WHERE user_id=? ORDER BY id DESC LIMIT 3", (user_id,)).fetchall()
+        balance = int(row["balance"] or 0) if row else 0
+        lines = ["👛 کیف پول SEYED PREMIUM", "━━━━━━━━━━━━━━━━━━", f"💰 موجودی: {toman(balance)} تومان"]
+        if last:
+            lines.extend(["", "آخرین درخواست‌های شارژ:"])
+            for x in last:
+                label = {"PAID":"✅ پرداخت‌شده", "PENDING":"⏳ در انتظار پرداخت", "REVIEW":"🕓 در انتظار بررسی رسید", "REJECTED":"❌ ردشده", "EXPIRED":"⌛ منقضی"}.get(x["status"], x["status"])
+                lines.append(f"• #{x['id']} | {toman(x['amount_toman'])} تومان | {label}")
+        wallet_buttons = []
+        for x in last:
+            if x["status"] == "PENDING" and x["invoice_id"]:
+                wallet_buttons.append([InlineKeyboardButton(f"🔎 بررسی پرداخت فاکتور #{x['id']}", callback_data=f"wallet_check_{x['invoice_id']}")])
+            elif x["status"] == "WAITING_RECEIPT":
+                wallet_buttons.append([InlineKeyboardButton(f"📷 ارسال رسید درخواست #{x['id']}", callback_data=f"wallet_receipt_{x['id']}")])
+        wallet_buttons.extend([[InlineKeyboardButton("＋ افزایش موجودی", callback_data="topup")],
+            [InlineKeyboardButton("📜 تاریخچه کیف پول", callback_data="wallet_history")],
+            [InlineKeyboardButton("🏠 منوی اصلی", callback_data="home")]])
+        await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(wallet_buttons))
+        return True
+    if data.startswith("wallet_receipt_"):
+        top_id = int(data.rsplit("_", 1)[1])
+        with db() as con:
+            top = con.execute("SELECT id,status,amount_toman FROM wallet_topups WHERE id=? AND user_id=?", (top_id,user_id)).fetchone()
+        if not top or top["status"] != "WAITING_RECEIPT":
+            await query.answer("این درخواست دیگر منتظر رسید نیست.", show_alert=True); return True
+        context.user_data["wallet_waiting_receipt"] = top_id
+        await query.edit_message_text(f"📷 لطفاً تصویر رسید درخواست #{top_id} به مبلغ {toman(top['amount_toman'])} تومان را ارسال کن. تا بررسی و تأیید مدیر، کیف پول شارژ نمی‌شود.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو درخواست",callback_data=f"wallet_cancel_{top_id}")]]))
+        return True
+    if data == "wallet_history":
+        with db() as con:
+            rows = con.execute("SELECT amount,kind,reason,reference,created_at FROM wallet_transactions WHERE user_id=? ORDER BY id DESC LIMIT 15", (user_id,)).fetchall()
+        lines = ["📜 تاریخچه کیف پول", "━━━━━━━━━━━━━━━━━━"]
+        if not rows: lines.append("هنوز تراکنشی ثبت نشده است.")
+        for r in rows:
+            sign = "+" if int(r["amount"]) > 0 else ""
+            lines.append(f"{sign}{toman(r['amount'])} تومان | {r['kind']}\n{r['reason'][:90]}\nشناسه: {r['reference']} | {format_iran_jalali_datetime(r['created_at'])}")
+        await query.edit_message_text("\n\n".join(lines)[:3900], reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ بازگشت", callback_data="wallet")]]))
+        return True
+    if data.startswith("wallet_amount_"):
+        raw = data.removeprefix("wallet_amount_")
+        if raw == "custom":
+            context.user_data["wallet_topup_custom"] = True
+            await query.edit_message_text("✍️ مبلغ دلخواه را به تومان بفرست؛ حداقل ۱۰٬۰۰۰ و حداکثر ۵۰٬۰۰۰٬۰۰۰ تومان.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="wallet")]]))
+            return True
+        if raw.isdigit():
+            await wallet_prepare_payment(query, context, user_id, int(raw)); return True
+    if data == "wallet_method_blupal":
+        amount = context.user_data.get("wallet_topup_amount")
+        if not amount:
+            await query.answer("مبلغ شارژ پیدا نشد؛ دوباره انتخاب کن.", show_alert=True); return True
+        await query.edit_message_text("⏳ در حال ساخت فاکتور امن BluPal...")
+        try:
+            topup_id, invoice, final_rial, link, card, mode = await wallet_create_blupal_invoice(user_id, amount, query.from_user.username or '')
+            text_msg = (f"✅ فاکتور پرداخت ساخته شد.\n\n💰 مبلغ شارژ کیف پول: {toman(amount)} تومان\n"
+                        f"💳 مبلغ دقیق قابل پرداخت: {final_rial:,} ریال\n"
+                        f"🧾 فاکتور: {invoice}\n🧪 محیط: {'آزمایشی' if mode == 'sandbox' else 'واقعی'}\n")
+            if card: text_msg += f"🏦 کارت مقصد: {card}\n"
+            text_msg += "\nپس از پرداخت، از دکمهٔ «بررسی پرداخت» استفاده کن. کیف پول فقط پس از استعلام وضعیت PAID از API BluPal شارژ می‌شود."
+            invoice_buttons = [[InlineKeyboardButton("💳 ورود به صفحه پرداخت", url=link)],
+                [InlineKeyboardButton("🔎 بررسی پرداخت", callback_data=f"wallet_check_{invoice}")]]
+            if user_id == ADMIN_ID and mode == "sandbox":
+                invoice_buttons.append([InlineKeyboardButton("🧪 تست شبیه‌سازی پرداخت موفق (مدیر)", callback_data=f"wallet_sandbox_simulate_{invoice}")])
+            invoice_buttons.append([InlineKeyboardButton("👛 کیف پول", callback_data="wallet")])
+            await query.edit_message_text(text_msg, reply_markup=InlineKeyboardMarkup(invoice_buttons), disable_web_page_preview=True)
+        except Exception as exc:
+            logger.exception("BluPal invoice creation failed")
+            await query.edit_message_text("❌ ساخت فاکتور ناموفق بود. موجودی شما تغییر نکرد.\n\n" + str(exc)[:500], reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="topup")]]))
+        context.user_data.pop("wallet_topup_amount", None)
+        return True
+    if data == "wallet_method_card":
+        amount = context.user_data.get("wallet_topup_amount")
+        if not amount:
+            await query.answer("مبلغ شارژ پیدا نشد.", show_alert=True); return True
+        card = bot_text("payment_card_number")
+        owner = bot_text("payment_card_owner")
+        if not card or card == "هنوز تنظیم نشده" or not owner or owner == "هنوز تنظیم نشده":
+            await query.answer("شماره کارت و نام صاحب کارت هنوز توسط مدیر تنظیم نشده است.", show_alert=True); return True
+        with db() as con:
+            cur = con.execute("INSERT INTO wallet_topups(user_id,method,amount_toman,status,created_at) VALUES(?, 'card_to_card', ?, 'WAITING_RECEIPT', ?)",
+                              (user_id, int(amount), utc_now().isoformat(timespec='seconds')))
+            topup_id = int(cur.lastrowid)
+        context.user_data["wallet_waiting_receipt"] = topup_id
+        context.user_data.pop("wallet_topup_amount", None)
+        await query.edit_message_text(f"💳 کارت‌به‌کارت برای شارژ کیف پول\n\nمبلغ: {toman(amount)} تومان\nشماره کارت: `{card}`\nصاحب کارت: {owner}\n\nپس از واریز، تصویر واضح رسید را همین‌جا ارسال کن. رسید فقط برای بررسی مدیر است و به‌تنهایی باعث شارژ خودکار نمی‌شود.", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data=f"wallet_cancel_{topup_id}")]]))
+        return True
+    if data.startswith("wallet_sandbox_simulate_"):
+        if user_id != ADMIN_ID:
+            await query.answer("این تست فقط برای مدیر است.", show_alert=True); return True
+        invoice = data.removeprefix("wallet_sandbox_simulate_")
+        if not blupal_api_key().startswith("blu_test_"):
+            await query.answer("شبیه‌سازی فقط با کلید آزمایشی blu_test_ ممکن است.", show_alert=True); return True
+        await query.edit_message_text("🧪 در حال شبیه‌سازی پرداخت موفق در محیط Sandbox...")
+        try:
+            sim = await blupal_request("POST", f"/v1/sandbox/invoices/{invoice}/simulate", {"scenario":"success"})
+            if str(sim.get("status", "")).upper() != "PAID":
+                raise RuntimeError("BluPal وضعیت شبیه‌سازی را PAID اعلام نکرد.")
+            result = await wallet_verify_blupal_invoice(invoice, context.application)
+            await query.edit_message_text("✅ تست Sandbox کامل شد.\n" + (f"کیف پول آزمایشی مدیر شارژ شد: {toman(result.get('amount',0))} تومان" if result.get("credited") else "این فاکتور قبلاً پردازش شده است."), reply_markup=wallet_admin_home_keyboard())
+        except Exception as exc:
+            logger.exception("BluPal sandbox simulation failed")
+            await query.edit_message_text("❌ تست Sandbox ناموفق بود: " + str(exc)[:300], reply_markup=wallet_admin_home_keyboard())
+        return True
+    if data.startswith("wallet_check_"):
+        invoice = data.removeprefix("wallet_check_")
+        with db() as con:
+            top = con.execute("SELECT * FROM wallet_topups WHERE invoice_id=? AND user_id=?", (invoice, user_id)).fetchone()
+        if not top:
+            await query.answer("فاکتور متعلق به این حساب نیست یا پیدا نشد.", show_alert=True); return True
+        if top["status"] == "PAID":
+            await query.answer("این فاکتور قبلاً تأیید و ثبت شده است.", show_alert=True); return True
+        await query.edit_message_text("⏳ در حال استعلام مستقیم وضعیت فاکتور از BluPal...")
+        try:
+            result = await wallet_verify_blupal_invoice(invoice, context.application)
+            if result.get("credited"):
+                await query.edit_message_text(f"✅ پرداخت تأیید شد و کیف پول شارژ شد.\nمبلغ: {toman(result['amount'])} تومان\nموجودی جدید: {toman(result['balance'])} تومان", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👛 کیف پول", callback_data="wallet")]]))
+            elif result.get("duplicate"):
+                await query.edit_message_text("✅ این پرداخت قبلاً ثبت شده است.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👛 کیف پول", callback_data="wallet")]]))
+            else:
+                await query.edit_message_text(f"⏳ هنوز پرداخت در BluPal تأیید نشده است. وضعیت: {result.get('status','در انتظار')}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 بررسی دوباره", callback_data=f"wallet_check_{invoice}")],[InlineKeyboardButton("👛 کیف پول", callback_data="wallet")]]))
+        except Exception as exc:
+            logger.exception("BluPal invoice status check failed")
+            await query.edit_message_text("⚠️ استعلام موقتاً ناموفق بود؛ موجودی تغییر نکرد.\n" + str(exc)[:350], reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 تلاش دوباره", callback_data=f"wallet_check_{invoice}")]]))
+        return True
+    if data.startswith("wallet_cancel_"):
+        topup_id = int(data.rsplit("_",1)[1])
+        with db() as con:
+            con.execute("UPDATE wallet_topups SET status='CANCELED' WHERE id=? AND user_id=? AND status='WAITING_RECEIPT'", (topup_id,user_id))
+        context.user_data.pop("wallet_waiting_receipt", None)
+        await query.edit_message_text("درخواست شارژ لغو شد؛ کیف پول تغییری نکرد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👛 کیف پول", callback_data="wallet")]]))
+        return True
+
+    # Owner-only wallet administration
+    if data.startswith("admin_wallet_"):
+        if user_id != ADMIN_ID:
+            await query.answer("دسترسی مجاز نیست.", show_alert=True); return True
+        if data == "admin_wallet_home":
+            context.user_data.pop("wallet_admin_state", None)
+            await query.edit_message_text(wallet_admin_home_text(), reply_markup=wallet_admin_home_keyboard()); return True
+        if data == "admin_wallet_search":
+            context.user_data["wallet_admin_state"] = {"step":"search"}
+            await query.edit_message_text("شناسه عددی تلگرام یا @username کاربر را بفرست.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="admin_wallet_home")]])); return True
+        if data == "admin_wallet_pending":
+            with db() as con:
+                rows=con.execute("SELECT id,user_id,amount_toman,created_at FROM wallet_topups WHERE status IN ('REVIEW','WAITING_RECEIPT') ORDER BY id DESC LIMIT 20").fetchall()
+            buttons=[]; lines=["🧾 شارژهای کارت‌به‌کارت در انتظار بررسی", "━━━━━━━━━━━━━━━━━━"]
+            for r in rows:
+                lines.append(f"#{r['id']} | کاربر {r['user_id']} | {toman(r['amount_toman'])} تومان | {r['created_at']}")
+                buttons.append([InlineKeyboardButton(f"درخواست #{r['id']}", callback_data=f"admin_wallet_top_{r['id']}")])
+            if not rows: lines.append("درخواستی وجود ندارد.")
+            buttons.append([InlineKeyboardButton("🔙 بازگشت", callback_data="admin_wallet_home")])
+            await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons)); return True
+        if data.startswith("admin_wallet_top_"):
+            top_id=int(data.rsplit("_",1)[1])
+            with db() as con: top=con.execute("SELECT * FROM wallet_topups WHERE id=?",(top_id,)).fetchone()
+            if not top: await query.answer("درخواست پیدا نشد.",show_alert=True); return True
+            body=f"درخواست شارژ #{top_id}\nکاربر: {top['user_id']}\nمبلغ: {toman(top['amount_toman'])} تومان\nوضعیت: {top['status']}\nرسید: {'دریافت شده' if top['receipt_file_id'] else 'دریافت نشده'}"
+            await query.edit_message_text(body,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ تأیید پس از بررسی بانک",callback_data=f"admin_wallet_approve_{top_id}"),InlineKeyboardButton("❌ رد درخواست",callback_data=f"admin_wallet_reject_{top_id}")],[InlineKeyboardButton("🔙 بازگشت",callback_data="admin_wallet_pending")]])); return True
+        if data.startswith("admin_wallet_approve_"):
+            top_id=int(data.rsplit("_",1)[1])
+            with db() as con:
+                con.execute("BEGIN IMMEDIATE")
+                top=con.execute("SELECT * FROM wallet_topups WHERE id=?",(top_id,)).fetchone()
+                if not top or top['status']!='REVIEW' or not top['receipt_file_id']:
+                    await query.answer("رسید معتبر در انتظار بررسی نیست.",show_alert=True); return True
+                user_id2=int(top['user_id']); amount=int(top['amount_toman'])
+                con.execute("INSERT OR IGNORE INTO users(user_id,username,balance,joined_at) VALUES(?,?,0,?)",(user_id2,'',utc_now().isoformat(timespec='seconds')))
+                user=con.execute("SELECT balance FROM users WHERE user_id=?",(user_id2,)).fetchone(); new_bal=int(user['balance'])+amount
+                ref=f"manual-topup:{top_id}"
+                cur=con.execute("INSERT OR IGNORE INTO wallet_transactions(user_id,amount,balance_after,kind,reference,reason,actor_admin_id,created_at,metadata) VALUES(?,?,?,'manual_topup',?,'تأیید دستی کارت‌به‌کارت توسط مدیر',?,?,?)",(user_id2,amount,new_bal,ref,ADMIN_ID,utc_now().isoformat(timespec='seconds'),json.dumps({"topup_id":top_id})))
+                if cur.rowcount:
+                    con.execute("UPDATE users SET balance=? WHERE user_id=?",(new_bal,user_id2))
+                    con.execute("UPDATE wallet_topups SET status='PAID',paid_at=?,reviewed_by=?,reviewed_at=? WHERE id=?",(utc_now().isoformat(timespec='seconds'),ADMIN_ID,utc_now().isoformat(timespec='seconds'),top_id))
+                else: new_bal=int(con.execute("SELECT balance FROM users WHERE user_id=?",(user_id2,)).fetchone()['balance'])
+            try: await context.bot.send_message(chat_id=user_id2,text=f"✅ رسید کارت‌به‌کارت شما توسط مدیر تأیید شد و کیف پول شارژ شد.\nمبلغ: {toman(amount)} تومان\nموجودی: {toman(new_bal)} تومان")
+            except Exception: logger.exception("Manual topup notify failed")
+            await wallet_safe_edit(query,"✅ درخواست بررسی و ثبت شد. موجودی کاربر: "+toman(new_bal)+" تومان",reply_markup=wallet_admin_home_keyboard()); return True
+        if data.startswith("admin_wallet_reject_"):
+            top_id=int(data.rsplit("_",1)[1])
+            with db() as con:
+                top=con.execute("SELECT user_id,status FROM wallet_topups WHERE id=?",(top_id,)).fetchone()
+                if not top or top['status'] not in {'REVIEW','WAITING_RECEIPT'}:
+                    await query.answer("درخواست قابل رد نیست.",show_alert=True); return True
+                con.execute("UPDATE wallet_topups SET status='REJECTED',reject_reason='رد توسط مدیر',reviewed_by=?,reviewed_at=? WHERE id=?",(ADMIN_ID,utc_now().isoformat(timespec='seconds'),top_id))
+            try: await context.bot.send_message(chat_id=int(top['user_id']),text="❌ رسید شارژ کیف پول شما تأیید نشد. لطفاً برای پیگیری با پشتیبانی تماس بگیر.")
+            except Exception: logger.exception("Rejected topup notify failed")
+            await wallet_safe_edit(query,"درخواست رد شد؛ موجودی تغییر نکرد.",reply_markup=wallet_admin_home_keyboard()); return True
+        if data.startswith("admin_wallet_add_") or data.startswith("admin_wallet_sub_"):
+            parts=data.split("_"); direction=parts[2]; uid=int(parts[3])
+            context.user_data["wallet_admin_state"]={"step":"amount","user_id":uid,"direction":direction}
+            await query.edit_message_text(("➕ مبلغ افزایش" if direction=="add" else "➖ مبلغ برداشت")+f" کیف پول کاربر {uid} را به تومان بفرست (عدد مثبت).",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو",callback_data=f"admin_wallet_view_{uid}")]])); return True
+        if data.startswith("admin_wallet_hist_"):
+            uid=int(data.rsplit("_",1)[1])
+            with db() as con: rows=con.execute("SELECT amount,balance_after,kind,reference,reason,actor_admin_id,created_at FROM wallet_transactions WHERE user_id=? ORDER BY id DESC LIMIT 30",(uid,)).fetchall()
+            lines=[f"📜 تاریخچه کیف پول {uid}","━━━━━━━━━━━━━━━━━━"]
+            for r in rows: lines.append(f"{r['amount']:+,} تومان | مانده: {toman(r['balance_after'])}\n{r['kind']} | {r['reason']}\nمرجع: {r['reference']} | مدیر: {r['actor_admin_id']}\n{r['created_at']}")
+            if not rows: lines.append("تراکنشی ثبت نشده است.")
+            await query.edit_message_text("\n\n".join(lines)[:3900],reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت",callback_data=f"admin_wallet_view_{uid}")]])); return True
+        if data.startswith("admin_wallet_view_"):
+            context.user_data.pop("wallet_admin_state", None)
+            uid=int(data.rsplit("_",1)[1]); await query.edit_message_text(wallet_user_text(uid),reply_markup=wallet_user_keyboard(uid)); return True
+        if data in {"admin_wallet_export_balances","admin_wallet_export_txs"}:
+            output=io.StringIO(); writer=csv.writer(output)
+            with db() as con:
+                if data.endswith("balances"):
+                    writer.writerow(["user_id","username","balance_toman"])
+                    rows=con.execute("SELECT user_id,username,balance FROM users ORDER BY user_id").fetchall()
+                    writer.writerows([tuple(r) for r in rows]); filename="seyed_wallet_balances.csv"
+                else:
+                    writer.writerow(["id","user_id","amount","balance_after","kind","reference","reason","actor_admin_id","created_at"])
+                    rows=con.execute("SELECT id,user_id,amount,balance_after,kind,reference,reason,actor_admin_id,created_at FROM wallet_transactions ORDER BY id").fetchall()
+                    writer.writerows([tuple(r) for r in rows]); filename="seyed_wallet_transactions.csv"
+            bio=io.BytesIO(output.getvalue().encode("utf-8-sig")); bio.name=filename
+            await context.bot.send_document(chat_id=ADMIN_ID,document=bio,filename=filename,caption="گزارش خروجی کیف پول SEYED PREMIUM")
+            await query.answer("فایل گزارش ارسال شد."); return True
+    return False
+
+
+async def handle_wallet_text(update, context):
+    user = update.effective_user; message = update.effective_message
+    if not user or not message:
+        return False
+    state = context.user_data if isinstance(context.user_data, dict) else {}
+    waiting_id = state.get("wallet_waiting_receipt")
+    if not waiting_id and (message.photo or message.document):
+        with db() as con:
+            pending_receipt = con.execute("SELECT id FROM wallet_topups WHERE user_id=? AND status='WAITING_RECEIPT' ORDER BY id DESC LIMIT 1", (user.id,)).fetchone()
+        waiting_id = int(pending_receipt["id"]) if pending_receipt else None
+    if waiting_id and (message.photo or message.document):
+        if message.photo:
+            file_id=message.photo[-1].file_id; media_type='photo'
+        else:
+            mime=str(message.document.mime_type or '')
+            if not mime.startswith('image/'):
+                await message.reply_text("فقط تصویر رسید (عکس یا فایل تصویری) قابل قبول است."); return True
+            file_id=message.document.file_id; media_type='document'
+        with db() as con:
+            top=con.execute("SELECT * FROM wallet_topups WHERE id=? AND user_id=?",(int(waiting_id),user.id)).fetchone()
+            if not top or top['status']!='WAITING_RECEIPT':
+                state.pop("wallet_waiting_receipt",None); await message.reply_text("درخواست شارژ فعال پیدا نشد؛ از منو دوباره شروع کن."); return True
+            con.execute("UPDATE wallet_topups SET receipt_file_id=?,receipt_media_type=?,status='REVIEW' WHERE id=?",(file_id,media_type,int(waiting_id)))
+        state.pop("wallet_waiting_receipt",None)
+        caption=f"🧾 رسید شارژ کیف پول\nدرخواست: #{waiting_id}\nکاربر: {user.id} (@{user.username or 'ندارد'})\nمبلغ: {toman(top['amount_toman'])} تومان\n⚠️ فقط پس از بررسی گردش حساب بانکی تأیید شود."
+        markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ تأیید پس از بررسی بانک",callback_data=f"admin_wallet_approve_{waiting_id}"),InlineKeyboardButton("❌ رد",callback_data=f"admin_wallet_reject_{waiting_id}")]])
+        try:
+            if media_type=='photo': await context.bot.send_photo(chat_id=ADMIN_ID,photo=file_id,caption=caption,reply_markup=markup)
+            else: await context.bot.send_document(chat_id=ADMIN_ID,document=file_id,caption=caption,reply_markup=markup)
+            await message.reply_text("✅ رسید دریافت و برای بررسی مدیر ارسال شد. کیف پول هنوز شارژ نشده است.")
+        except Exception:
+            logger.exception("Could not forward manual wallet receipt")
+            await message.reply_text("رسید در سیستم ذخیره شد، اما ارسال به مدیر انجام نشد؛ پشتیبانی را مطلع کن.")
+        return True
+    if user.id == ADMIN_ID:
+        admin_state=state.get("wallet_admin_state")
+        if admin_state:
+            raw=message.text.strip() if message.text else ''
+            if raw.lower() in {'/cancel','لغو','انصراف'}:
+                state.pop('wallet_admin_state',None); await message.reply_text("عملیات لغو شد؛ تغییری انجام نشد.",reply_markup=wallet_admin_home_keyboard()); return True
+            step=admin_state.get('step')
+            if step=='search':
+                found=wallet_find_user(raw); state.pop('wallet_admin_state',None)
+                if not found: await message.reply_text("کاربر پیدا نشد. ابتدا باید حداقل یک‌بار ربات را باز کرده باشد.",reply_markup=wallet_admin_home_keyboard()); return True
+                await message.reply_text(wallet_user_text(found['user_id']),reply_markup=wallet_user_keyboard(found['user_id'])); return True
+            if step=='amount':
+                clean=normalize_ascii_digits(raw).replace(',','').replace('٬','').replace('،','').strip()
+                if not clean.isdigit() or not 1 <= int(clean) <= 10_000_000_000:
+                    await message.reply_text("مبلغ باید عدد صحیح مثبت به تومان باشد."); return True
+                admin_state['amount']=int(clean); admin_state['step']='reason'; state['wallet_admin_state']=admin_state
+                await message.reply_text("دلیل تراکنش را بنویس (برای ثبت سابقه الزامی است):"); return True
+            if step=='reason':
+                if not raw or len(raw)>500: await message.reply_text("دلیل باید بین ۱ تا ۵۰۰ نویسه باشد."); return True
+                uid=int(admin_state['user_id']); amount=int(admin_state['amount']); delta=amount if admin_state['direction']=='add' else -amount
+                ref=f"admin:{ADMIN_ID}:{secrets.token_hex(8)}"
+                try:
+                    result=wallet_apply_transaction(uid,delta,'admin_credit' if delta>0 else 'admin_debit',ref,raw,ADMIN_ID,{'source':'admin_panel'})
+                except Exception as exc: await message.reply_text("❌ تراکنش انجام نشد: "+str(exc),reply_markup=wallet_user_keyboard(uid)); state.pop('wallet_admin_state',None); return True
+                state.pop('wallet_admin_state',None)
+                try: await context.bot.send_message(chat_id=uid,text=f"{'✅ افزایش' if delta>0 else 'ℹ️ برداشت'} موجودی کیف پول\nمبلغ: {toman(abs(delta))} تومان\nدلیل: {raw}\nموجودی جدید: {toman(result['balance'])} تومان")
+                except Exception: logger.exception("Wallet adjustment notification failed")
+                await message.reply_text(f"✅ تراکنش ثبت شد.\nشناسه: {ref}\nموجودی جدید: {toman(result['balance'])} تومان",reply_markup=wallet_user_keyboard(uid)); return True
+    if state.get("wallet_topup_custom"):
+        raw=message.text.strip() if message.text else ''
+        clean=normalize_ascii_digits(raw).replace(',','').replace('٬','').replace('،','').strip()
+        if not clean.isdigit() or not 10_000 <= int(clean) <= 50_000_000:
+            await message.reply_text("مبلغ باید بین ۱۰٬۰۰۰ تا ۵۰٬۰۰۰٬۰۰۰ تومان باشد."); return True
+        state.pop("wallet_topup_custom",None)
+        # Create a lightweight synthetic query to reuse the same choice screen without a callback event.
+        amount=int(clean); state['wallet_topup_amount']=amount
+        await message.reply_text(f"مبلغ انتخابی: {toman(amount)} تومان\nروش پرداخت را انتخاب کن:",reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🌐 پرداخت آنلاین BluPal",callback_data="wallet_method_blupal")],
+            [InlineKeyboardButton("💳 کارت‌به‌کارت",callback_data="wallet_method_card")],
+            [InlineKeyboardButton("❌ لغو",callback_data="wallet")]]))
+        return True
+    return False
+
+
+async def admin_wallet_command(update, context):
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
+        await update.effective_message.reply_text("⛔ دسترسی مجاز نیست."); return
+    if context.args:
+        found=wallet_find_user(' '.join(context.args))
+        if found:
+            await update.effective_message.reply_text(wallet_user_text(found['user_id']),reply_markup=wallet_user_keyboard(found['user_id'])); return
+        await update.effective_message.reply_text("کاربر پیدا نشد."); return
+    await update.effective_message.reply_text(wallet_admin_home_text(),reply_markup=wallet_admin_home_keyboard())
+
+
+# ==========================================
 # اجرای ربات
 # ==========================================
 
 def main():
-    token = input("توکن ربات را وارد کن (در چت ارسال نکن): ").strip()
+    token = str(os.getenv("BOT_TOKEN", "")).strip()
+    if not token and sys.stdin.isatty():
+        token = input("توکن ربات را وارد کن (در چت ارسال نکن): ").strip()
+    if not token:
+        logger.error("BOT_TOKEN environment variable is missing; configure it in the hosting panel.")
+        return
 
-    if not token or ":" not in token:
+    if ":" not in token:
         print("توکن معتبر نیست. از BotFather توکن صحیح بگیر.")
         return
 
     init_db()
+    ensure_wallet_payment_schema()
 
     async def set_commands(application):
         await application.bot.set_my_commands([
             BotCommand("start", "نمایش منوی فروشگاه"),
             BotCommand("admin", "پنل مدیریت"),
+            BotCommand("wallet", "مدیریت کیف پول (مدیر)"),
         ])
 
     async def post_init(application):
         application.create_task(set_commands(application))
+        try:
+            start_blupal_webhook_server(application)
+        except Exception:
+            logger.exception("BluPal webhook listener could not start; online payment must be considered unavailable")
         refresh_task = application.bot_data.get("_auto_pricing_refresh_task")
         if refresh_task is None or refresh_task.done():
             application.bot_data["_auto_pricing_refresh_task"] = application.create_task(
@@ -13152,6 +13960,7 @@ def main():
     app.add_handler(TypeHandler(Update, trace_update), group=-1)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin))
+    app.add_handler(CommandHandler("wallet", admin_wallet_command))
     app.add_handler(CommandHandler("cancel", cancel_coupon_creation))
     app.add_handler(CallbackQueryHandler(callbacks))
     if PreCheckoutQueryHandler is not None:
