@@ -13915,10 +13915,6 @@ def main():
     ensure_wallet_payment_schema()
 
     async def set_commands(application):
-        # Telegram has rejected setMyCommands for this bot/account with
-        # FROZEN_METHOD_INVALID. Keep this opt-in so the bot can start cleanly
-        # while the account restriction is appealed. Registered CommandHandlers
-        # below remain active even when this optional menu registration is off.
         await application.bot.set_my_commands([
             BotCommand("start", "نمایش منوی فروشگاه"),
             BotCommand("admin", "پنل مدیریت"),
@@ -13926,64 +13922,26 @@ def main():
         ])
 
     async def post_init(application):
-        register_commands = str(os.getenv("TELEGRAM_REGISTER_COMMANDS", "0")).strip().lower() in {"1", "true", "yes", "on"}
-        if register_commands:
-            try:
-                await set_commands(application)
-                logger.info("Telegram command menu registered successfully")
-            except Exception as exc:
-                logger.warning(
-                    "Telegram command menu registration skipped after Telegram API rejection: %s. "
-                    "Bot handlers remain available by manually sending /start, /admin or /wallet.",
-                    str(exc)[:300],
-                )
-        else:
-            logger.info(
-                "Telegram setMyCommands registration is disabled; /start, /admin and /wallet handlers remain active. "
-                "Set TELEGRAM_REGISTER_COMMANDS=1 only after Telegram lifts the account restriction."
-            )
-
+        # Register bot commands during startup and handle Telegram API errors
+        # without leaving an unobserved background task exception.
+        try:
+            await set_commands(application)
+        except Exception:
+            logger.exception("Could not register Telegram bot commands")
         try:
             start_blupal_webhook_server(application)
         except Exception:
             logger.exception("BluPal webhook listener could not start; online payment must be considered unavailable")
-
-        # post_init runs before Application.start(). Use asyncio.create_task here
-        # instead of Application.create_task to avoid PTB's not-running warning.
         refresh_task = application.bot_data.get("_auto_pricing_refresh_task")
         if refresh_task is None or refresh_task.done():
-            application.bot_data["_auto_pricing_refresh_task"] = asyncio.create_task(
+            application.bot_data["_auto_pricing_refresh_task"] = application.create_task(
                 auto_pricing_refresh_loop(application), name="seyed-premium-auto-pricing"
             )
         stars_refresh_task = application.bot_data.get("_stars_usd_refresh_task")
         if stars_refresh_task is None or stars_refresh_task.done():
-            application.bot_data["_stars_usd_refresh_task"] = asyncio.create_task(
-                stars_usd_refresh_loop(application), name="seyed-premium-stars-usd-refresh"
+            application.bot_data["_stars_usd_refresh_task"] = application.create_task(
+                stars_usd_refresh_loop(application), name="seyed-premium-stars-free-usd"
             )
-
-    async def post_shutdown(application):
-        # Explicitly stop long-running tasks created during post_init.
-        tasks = []
-        for key in ("_auto_pricing_refresh_task", "_stars_usd_refresh_task"):
-            task = application.bot_data.pop(key, None)
-            if task is not None and not task.done():
-                task.cancel()
-                tasks.append(task)
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Stop the local webhook listener cleanly on host restart/shutdown.
-        global _BLUPAL_SERVER, _BLUPAL_LOOP, _BLUPAL_APPLICATION
-        server = _BLUPAL_SERVER
-        _BLUPAL_SERVER = None
-        if server is not None:
-            try:
-                await asyncio.to_thread(server.shutdown)
-                server.server_close()
-            except Exception:
-                logger.exception("BluPal webhook listener shutdown failed")
-        _BLUPAL_LOOP = None
-        _BLUPAL_APPLICATION = None
     app = (
         Application.builder()
         .token(token)
@@ -13993,7 +13951,6 @@ def main():
         .write_timeout(15)
         .pool_timeout(5)
         .post_init(post_init)
-        .post_shutdown(post_shutdown)
         .build()
     )
     async def trace_update(update, context):
