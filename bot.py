@@ -13462,14 +13462,41 @@ class _BluPalWebhookHandler(BaseHTTPRequestHandler):
         self.wfile.write(encoded)
 
     def do_GET(self):
-        if self.path == "/healthz":
-            return self._send(200, {"ok": True, "service": "seyed-premium-wallet"})
+        request_path = urlsplit(self.path).path
+        if request_path == "/healthz":
+            webhook_token = str(os.getenv("BLUPAL_WEBHOOK_TOKEN", "")).strip()
+            return self._send(200, {
+                "ok": True,
+                "service": "seyed-premium-wallet",
+                "webhook_configured": len(webhook_token) >= 32,
+                "payment_api_configured": bool(blupal_api_key()),
+            })
+        if request_path in {"/payment/success", "/blupal/return"}:
+            body = (
+                "<!doctype html><html lang='fa' dir='rtl'><meta charset='utf-8'>"
+                "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                "<title>SEYED PREMIUM</title><body style='font-family:sans-serif;max-width:620px;"
+                "margin:48px auto;padding:24px;line-height:2;background:#111;color:#eee'>"
+                "<h2>بازگشت از درگاه پرداخت</h2>"
+                "<p>درخواست بازگشت دریافت شد. این صفحه به‌تنهایی تأیید پرداخت نیست.</p>"
+                "<p>برای تأیید قطعی، به ربات تلگرام برگردید و دکمهٔ «بررسی پرداخت» را بزنید.</p>"
+                "</body></html>"
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         return self._send(404, {"ok": False})
 
     def do_POST(self):
         token = str(os.getenv("BLUPAL_WEBHOOK_TOKEN", "")).strip()
+        if len(token) < 32:
+            return self._send(503, {"ok": False, "error": "webhook secret is not configured"})
         expected_path = "/blupal/webhook/" + token
-        if not token or not secrets.compare_digest(self.path, expected_path):
+        request_path = urlsplit(self.path).path
+        if not secrets.compare_digest(request_path, expected_path):
             return self._send(404, {"ok": False})
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -13501,28 +13528,36 @@ class _BluPalWebhookHandler(BaseHTTPRequestHandler):
 
 
 def start_blupal_webhook_server(application):
+    """Start the public health/return/webhook HTTP listener on FadeHost's injected PORT.
+
+    The listener starts even when the webhook secret is not configured, so /healthz
+    remains testable. Payment webhooks themselves fail closed until a 32+ char secret
+    is supplied; no payment is credited from an unauthenticated request.
+    """
     global _BLUPAL_SERVER, _BLUPAL_LOOP, _BLUPAL_APPLICATION
-    token = str(os.getenv("BLUPAL_WEBHOOK_TOKEN", "")).strip()
-    if len(token) < 32:
-        logger.warning("BluPal webhook not started: BLUPAL_WEBHOOK_TOKEN must contain at least 32 characters")
-        return False
     if _BLUPAL_SERVER is not None:
         return True
     _BLUPAL_LOOP = asyncio.get_running_loop()
     _BLUPAL_APPLICATION = application
-    host = str(os.getenv("BLUPAL_BIND_HOST", "0.0.0.0"))
+    host = str(os.getenv("BLUPAL_BIND_HOST", "0.0.0.0")).strip() or "0.0.0.0"
     port = int(os.getenv("PORT", os.getenv("BLUPAL_WEBHOOK_PORT", "8080")))
     server = ThreadingHTTPServer((host, port), _BluPalWebhookHandler)
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, name="blupal-webhook", daemon=True)
     thread.start()
     _BLUPAL_SERVER = server
-    public_base = str(os.getenv("BLUPAL_PUBLIC_BASE_URL", "")).rstrip("/")
-    if public_base:
-        # Never print the secret endpoint token to application logs.
-        logger.info("BluPal webhook listener active for public base URL %s (secret path configured in dashboard)", public_base)
+    token = str(os.getenv("BLUPAL_WEBHOOK_TOKEN", "")).strip()
+    public_base = str(os.getenv("BLUPAL_PUBLIC_BASE_URL", os.getenv("APP_URL", ""))).rstrip("/")
+    if len(token) >= 32:
+        logger.info("BluPal webhook listener active on %s:%s; secret path is configured", host, port)
     else:
-        logger.warning("BluPal webhook listener active on port %s; set BLUPAL_PUBLIC_BASE_URL and configure public HTTPS proxy", port)
+        logger.warning("HTTP listener active on %s:%s, but BluPal webhook is disabled: BLUPAL_WEBHOOK_TOKEN must contain at least 32 characters", host, port)
+    if not blupal_api_key():
+        logger.warning("BluPal invoice creation is disabled: BLUPAL_API_KEY is not configured")
+    if public_base:
+        logger.info("SEYED PREMIUM public health URL: %s/healthz", public_base)
+    else:
+        logger.warning("Public base URL is not set; configure BLUPAL_PUBLIC_BASE_URL to https://seyed-premium.fadehost.app")
     return True
 
 
@@ -13915,19 +13950,28 @@ def main():
     ensure_wallet_payment_schema()
 
     async def set_commands(application):
-        await application.bot.set_my_commands([
-            BotCommand("start", "نمایش منوی فروشگاه"),
-            BotCommand("admin", "پنل مدیریت"),
-            BotCommand("wallet", "مدیریت کیف پول (مدیر)"),
-        ])
+        # Telegram may reject this optional convenience method for restricted/frozen
+        # accounts. Never let command-menu registration create an unhandled task error.
+        try:
+            await application.bot.set_my_commands([
+                BotCommand("start", "نمایش منوی فروشگاه"),
+                BotCommand("admin", "پنل مدیریت"),
+                BotCommand("wallet", "مدیریت کیف پول (مدیر)"),
+            ])
+            logger.info("Telegram bot command menu registered")
+        except Exception as exc:
+            error_text = str(exc)
+            if "FROZEN_METHOD_INVALID" in error_text.upper():
+                logger.error(
+                    "Telegram rejected setMyCommands with FROZEN_METHOD_INVALID. "
+                    "This is a Telegram-side account restriction, not a Python syntax issue; "
+                    "the command menu will not be registered. Check Telegram's official appeal/support flow."
+                )
+            else:
+                logger.warning("Could not register Telegram command menu; bot handlers remain available: %s", error_text[:300])
 
     async def post_init(application):
-        # Register bot commands during startup and handle Telegram API errors
-        # without leaving an unobserved background task exception.
-        try:
-            await set_commands(application)
-        except Exception:
-            logger.exception("Could not register Telegram bot commands")
+        await set_commands(application)
         try:
             start_blupal_webhook_server(application)
         except Exception:
@@ -13982,7 +14026,7 @@ def main():
 
 
 
-    print("SEYED PREMIUM روشن شد. برای توقف Ctrl+C را بزن.")
+    print("SEYED PREMIUM روشن شد؛ polling فعال است.")
     # Keep polling resilient to transient Telegram Bad Gateway / network errors.
     # Pending updates are preserved so orders and receipts are not silently dropped.
     # Timeouts belong to Application.builder() above, not run_polling().
