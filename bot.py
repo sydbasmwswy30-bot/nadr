@@ -13922,7 +13922,12 @@ def main():
         ])
 
     async def post_init(application):
-        application.create_task(set_commands(application))
+        # Register bot commands during startup and handle Telegram API errors
+        # without leaving an unobserved background task exception.
+        try:
+            await set_commands(application)
+        except Exception:
+            logger.exception("Could not register Telegram bot commands")
         try:
             start_blupal_webhook_server(application)
         except Exception:
