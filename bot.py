@@ -6370,7 +6370,10 @@ def back_menu():
 
 
 # قفل عضویت اجباری کانال
-CHANNEL_USERNAME = '@SeyedPro_FQA'
+# Keep the canonical username and URL in one place to avoid checking a stale channel.
+CHANNEL_USERNAME = "@SeyedPrime"
+CHANNEL_URL = "https://t.me/SeyedPrime"
+
 
 def membership_keyboard():
     if get_main_menu_type() == MENU_TYPE_KEYBOARD:
@@ -6381,14 +6384,82 @@ def membership_keyboard():
             input_field_placeholder="برای بررسی عضویت، دکمه را بزن…",
         )
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 عضویت در کانال", url="https://t.me/SeyedPro_FQA", style="primary")],
+        [InlineKeyboardButton("📢 عضویت در کانال", url=CHANNEL_URL, style="primary")],
         [InlineKeyboardButton("🔄 بررسی عضویت", callback_data="check_membership", style="success")],
     ])
+
 
 _MEMBERSHIP_CACHE = {}
 _MEMBERSHIP_CACHE_TTL = 300
 _MEMBERSHIP_NEGATIVE_CACHE_TTL = 15
 _MEMBERSHIP_FAILURE_CACHE_TTL = 5
+_MEMBERSHIP_CHANNEL_ID = None
+_MEMBERSHIP_CHANNEL_ACCESS_CACHE = None
+_MEMBERSHIP_CHANNEL_ACCESS_CACHE_TTL = 60
+
+
+async def _verified_membership_channel_id(bot):
+    """Resolve the configured channel and verify that this bot is its admin.
+
+    Telegram only guarantees getChatMember results for other users when the bot
+    is an administrator. Cache a successful preflight briefly to avoid an extra
+    API request for every customer membership check.
+    """
+    global _MEMBERSHIP_CHANNEL_ID, _MEMBERSHIP_CHANNEL_ACCESS_CACHE
+
+    now = time.monotonic()
+    cached = _MEMBERSHIP_CHANNEL_ACCESS_CACHE
+    if cached:
+        cache_ttl = _MEMBERSHIP_CHANNEL_ACCESS_CACHE_TTL if cached["channel_id"] is not None else 10
+        if now - cached["checked_at"] < cache_ttl:
+            return cached["channel_id"]
+
+    try:
+        channel = await bot.get_chat(CHANNEL_USERNAME)
+        resolved_username = str(getattr(channel, "username", "") or "").lstrip("@").casefold()
+        expected_username = CHANNEL_USERNAME.lstrip("@").casefold()
+        if resolved_username and resolved_username != expected_username:
+            raise RuntimeError(
+                f"Configured channel mismatch: expected @{expected_username}, "
+                f"Telegram resolved @{resolved_username}."
+            )
+
+        channel_id = int(channel.id)
+        bot_member = await bot.get_chat_member(channel_id, bot.id)
+        if str(getattr(bot_member, "status", "")).lower() not in {"creator", "administrator"}:
+            status = str(getattr(bot_member, "status", "unknown"))
+            raise RuntimeError(
+                f"The bot is not an administrator of {CHANNEL_USERNAME} (current status: {status}). "
+                "Promote the bot to channel administrator, then retry."
+            )
+
+        _MEMBERSHIP_CHANNEL_ID = channel_id
+        _MEMBERSHIP_CHANNEL_ACCESS_CACHE = {
+            "channel_id": channel_id,
+            "checked_at": time.monotonic(),
+        }
+        logger.info(
+            "Membership channel verified: username=%s channel_id=%s bot_status=%s",
+            CHANNEL_USERNAME,
+            channel_id,
+            getattr(bot_member, "status", "unknown"),
+        )
+        return channel_id
+    except Exception as exc:
+        _MEMBERSHIP_CHANNEL_ID = None
+        _MEMBERSHIP_CHANNEL_ACCESS_CACHE = {
+            "channel_id": None,
+            "checked_at": time.monotonic(),
+        }
+        logger.error(
+            "Membership channel preflight failed for %s: %s: %s. "
+            "Check that the channel username is correct and the bot is an administrator.",
+            CHANNEL_USERNAME,
+            type(exc).__name__,
+            str(exc)[:500],
+            exc_info=True,
+        )
+        return None
 
 
 async def is_channel_member(update, context):
@@ -6412,19 +6483,32 @@ async def is_channel_member(update, context):
         if now - checked_at < cache_ttl:
             return result
 
+    channel_id = await _verified_membership_channel_id(context.bot)
+    if channel_id is None:
+        _MEMBERSHIP_CACHE[user_id] = (None, time.monotonic())
+        return None
+
     try:
-        m = await context.bot.get_chat_member(CHANNEL_USERNAME, user_id)
+        member = await context.bot.get_chat_member(channel_id, user_id)
         result = (
-            m.status in ("creator", "administrator", "member")
+            member.status in ("creator", "administrator", "member")
             or (
-                m.status == "restricted"
-                and getattr(m, "is_member", False)
+                member.status == "restricted"
+                and getattr(member, "is_member", False)
             )
         )
         _MEMBERSHIP_CACHE[user_id] = (result, time.monotonic())
         return result
-    except Exception:
-        logger.warning("Channel membership check failed", exc_info=True)
+    except Exception as exc:
+        logger.warning(
+            "Channel membership lookup failed: channel=%s channel_id=%s user_id=%s error=%s: %s",
+            CHANNEL_USERNAME,
+            channel_id,
+            user_id,
+            type(exc).__name__,
+            str(exc)[:400],
+            exc_info=True,
+        )
         _MEMBERSHIP_CACHE[user_id] = (None, time.monotonic())
         return None
 
@@ -6444,7 +6528,7 @@ async def require_channel_membership(update, context):
             )
         else:
             await message.reply_text(
-                "🔒 برای استفاده از خدمات ربات، ابتدا عضو کانال شو:\nhttps://t.me/SeyedPro_FQA\n\nپس از عضویت، «بررسی عضویت» را بزن.",
+                f"🔒 برای استفاده از خدمات ربات، ابتدا عضو کانال شو:\n{CHANNEL_URL}\n\nپس از عضویت، «بررسی عضویت» را بزن.",
                 reply_markup=membership_keyboard(),
             )
     return False
@@ -7630,7 +7714,7 @@ async def _callbacks_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         elif result is False:
             await query.edit_message_text(
-                "🔒 برای استفاده از خدمات ربات، ابتدا عضو کانال شو:\nhttps://t.me/SeyedPro_FQA\n\nپس از عضویت، «بررسی عضویت» را بزن.",
+                f"🔒 برای استفاده از خدمات ربات، ابتدا عضو کانال شو:\n{CHANNEL_URL}\n\nپس از عضویت، «بررسی عضویت» را بزن.",
                 reply_markup=membership_keyboard(),
             )
         else:
